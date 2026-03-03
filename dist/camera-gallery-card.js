@@ -1,13 +1,16 @@
 /**
  * Camera Gallery Card
- * Version: 1.0.2
+ * Version: 1.1.0
  */
 
-const CARD_VERSION = "1.0.2";
+const CARD_VERSION = "1.1.0";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
 const PREVIEW_WIDTH = "100%";
+
+// color mode: "auto" | "fixed" | "theme"
+const DEFAULT_COLOR_MODE = "auto";
 
 // thumbs (UI only — NOT a cap anymore)
 const THUMBS_ENABLED = true;
@@ -18,6 +21,8 @@ const THUMBS_COUNT = 8;
 const THUMB_SIZE = 86;
 const THUMB_RADIUS = 14;
 const THUMB_GAP = 12;
+
+const FRIGATE_SNAPSHOTS_ROOT = "frigate/frigate/event-search/snapshots";
 
 // defaults (can be overridden via config)
 const DEFAULT_ALLOW_DELETE = true;
@@ -49,14 +54,34 @@ const DEFAULT_SOURCE_MODE = "sensor"; // "sensor" | "media"
 // ✅ NEW (1.0.6)
 const DEFAULT_PREVIEW_POSITION = "top"; // "top" | "bottom"
 
+// ✅ Fixed (your “glass” defaults) — used for fixed mode, and as fallbacks
 const STYLE = {
   card_background: "rgba(255,255,255,0.06)",
+  preview_background: "rgba(255,255,255,0.06)",
   card_padding: "10px 12px",
   topbar_padding: "0px",
   topbar_margin: "0px",
-  preview_background: "rgba(255,255,255,0.06)",
 };
 // ------------------------------------
+
+// ─── HLS (m3u8) support ─────────────────────────────────────────────
+let _cgHlsLibPromise = null;
+
+async function _cgEnsureHlsLib() {
+  if (window.Hls) return window.Hls;
+
+  if (!_cgHlsLibPromise) {
+    _cgHlsLibPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js";
+      s.async = true;
+      s.onload = () => resolve(window.Hls);
+      s.onerror = () => reject(new Error("Failed to load hls.js"));
+      document.head.appendChild(s);
+    });
+  }
+  return _cgHlsLibPromise;
+}
 
 // ─── Resolve Lit from HA ─────────────────────────────────────────────
 let LitElement, html, css;
@@ -139,6 +164,8 @@ class CameraGalleryCard extends LitElement {
 
       preview_click_to_open: DEFAULT_PREVIEW_CLICK_TO_OPEN,
       preview_close_on_tap: DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED,
+
+      color_mode: DEFAULT_COLOR_MODE,
     };
   }
 
@@ -149,6 +176,15 @@ class CameraGalleryCard extends LitElement {
     this._posterCache = new Map();
     this._posterPending = new Set();
     this._deleted = new Set();
+
+    this._msSnaps = {
+      key: "",
+      loading: false,
+      loadedAt: 0,
+      list: [],
+      urlCache: new Map(),
+      byBase: new Map(),
+    };
 
     this._selectMode = false;
     this._selectedSet = new Set();
@@ -163,12 +199,21 @@ class CameraGalleryCard extends LitElement {
       key: "",
       loading: false,
       loadedAt: 0,
-      list: [], // [{ id, title, mime, cls }]
+      list: [], // [{ id, title, mime, cls, thumb }]
       urlCache: new Map(), // media_content_id -> resolved url
     };
 
     this._msResolveInFlight = false;
     this._msResolveQueued = new Set();
+
+        // ✅ Snapshot resolving (Frigate snapshots folder)
+    this._msSnapsResolveInFlight = false;
+    this._msSnapsResolveQueued = new Set();
+
+    // ✅ HLS instance + currently attached URL
+    this._hls = null;
+    this._activePreviewUrl = "";
+    this._activeHlsAttachedUrl = "";
   }
 
   connectedCallback() {
@@ -179,6 +224,7 @@ class CameraGalleryCard extends LitElement {
     super.disconnectedCallback();
     if (this._navHideT) clearTimeout(this._navHideT);
     this._navHideT = null;
+    this._cleanupHls();
   }
 
   set hass(hass) {
@@ -187,6 +233,51 @@ class CameraGalleryCard extends LitElement {
   }
   get hass() {
     return this._hass;
+  }
+
+  // ─── HLS helpers ──────────────────────────────────────────────────
+  _isHls(src) {
+    const s = String(src || "");
+    return /\.m3u8(\?|#|$)/i.test(s) || s.includes("index.m3u8");
+  }
+
+  _cleanupHls() {
+    try {
+      if (this._hls) {
+        this._hls.destroy();
+        this._hls = null;
+      }
+    } catch (_) {}
+  }
+
+  async _attachHlsToVideo(videoEl, url) {
+    if (!videoEl || !url) return;
+
+    // Safari can often play HLS directly
+    try {
+      if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
+        this._cleanupHls();
+        if (videoEl.src !== url) videoEl.src = url;
+        return;
+      }
+    } catch (_) {}
+
+    // Chrome/Edge need hls.js
+    const Hls = await _cgEnsureHlsLib();
+
+    if (Hls && Hls.isSupported()) {
+      this._cleanupHls();
+      this._hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+      });
+      this._hls.loadSource(url);
+      this._hls.attachMedia(videoEl);
+    } else {
+      // last resort: try native
+      this._cleanupHls();
+      if (videoEl.src !== url) videoEl.src = url;
+    }
   }
 
   _resetThumbScrollToStart() {
@@ -217,6 +308,18 @@ class CameraGalleryCard extends LitElement {
     this._pendingScrollToI = this._selectedIndex;
     this.requestUpdate();
     this._showNavChevrons();
+  }
+
+  _baseKeyFromName(v) {
+    const s = String(v || "");
+    const tail = s.split("/").pop() || s;
+
+    let t = tail
+      .replace(/index\.m3u8$/i, "")
+      .replace(/\.(mp4|webm|mov|m4v|m3u8|jpg|jpeg|png|webp)$/i, "");
+
+    const m = t.match(/([A-Za-z0-9 _-]+-\d{9,11}(?:\.\d+)?)/);
+    return m ? m[1] : t;
   }
 
   _navNext(listLen) {
@@ -254,6 +357,59 @@ class CameraGalleryCard extends LitElement {
     return Math.max(1, Math.min(2000, Math.round(n)));
   }
 
+  _parseCssColorToRgb(v) {
+    const s = String(v || "").trim().toLowerCase();
+    if (!s) return null;
+
+    // rgb/rgba(...)
+    const m = s.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/);
+    if (m) return { r: +m[1], g: +m[2], b: +m[3] };
+
+    // #rgb / #rrggbb
+    if (s.startsWith("#")) {
+      const hex = s.slice(1);
+      if (hex.length === 3) {
+        const r = parseInt(hex[0] + hex[0], 16);
+        const g = parseInt(hex[1] + hex[1], 16);
+        const b = parseInt(hex[2] + hex[2], 16);
+        return { r, g, b };
+      }
+      if (hex.length >= 6) {
+        const r = parseInt(hex.slice(0, 2), 16);
+        const g = parseInt(hex.slice(2, 4), 16);
+        const b = parseInt(hex.slice(4, 6), 16);
+        return { r, g, b };
+      }
+    }
+
+    return null;
+  }
+
+  _luminance({ r, g, b }) {
+    const srgb = [r, g, b].map((x) => {
+      x = x / 255;
+      return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
+  }
+
+  _isLightTheme() {
+    try {
+      const cs = getComputedStyle(this);
+      const bg =
+        cs.getPropertyValue("--primary-background-color") ||
+        cs.getPropertyValue("--lovelace-background") ||
+        cs.backgroundColor ||
+        "";
+
+      const rgb = this._parseCssColorToRgb(bg);
+      if (!rgb) return false;
+      return this._luminance(rgb) > 0.6;
+    } catch (_) {
+      return false;
+    }
+  }
+
   setConfig(config) {
     const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
     const num = (v, d) => {
@@ -261,6 +417,13 @@ class CameraGalleryCard extends LitElement {
       const n = Number(String(v).trim().replace("px", "").replace("%", ""));
       return Number.isFinite(n) ? n : d;
     };
+
+    const normColorMode = (v) => (v === "theme" || v === "fixed" ? v : "auto");
+
+    const color_mode =
+      config.color_mode !== undefined
+        ? String(config.color_mode).trim().toLowerCase()
+        : DEFAULT_COLOR_MODE;
 
     const posRaw = String(config.bar_position ?? "top").toLowerCase().trim();
     const bar_position =
@@ -277,17 +440,12 @@ class CameraGalleryCard extends LitElement {
       100
     );
 
-    // ✅ max_media is now the SINGLE cap for what is shown
-    const max_media = this._normMaxMedia(
-      config.max_media ?? DEFAULT_MAX_MEDIA
-    );
+    const max_media = this._normMaxMedia(config.max_media ?? DEFAULT_MAX_MEDIA);
 
-    // ✅ NEW: source mode (mutual exclusive)
     let source_mode = this._normSourceMode(
       config.source_mode ?? DEFAULT_SOURCE_MODE
     );
 
-    // ✅ NEW: preview position
     const preview_position = this._normPreviewPosition(
       config.preview_position ?? DEFAULT_PREVIEW_POSITION
     );
@@ -295,7 +453,6 @@ class CameraGalleryCard extends LitElement {
     const entityRaw = String(config?.entity || "").trim();
     const mediaRaw = String(config?.media_source || "").trim();
 
-    // If user didn't set source_mode explicitly, infer from provided fields
     if (
       config.source_mode === undefined ||
       config.source_mode === null ||
@@ -305,7 +462,6 @@ class CameraGalleryCard extends LitElement {
       else source_mode = "sensor";
     }
 
-    // Enforce mutual exclusive + validate required field
     if (source_mode === "sensor") {
       if (!entityRaw) {
         throw new Error(
@@ -340,7 +496,6 @@ class CameraGalleryCard extends LitElement {
         ? !!config.delete_confirm
         : DEFAULT_DELETE_CONFIRM;
 
-    // ✅ delete only relevant in SENSOR mode
     const wantsDelete = source_mode === "sensor" && !!allow_delete;
 
     if (wantsDelete && !delete_service) {
@@ -370,7 +525,6 @@ class CameraGalleryCard extends LitElement {
       source_mode,
       preview_position,
 
-      // mutually exclusive: only keep the active one as value
       entity: source_mode === "sensor" ? entityRaw : "",
       media_source: source_mode === "media" ? mediaRaw : "",
 
@@ -389,6 +543,8 @@ class CameraGalleryCard extends LitElement {
 
       preview_click_to_open,
       preview_close_on_tap,
+
+      color_mode: normColorMode(color_mode),
     };
 
     if (this._selectedIndex === undefined) this._selectedIndex = 0;
@@ -401,7 +557,6 @@ class CameraGalleryCard extends LitElement {
     if (!this._selectedSet) this._selectedSet = new Set();
     if (this._selectMode === undefined) this._selectMode = false;
 
-    // preview open/close behavior
     if (this.config.preview_click_to_open) {
       if (this._previewOpen === undefined) this._previewOpen = false;
       if (this._previewOpen !== true) this._previewOpen = false;
@@ -409,7 +564,6 @@ class CameraGalleryCard extends LitElement {
       this._previewOpen = true;
     }
 
-    // ✅ media-source cache reset on key change (only when in media mode)
     if (this.config.source_mode === "media") {
       const key = this._msNormalizeRoot(this.config?.media_source);
       if (key && this._ms.key && key !== this._ms.key) {
@@ -422,7 +576,51 @@ class CameraGalleryCard extends LitElement {
     }
   }
 
-  updated(changedProps) {
+  async _msEnsureSnapshotsLoaded() {
+    const root = this._msNormalizeRoot(FRIGATE_SNAPSHOTS_ROOT);
+    if (!root) return;
+
+    const now = Date.now();
+    const fresh =
+      this._msSnaps.key === root &&
+      now - (this._msSnaps.loadedAt || 0) < 30000;
+
+    if (this._msSnaps.loading || fresh) return;
+
+    this._msSnaps.loading = true;
+
+    try {
+      const flat = [];
+      await this._msWalk(root, flat);
+
+      const items = flat
+        .filter((x) => !!x?.media_content_id)
+        .map((x) => ({
+          id: String(x.media_content_id),
+          title: String(x.title || ""),
+        }));
+
+      const map = new Map();
+
+      for (const it of items) {
+        const base = this._baseKeyFromName(it.title || it.id);
+        if (base && !map.has(base)) {
+          map.set(base, it.id);
+        }
+      }
+
+      this._msSnaps.key = root;
+      this._msSnaps.byBase = map;
+      this._msSnaps.list = items;
+      this._msSnaps.loadedAt = Date.now();
+    } catch (e) {
+      console.warn("Snapshot load failed", e);
+    } finally {
+      this._msSnaps.loading = false;
+    }
+  }
+
+  async updated(changedProps) {
     if (this._pendingScrollToI != null) {
       const i = this._pendingScrollToI;
       this._pendingScrollToI = null;
@@ -432,8 +630,42 @@ class CameraGalleryCard extends LitElement {
     const dayChanged = changedProps.has("_selectedDay");
     const filterChanged = changedProps.has("_filterAll");
     if (dayChanged || filterChanged) this._resetThumbScrollToStart();
+
+    const url = String(this._activePreviewUrl || "");
+    if (!url) {
+      this._cleanupHls();
+      this._activeHlsAttachedUrl = "";
+      return;
+    }
+
+    // If preview is gated and closed, don't attach
+    const previewGated = !!this.config?.preview_click_to_open;
+    const previewOpen = !previewGated || !!this._previewOpen;
+    if (!previewOpen) {
+      this._cleanupHls();
+      this._activeHlsAttachedUrl = "";
+      return;
+    }
+
+    const videoEl = this.renderRoot?.querySelector("#cg-video");
+    if (!videoEl) {
+      this._cleanupHls();
+      this._activeHlsAttachedUrl = "";
+      return;
+    }
+
+    if (this._isHls(url)) {
+      if (this._activeHlsAttachedUrl === url) return;
+      this._activeHlsAttachedUrl = url;
+      await this._attachHlsToVideo(videoEl, url);
+    } else {
+      this._activeHlsAttachedUrl = "";
+      this._cleanupHls();
+      if (videoEl.src !== url) videoEl.src = url;
+    }
   }
 
+  // ✅ FIX: stable scroll centering (rect-based)
   async _scrollThumbIntoView(filteredIndexI) {
     try {
       await this.updateComplete;
@@ -446,21 +678,26 @@ class CameraGalleryCard extends LitElement {
     const wrap = this.renderRoot?.querySelector(".tthumbs");
     if (!wrap) return;
 
-    let btn = wrap.querySelector(`button.tthumb[data-i="${filteredIndexI}"]`);
+    const btn = wrap.querySelector(`button.tthumb[data-i="${filteredIndexI}"]`);
     if (!btn) return;
 
     const max = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
     if (max <= 0) return;
 
-    const target = Math.min(
-      max,
-      Math.max(0, btn.offsetLeft - wrap.clientWidth / 2 + btn.clientWidth / 2)
-    );
+    const wrapRect = wrap.getBoundingClientRect();
+    const btnRect = btn.getBoundingClientRect();
 
-    wrap.scrollLeft = target;
+    const current = wrap.scrollLeft;
+    const leftInView = btnRect.left - wrapRect.left;
+    const delta = leftInView - wrap.clientWidth / 2 + btnRect.width / 2;
+
+    const target = Math.min(max, Math.max(0, current + delta));
+
     try {
       wrap.scrollTo({ left: target, behavior: "auto" });
-    } catch (_) {}
+    } catch (_) {
+      wrap.scrollLeft = target;
+    }
   }
 
   _toWebPath(p) {
@@ -490,7 +727,8 @@ class CameraGalleryCard extends LitElement {
   }
 
   _isVideo(src) {
-    return /\.(mp4|webm|mov|m4v)$/i.test(String(src || ""));
+    const s = String(src || "");
+    return /\.(mp4|webm|mov|m4v)$/i.test(s) || this._isHls(s);
   }
 
   _isMediaSourceId(v) {
@@ -537,6 +775,8 @@ class CameraGalleryCard extends LitElement {
   }
 
   async _ensurePoster(src) {
+    if (this._isHls(src)) return;
+
     if (!src || this._posterCache.has(src) || this._posterPending.has(src))
       return;
     this._posterPending.add(src);
@@ -619,7 +859,8 @@ class CameraGalleryCard extends LitElement {
 
     if (v.startsWith("media-source://")) return v;
 
-    const strip = (s) => String(s || "").replace(/^\/+/, "").replace(/\/+$/, "");
+    const strip = (s) =>
+      String(s || "").replace(/^\/+/, "").replace(/\/+$/, "");
     v = strip(v);
 
     if (/^frigate(\/|$)/i.test(v)) {
@@ -689,7 +930,7 @@ class CameraGalleryCard extends LitElement {
     if (m.startsWith("image/")) return true;
     if (m.startsWith("video/")) return true;
     if (/\.(jpg|jpeg|png|webp|gif)$/i.test(t)) return true;
-    if (/\.(mp4|webm|mov|m4v)$/i.test(t)) return true;
+    if (/\.(mp4|webm|mov|m4v|m3u8)$/i.test(t)) return true;
     if (c === "image" || c === "video") return true;
 
     return false;
@@ -719,12 +960,15 @@ class CameraGalleryCard extends LitElement {
 
       const items = flat
         .filter((x) => !!x?.media_content_id)
-        .filter((x) => this._msIsRenderable(x?.mime_type, x?.media_class, x?.title))
+        .filter((x) =>
+          this._msIsRenderable(x?.mime_type, x?.media_class, x?.title)
+        )
         .map((x) => ({
           id: String(x.media_content_id || ""),
           title: String(x.title || ""),
           mime: String(x.mime_type || ""),
           cls: String(x.media_class || ""),
+          thumb: String(x.thumbnail || ""),
         }))
         .filter((x) => !!x.id);
 
@@ -739,7 +983,6 @@ class CameraGalleryCard extends LitElement {
         return a.title < b.title ? 1 : a.title > b.title ? -1 : 0;
       });
 
-      // ✅ max_media also caps what is displayed later, but we still cap the loaded list too
       const limit = this._normMaxMedia(this.config?.max_media);
       this._ms.list = items.slice(0, limit);
       this._ms.loadedAt = Date.now();
@@ -766,6 +1009,23 @@ class CameraGalleryCard extends LitElement {
     return it?.title || "";
   }
 
+  _msThumbUrl(mediaId) {
+    const it = (this._ms?.list || []).find((x) => x.id === mediaId);
+    const t = String(it?.thumb || "").trim();
+    if (!t) return "";
+
+    if (
+      t.startsWith("http://") ||
+      t.startsWith("https://") ||
+      t.startsWith("/")
+    )
+      return t;
+
+    return `/api/media_source/thumbnail?media_content_id=${encodeURIComponent(
+      t
+    )}`;
+  }
+
   _msQueueResolve(ids) {
     for (const id of ids || []) {
       if (!id) continue;
@@ -779,7 +1039,10 @@ class CameraGalleryCard extends LitElement {
     (async () => {
       try {
         while (this._msResolveQueued.size) {
-          const chunk = Array.from(this._msResolveQueued).slice(0, DEFAULT_RESOLVE_BATCH);
+          const chunk = Array.from(this._msResolveQueued).slice(
+            0,
+            DEFAULT_RESOLVE_BATCH
+          );
           chunk.forEach((x) => this._msResolveQueued.delete(x));
 
           await Promise.allSettled(chunk.map((id) => this._msResolve(id)));
@@ -792,6 +1055,76 @@ class CameraGalleryCard extends LitElement {
       this._msResolveInFlight = false;
     });
   }
+
+  // ─── Snapshot URL resolving (Frigate snapshots) ───────────────────
+
+  async _msSnapsResolve(mediaId) {
+    const cached = this._msSnaps?.urlCache?.get(mediaId);
+    if (cached) return cached;
+
+    const r = await this._hass.callWS({
+      type: "media_source/resolve_media",
+      media_content_id: mediaId,
+      expires: 60 * 60,
+    });
+
+    const url = r?.url ? String(r.url) : "";
+    if (url) this._msSnaps.urlCache.set(mediaId, url);
+    return url;
+  }
+
+  _msSnapsQueueResolve(ids) {
+    for (const id of ids || []) {
+      if (!id) continue;
+      if (this._msSnaps.urlCache.has(id)) continue;
+      this._msSnapsResolveQueued.add(id);
+    }
+    if (this._msSnapsResolveInFlight) return;
+
+    this._msSnapsResolveInFlight = true;
+
+    (async () => {
+      try {
+        while (this._msSnapsResolveQueued.size) {
+          const chunk = Array.from(this._msSnapsResolveQueued).slice(
+            0,
+            DEFAULT_RESOLVE_BATCH
+          );
+          chunk.forEach((x) => this._msSnapsResolveQueued.delete(x));
+
+          await Promise.allSettled(chunk.map((id) => this._msSnapsResolve(id)));
+          this.requestUpdate();
+        }
+      } finally {
+        this._msSnapsResolveInFlight = false;
+      }
+    })().catch(() => {
+      this._msSnapsResolveInFlight = false;
+    });
+  }
+
+  _snapshotUrlForClip(clipMediaId) {
+    // Alleen voor media-source ids (Frigate clips)
+    if (!this._isMediaSourceId(clipMediaId)) return "";
+
+    // Trigger snapshot index load (async, we don't await inside render)
+    this._msEnsureSnapshotsLoaded?.();
+
+    const clipTitle = this._msTitleById(clipMediaId);
+    const base = this._baseKeyFromName(clipTitle || clipMediaId);
+    if (!base) return "";
+
+    const snapMediaId = this._msSnaps?.byBase?.get(base);
+    if (!snapMediaId) return "";
+
+    // If already resolved → return direct URL
+    const cachedUrl = this._msSnaps?.urlCache?.get(snapMediaId);
+    if (cachedUrl) return cachedUrl;
+
+    // Otherwise queue resolve and return empty for now (fallback kicks in)
+    this._msSnapsQueueResolve([snapMediaId]);
+    return "";
+  }  
 
   // ─── Data ─────────────────────────────────────────────────────────
   _items() {
@@ -814,7 +1147,8 @@ class CameraGalleryCard extends LitElement {
     } else if (typeof raw === "string") {
       try {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) list = parsed.map((x) => this._toWebPath(x)).filter(Boolean);
+        if (Array.isArray(parsed))
+          list = parsed.map((x) => this._toWebPath(x)).filter(Boolean);
         else list = [this._toWebPath(raw)].filter(Boolean);
       } catch (_) {
         list = [this._toWebPath(raw)].filter(Boolean);
@@ -826,9 +1160,11 @@ class CameraGalleryCard extends LitElement {
   }
 
   _sourceNameForParsing(src) {
-    if (!this._isMediaSourceId(src)) return String(src || "");
-    const t = this._msTitleById(src);
-    return t || String(src || "");
+    const raw = String(src || "");
+    if (!this._isMediaSourceId(raw)) return raw;
+
+    const t = this._msTitleById(raw);
+    return t ? `${raw} ${t}` : raw;
   }
 
   _dayKeyFromMs(ms) {
@@ -895,24 +1231,44 @@ class CameraGalleryCard extends LitElement {
     const s = this._sourceNameForParsing(src);
     const m = String(s || "").match(/(\d{8})[_-](\d{6})/);
     if (!m) return null;
-    return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}T${m[2].slice(
-      0,
-      2
-    )}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
+    return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(
+      6,
+      8
+    )}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
   }
 
   _dtMsFromSrc(src) {
     const ems = this._extractEpochMs(src);
     if (Number.isFinite(ems)) return ems;
 
+    // ✅ Also parse "YYYY-MM-DD HH:MM:SS" from Frigate titles
+    {
+      const s = this._sourceNameForParsing(src);
+      const m = s.match(/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
+      if (m) {
+        const ms = new Date(`${m[1]}T${m[2]}`).getTime();
+        if (Number.isFinite(ms)) return ms;
+      }
+    }
+
+    // ✅ Also parse folder style "/YYYY-MM-DD/"
+    {
+      const s = this._sourceNameForParsing(src);
+      const m = s.match(/\/(\d{4}-\d{2}-\d{2})\//);
+      if (m) {
+        const ms = new Date(`${m[1]}T00:00:00`).getTime();
+        if (Number.isFinite(ms)) return ms;
+      }
+    }
+
     const dtKey = (() => {
       const s = this._sourceNameForParsing(src);
       const m = String(s || "").match(/(\d{8})[_-](\d{6})/);
       if (!m) return null;
-      return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}T${m[2].slice(
-        0,
-        2
-      )}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
+      return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(
+        6,
+        8
+      )}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
     })();
 
     if (dtKey) {
@@ -926,6 +1282,7 @@ class CameraGalleryCard extends LitElement {
       if (!m) return null;
       return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}`;
     })();
+
     if (dayKey) {
       const ms = new Date(`${dayKey}T00:00:00`).getTime();
       if (Number.isFinite(ms)) return ms;
@@ -968,7 +1325,10 @@ class CameraGalleryCard extends LitElement {
     }
 
     const base = String(name).split("/").pop() || String(name);
-    const noExt = base.replace(/\.(mp4|webm|mov|m4v|jpg|jpeg|png|webp|gif)$/i, "");
+    const noExt = base.replace(
+      /\.(mp4|webm|mov|m4v|m3u8|jpg|jpeg|png|webp|gif)$/i,
+      ""
+    );
     return noExt.length > 42 ? noExt.slice(0, 39) + "…" : noExt;
   }
 
@@ -976,10 +1336,16 @@ class CameraGalleryCard extends LitElement {
     if (!dtKey) return "";
     try {
       const dt = new Date(dtKey);
-      const date = new Intl.DateTimeFormat("en", { day: "2-digit", month: "short" })
+      const date = new Intl.DateTimeFormat("en", {
+        day: "2-digit",
+        month: "short",
+      })
         .format(dt)
         .replace(".", "");
-      const time = new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit" }).format(dt);
+      const time = new Intl.DateTimeFormat("en", {
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(dt);
       return `${date} • ${time}`;
     } catch (_) {
       return "";
@@ -1047,7 +1413,9 @@ class CameraGalleryCard extends LitElement {
     if (!srcs.length) return;
 
     if (this.config?.delete_confirm) {
-      const ok = window.confirm(`Are you sure you want to delete ${srcs.length} file(s)?`);
+      const ok = window.confirm(
+        `Are you sure you want to delete ${srcs.length} file(s)?`
+      );
       if (!ok) return;
     }
 
@@ -1068,7 +1436,10 @@ class CameraGalleryCard extends LitElement {
 
   _isInsideTsbar(e) {
     const path = e.composedPath?.() || [];
-    return path.some((el) => el?.classList?.contains("tsicon") || el?.classList?.contains("tsbar"));
+    return path.some(
+      (el) =>
+        el?.classList?.contains("tsicon") || el?.classList?.contains("tsbar")
+    );
   }
 
   _closePreviewIfEnabled(e) {
@@ -1127,9 +1498,11 @@ class CameraGalleryCard extends LitElement {
     if (this._selectMode) return;
 
     if (dx < 0) {
-      if ((this._selectedIndex ?? 0) < listLen - 1) this._selectedIndex = (this._selectedIndex ?? 0) + 1;
+      if ((this._selectedIndex ?? 0) < listLen - 1)
+        this._selectedIndex = (this._selectedIndex ?? 0) + 1;
     } else {
-      if ((this._selectedIndex ?? 0) > 0) this._selectedIndex = (this._selectedIndex ?? 0) - 1;
+      if ((this._selectedIndex ?? 0) > 0)
+        this._selectedIndex = (this._selectedIndex ?? 0) - 1;
     }
 
     this._scrubMinute = NaN;
@@ -1145,11 +1518,11 @@ class CameraGalleryCard extends LitElement {
     const rawItems = this._items();
 
     if (!rawItems.length) {
-      if (usingMediaSource && this._ms?.loading) return html`<div class="empty">Loading media…</div>`;
+      if (usingMediaSource && this._ms?.loading)
+        return html`<div class="empty">Loading media…</div>`;
       return html`<div class="empty">No media found.</div>`;
     }
 
-    // ✅ Build sortable list
     const withDt = rawItems.map((src, idx) => {
       const dtMs = this._dtMsFromSrc(src);
       const dayKey = this._extractDayKey(src);
@@ -1171,37 +1544,51 @@ class CameraGalleryCard extends LitElement {
     const activeDay = this._filterAll ? null : this._selectedDay ?? newestDay;
 
     const filteredAll =
-      !activeDay || this._filterAll ? allWithDay : allWithDay.filter((x) => x.dayKey === activeDay);
+      !activeDay || this._filterAll
+        ? allWithDay
+        : allWithDay.filter((x) => x.dayKey === activeDay);
 
-    if (!filteredAll.length) return html`<div class="empty">No media for this day.</div>`;
+    if (!filteredAll.length)
+      return html`<div class="empty">No media for this day.</div>`;
 
-    // ✅ SINGLE VISIBLE CAP: max_media
     const cap = this._normMaxMedia(this.config?.max_media);
     const filtered = filteredAll.slice(0, Math.min(cap, filteredAll.length));
 
-    if (!filtered.length) return html`<div class="empty">No media found.</div>`;
+    if (!filtered.length)
+      return html`<div class="empty">No media found.</div>`;
 
     if ((this._selectedIndex ?? 0) >= filtered.length) this._selectedIndex = 0;
 
-    const idx = Math.min(Math.max(this._selectedIndex ?? 0, 0), filtered.length - 1);
+    const idx = Math.min(
+      Math.max(this._selectedIndex ?? 0, 0),
+      filtered.length - 1
+    );
     const selected = filtered[idx]?.src;
 
-    // ✅ thumbs == visible items (no sampling, no THUMBS_COUNT cap)
     const thumbs = THUMBS_ENABLED ? filtered.map((it, i) => ({ ...it, i })) : [];
 
-    // media-source resolve queue
     if (usingMediaSource) {
       const want = new Set();
       if (selected && this._isMediaSourceId(selected)) want.add(selected);
-      for (const t of thumbs) if (t?.src && this._isMediaSourceId(t.src)) want.add(t.src);
+      for (const t of thumbs)
+        if (t?.src && this._isMediaSourceId(t.src)) want.add(t.src);
       this._msQueueResolve(Array.from(want));
+      this._msEnsureSnapshotsLoaded?.();
     }
 
     let selectedUrl = selected;
-    if (this._isMediaSourceId(selected)) selectedUrl = this._ms.urlCache.get(selected) || "";
+    if (this._isMediaSourceId(selected))
+      selectedUrl = this._ms.urlCache.get(selected) || "";
 
     const selectedIsVideo = this._isVideo(selectedUrl);
-    if (selectedIsVideo && selectedUrl) this._ensurePoster(selectedUrl);
+    const selectedIsHls = this._isHls(selectedUrl);
+
+    // Save for updated() HLS attach
+    this._activePreviewUrl = selectedUrl;
+
+    // Posters only for direct mp4/etc (not HLS)
+    if (selectedIsVideo && selectedUrl && !selectedIsHls)
+      this._ensurePoster(selectedUrl);
 
     const tsKey = this._extractDateTimeKey(selected);
     const tsText = this._formatDateTime(tsKey);
@@ -1214,23 +1601,128 @@ class CameraGalleryCard extends LitElement {
     const isAll = this._filterAll === true;
     const isToday = !isAll && currentForNav === newestDay;
 
+    // ✅ Color system
+    const mode = String(this.config?.color_mode || DEFAULT_COLOR_MODE)
+      .trim()
+      .toLowerCase();
+    const useTheme = mode === "theme";
+    const isLight = mode === "auto" ? this._isLightTheme() : false;
+
+    const fixedDark = {
+      cardBg: STYLE.card_background,
+      previewBg: STYLE.preview_background,
+      uiBg: "rgba(255,255,255,0.06)",
+      uiStroke: "rgba(255,255,255,0.12)",
+      divider: "rgba(255,255,255,0.10)",
+      text: "rgba(255,255,255,0.92)",
+      text2: "rgba(255,255,255,0.78)",
+      disabled: "rgba(255,255,255,0.35)",
+      onBg: "#ffffff",
+      onTxt: "rgba(0,0,0,0.98)",
+      accent: "rgba(64,148,255,0.95)",
+      danger: "#db4437",
+      success: "#2e7d32",
+      floatBg: "rgba(0,0,0,0.38)",
+      floatTxt: "rgba(255,255,255,0.95)",
+      pillBg: "rgba(255,255,255,0.15)",
+      pillTxt: "rgba(255,255,255,0.95)",
+    };
+
+    const fixedLight = {
+      cardBg: "rgba(0,0,0,0.04)",
+      previewBg: "rgba(0,0,0,0.04)",
+      uiBg: "rgba(0,0,0,0.06)",
+      uiStroke: "rgba(0,0,0,0.12)",
+      divider: "rgba(0,0,0,0.10)",
+      text: "rgba(0,0,0,0.88)",
+      text2: "rgba(0,0,0,0.62)",
+      disabled: "rgba(0,0,0,0.30)",
+      onBg: "rgba(0,0,0,0.88)",
+      onTxt: "rgba(255,255,255,0.98)",
+      accent: "var(--primary-color, rgba(64,148,255,0.95))",
+      danger: "var(--error-color, #db4437)",
+      success: "var(--success-color, #2e7d32)",
+      floatBg: "rgba(0,0,0,0.32)",
+      floatTxt: "rgba(255,255,255,0.95)",
+      pillBg: "rgba(0,0,0,0.45)", 
+      pillTxt: "rgba(255,255,255,0.95)", 
+    };
+
+    const fx = mode === "fixed" ? fixedDark : isLight ? fixedLight : fixedDark;
+
     const rootVars = `
       --gap:10px; --r:18px;
-      --cardBg:${STYLE.card_background}; --cardPad:${STYLE.card_padding};
-      --topbarPad:${STYLE.topbar_padding}; --topbarMar:${STYLE.topbar_margin};
-      --previewBg:${STYLE.preview_background};
-      --uiBg:rgba(255,255,255,0.06); --uiStroke:rgba(255,255,255,0.10);
-      --uiTxt:rgba(255,255,255,0.92); --uiTxt2:rgba(255,255,255,0.78);
-      --uiDis:rgba(255,255,255,0.35);
+
+      --cardPad:${STYLE.card_padding};
+      --topbarPad:${STYLE.topbar_padding};
+      --topbarMar:${STYLE.topbar_margin};
+
+      --cardBg:${
+        useTheme
+          ? "var(--ha-card-background, var(--card-background-color, rgba(0,0,0,0.04)))"
+          : fx.cardBg
+      };
+      --previewBg:${
+        useTheme
+          ? "var(--ha-card-background, var(--card-background-color, rgba(0,0,0,0.04)))"
+          : fx.previewBg
+      };
+
+      --cg-text:${useTheme ? "var(--primary-text-color, #000)" : fx.text};
+      --cg-text2:${
+        useTheme ? "var(--secondary-text-color, rgba(0,0,0,0.62))" : fx.text2
+      };
+      --cg-disabled:${
+        useTheme ? "var(--disabled-text-color, rgba(0,0,0,0.30))" : fx.disabled
+      };
+
+      --cg-accent:${
+        useTheme ? "var(--primary-color, rgba(64,148,255,0.95))" : fx.accent
+      };
+      --cg-danger:${useTheme ? "var(--error-color, #db4437)" : fx.danger};
+      --cg-success:${useTheme ? "var(--success-color, #2e7d32)" : fx.success};
+
+      --cg-on-bg:${useTheme ? "var(--primary-color, rgba(64,148,255,0.95))" : fx.onBg};
+      --cg-on-txt:${useTheme ? "var(--text-primary-color, #fff)" : fx.onTxt};
+
+      --cg-ui-bg:${
+        useTheme
+          ? "color-mix(in srgb, var(--ha-card-background, #fff) 88%, transparent)"
+          : fx.uiBg
+      };
+      --cg-ui-stroke:${
+        useTheme
+          ? "color-mix(in srgb, var(--primary-text-color, #000) 18%, transparent)"
+          : fx.uiStroke
+      };
+      --cg-divider:${
+        useTheme
+          ? "color-mix(in srgb, var(--primary-text-color, #000) 14%, transparent)"
+          : fx.divider
+      };
+
+      --cg-float-bg:${useTheme ? "color-mix(in srgb, #000 38%, transparent)" : fx.floatBg};
+      --cg-float-txt:${useTheme ? "rgba(255,255,255,0.95)" : fx.floatTxt};
+
+      /* ✅ pill (1/14) — tekst altijd wit */
+      --cg-pill-bg:${useTheme ? "color-mix(in srgb, #000 45%, transparent)" : fx.pillBg};
+      --cg-pill-txt:${useTheme ? "rgba(255,255,255,0.95)" : fx.pillTxt};
+
       --barOpacity:${this.config.bar_opacity};
     `;
 
     const sp = this._serviceParts();
 
-    const canDelete = this.config?.source_mode === "sensor" && !!this.config?.allow_delete && !!sp;
+    const canDelete =
+      this.config?.source_mode === "sensor" &&
+      !!this.config?.allow_delete &&
+      !!sp;
     const canBulkDelete =
-      this.config?.source_mode === "sensor" && !!this.config?.allow_bulk_delete && !!sp;
-    const showBulkToggle = canDelete && canBulkDelete && (thumbs?.length ?? 0) > 0;
+      this.config?.source_mode === "sensor" &&
+      !!this.config?.allow_bulk_delete &&
+      !!sp;
+    const showBulkToggle =
+      canDelete && canBulkDelete && (thumbs?.length ?? 0) > 0;
 
     const tsPosClass =
       this.config.bar_position === "bottom"
@@ -1275,14 +1767,23 @@ class CameraGalleryCard extends LitElement {
             @click=${(e) => this._closePreviewIfEnabled(e)}
           >
             ${selectedIsVideo
-              ? html`<video
-                  class="pimg"
-                  src=${selectedUrl}
-                  controls
-                  playsinline
-                  preload="auto"
-                  poster=${this._posterCache.get(selectedUrl) || ""}
-                ></video>`
+              ? selectedIsHls
+                ? html`<video
+                    id="cg-video"
+                    class="pimg"
+                    controls
+                    playsinline
+                    preload="auto"
+                  ></video>`
+                : html`<video
+                    id="cg-video"
+                    class="pimg"
+                    src=${selectedUrl}
+                    controls
+                    playsinline
+                    preload="auto"
+                    poster=${this._posterCache.get(selectedUrl) || ""}
+                  ></video>`
               : html`<img class="pimg" src=${selectedUrl} alt="" />`}
 
             ${this._showNav && filtered.length > 1
@@ -1324,7 +1825,9 @@ class CameraGalleryCard extends LitElement {
                   <div class="tsbar ${tsPosClass}">
                     <div class="tsleft">${tsLabel || "—"}</div>
                     <div class="tspill">
-                      <span class="tspill-val">${idx + 1}/${filtered.length}</span>
+                      <span class="tspill-val"
+                        >${idx + 1}/${filtered.length}</span
+                      >
                     </div>
                   </div>
                 `
@@ -1338,7 +1841,9 @@ class CameraGalleryCard extends LitElement {
         ${this._selectMode && (this._selectedSet?.size ?? 0)
           ? html`
               <div class="bulkbar topbulk">
-                <span class="bulkcount">${this._selectedSet.size} selected</span>
+                <span class="bulkcount"
+                  >${this._selectedSet.size} selected</span
+                >
                 <div class="bulkactions">
                   <button
                     type="button"
@@ -1381,27 +1886,59 @@ class CameraGalleryCard extends LitElement {
                   const isSel = this._selectedSet?.has(it.src);
 
                   let thumbUrl = it.src;
-                  if (this._isMediaSourceId(it.src)) thumbUrl = this._ms.urlCache.get(it.src) || "";
+                  const isMs = this._isMediaSourceId(it.src);
+
+                  if (isMs) thumbUrl = this._ms.urlCache.get(it.src) || "";
 
                   const isVid = this._isVideo(thumbUrl);
-                  if (isVid && thumbUrl) this._ensurePoster(thumbUrl);
+                  const isHls = this._isHls(thumbUrl);
 
-                  const poster = isVid ? this._posterCache.get(thumbUrl) : thumbUrl;
+                  // ✅ snapUrl: zoek bijbehorende snapshot (alleen voor video)
+                  // Verwachting: clips: .../Doorbell-1772467478.176409.mp4
+                  // snapshots: .../Doorbell-1772467478.176409.jpg
+                  let snapUrl = "";
+                  if (isVid) {
+                    snapUrl = this._snapshotUrlForClip(it.src) || "";
+                    // (it.src is media-source id, niet de resolved url)
+                    // _snapshotUrlForClip moet je nog toevoegen (helper functie)
+                  }
+
+                  let thumbContent = html`<div class="tph" aria-hidden="true"></div>`;
+
+                  if (!isVid && thumbUrl) {
+                    thumbContent = html`<img class="timg" src="${thumbUrl}" alt="" loading="lazy" />`;
+                  } else if (isVid && snapUrl) {
+                    thumbContent = html`<img class="timg" src="${snapUrl}" alt="" loading="lazy" />`;
+                  } else if (isVid && thumbUrl && !isHls) {
+                    this._ensurePoster(thumbUrl);
+                    const poster = this._posterCache.get(thumbUrl) || "";
+                    thumbContent = poster
+                      ? html`<img class="timg" src="${poster}" alt="" loading="lazy" />`
+                      : html`<div class="tph video" aria-hidden="true">
+                          <ha-icon icon="mdi:play-circle-outline"></ha-icon>
+                        </div>`;
+                  } else if (isVid && isMs) {
+                    // HLS of onbekende video: fallback naar HA media thumbnail
+                    const hlsThumb = this._msThumbUrl(it.src) || "";
+                    thumbContent = hlsThumb
+                      ? html`<img class="timg" src="${hlsThumb}" alt="" loading="lazy" />`
+                      : html`<div class="tph video" aria-hidden="true">
+                          <ha-icon icon="mdi:play-circle-outline"></ha-icon>
+                        </div>`;
+                  }
 
                   return html`
                     <button
                       class="tthumb ${isOn ? "on" : ""} ${this._selectMode && isSel ? "sel" : ""}"
                       data-i="${it.i}"
                       style="width:${this.config.thumb_size}px;height:${this.config.thumb_size}px;border-radius:${THUMB_RADIUS}px;"
+                      @pointerdown=${(e) => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation?.(); }}
                       @click=${(e) => {
                         e.preventDefault();
                         e.stopPropagation();
+                        try { e.currentTarget?.blur?.(); } catch (_) {}
 
-                        if (this._selectMode) {
-                          this._toggleSelected(it.src);
-                          return;
-                        }
-
+                        if (this._selectMode) { this._toggleSelected(it.src); return; }
                         if (this.config?.preview_click_to_open) this._previewOpen = true;
 
                         this._selectedIndex = it.i;
@@ -1410,17 +1947,12 @@ class CameraGalleryCard extends LitElement {
                         this.requestUpdate();
                       }}
                     >
-                      ${poster
-                        ? html`<img class="timg" src="${poster}" alt="" loading="lazy" />`
-                        : html`<div class="tph" aria-hidden="true"></div>`}
+                      ${thumbContent}
 
-                      ${this._selectMode
-                        ? html`
-                            <div class="selOverlay ${isSel ? "on" : ""}">
-                              <ha-icon icon="mdi:check"></ha-icon>
-                            </div>
-                          `
-                        : html``}
+                      ${this._selectMode ? html`
+                        <div class="selOverlay ${isSel ? "on" : ""}">
+                          <ha-icon icon="mdi:check"></ha-icon>
+                        </div>` : html``}
                     </button>
                   `;
                 })}
@@ -1433,7 +1965,9 @@ class CameraGalleryCard extends LitElement {
     return html`
       <div class="root" style="${rootVars}">
         <div class="panel" style="width:${PREVIEW_WIDTH}; margin:0 auto;">
-          ${!previewAtBottom && showPreviewSection ? html`${previewBlock}<div class="divider"></div>` : html``}
+          ${!previewAtBottom && showPreviewSection
+            ? html`${previewBlock}<div class="divider"></div>`
+            : html``}
 
           <div class="topbar">
             <div class="seg" role="tablist" aria-label="Filter">
@@ -1469,7 +2003,13 @@ class CameraGalleryCard extends LitElement {
                 <ha-icon icon="mdi:chevron-left"></ha-icon>
               </button>
               <div class="dateinfo" title="Selected day">
-                <span class="txt">${isAll ? "All" : currentForNav ? this._formatDay(currentForNav) : "—"}</span>
+                <span class="txt"
+                  >${isAll
+                    ? "All"
+                    : currentForNav
+                    ? this._formatDay(currentForNav)
+                    : "—"}</span
+                >
               </div>
               <button
                 class="iconbtn"
@@ -1524,7 +2064,9 @@ class CameraGalleryCard extends LitElement {
 
           ${thumbsBlock}
 
-          ${previewAtBottom && showPreviewSection ? html`<div class="divider"></div>${previewBlock}` : html``}
+          ${previewAtBottom && showPreviewSection
+            ? html`<div class="divider"></div>${previewBlock}`
+            : html``}
         </div>
       </div>
     `;
@@ -1551,7 +2093,7 @@ class CameraGalleryCard extends LitElement {
       }
       .divider {
         height: 1px;
-        background: rgba(255, 255, 255, 0.1);
+        background: var(--cg-divider);
         margin: 10px 0;
       }
 
@@ -1586,11 +2128,11 @@ class CameraGalleryCard extends LitElement {
         width: 44px;
         height: 44px;
         border-radius: 999px;
-        border: 1px solid rgba(255, 255, 255, 0.18);
-        background: rgba(0, 0, 0, 0.38);
+        border: 1px solid var(--cg-ui-stroke);
+        background: var(--cg-float-bg);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
-        color: rgba(255, 255, 255, 0.95);
+        color: var(--cg-float-txt);
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -1645,9 +2187,9 @@ class CameraGalleryCard extends LitElement {
         gap: 4px;
         padding: 4px 12px;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.15);
+        background: var(--cg-pill-bg);
         backdrop-filter: blur(6px);
-        color: rgba(255, 255, 255, 0.95);
+        color: var(--cg-pill-txt);
         font-size: 11px;
         font-weight: 800;
         white-space: nowrap;
@@ -1670,10 +2212,11 @@ class CameraGalleryCard extends LitElement {
         display: inline-flex;
         align-items: center;
         height: 30px;
-        background: var(--uiBg);
+        background: var(--cg-ui-bg);
         border-radius: 10px;
         overflow: hidden;
         flex: 0 0 auto;
+        border: 1px solid var(--cg-ui-stroke);
       }
       .segbtn {
         border: 0;
@@ -1683,7 +2226,7 @@ class CameraGalleryCard extends LitElement {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        color: var(--uiTxt2);
+        color: var(--cg-text2);
         background: transparent;
         font-size: 13px;
         font-weight: 700;
@@ -1692,8 +2235,8 @@ class CameraGalleryCard extends LitElement {
         -webkit-tap-highlight-color: transparent;
       }
       .segbtn.on {
-        background: #ffffff;
-        color: rgba(0, 0, 0, 0.98);
+        background: var(--cg-on-bg);
+        color: var(--cg-on-txt);
         border-radius: 8px;
       }
 
@@ -1701,18 +2244,19 @@ class CameraGalleryCard extends LitElement {
         display: flex;
         align-items: center;
         height: 30px;
-        background: var(--uiBg);
+        background: var(--cg-ui-bg);
         border-radius: 10px;
         overflow: hidden;
         flex: 1 1 auto;
         min-width: 0;
+        border: 1px solid var(--cg-ui-stroke);
       }
       .iconbtn {
         width: 44px;
         height: 44px;
         border: 0;
         background: transparent;
-        color: var(--uiTxt);
+        color: var(--cg-text);
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -1720,7 +2264,7 @@ class CameraGalleryCard extends LitElement {
         flex: 0 0 auto;
       }
       .iconbtn[disabled] {
-        color: var(--uiDis);
+        color: var(--cg-disabled);
         cursor: default;
       }
       .dateinfo {
@@ -1730,7 +2274,7 @@ class CameraGalleryCard extends LitElement {
         align-items: center;
         justify-content: center;
         padding: 10px 14px;
-        color: var(--uiTxt);
+        color: var(--cg-text);
         font-size: 13px;
         font-weight: 800;
       }
@@ -1745,8 +2289,8 @@ class CameraGalleryCard extends LitElement {
         width: var(--bsize);
         height: var(--bsize);
         border-radius: 999px;
-        background: var(--uiBg);
-        color: var(--uiTxt);
+        background: var(--cg-ui-bg);
+        color: var(--cg-text);
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -1758,11 +2302,11 @@ class CameraGalleryCard extends LitElement {
         padding: 0;
         line-height: 0;
         box-sizing: border-box;
-        border: 0;
+        border: 1px solid var(--cg-ui-stroke);
       }
       .bulkbtn.on {
-        background: #ffffff;
-        color: #000000;
+        background: var(--cg-on-bg);
+        color: var(--cg-on-txt);
       }
       .bulkbtn ha-icon {
         --ha-icon-size: calc(var(--bsize) * 0.55);
@@ -1804,7 +2348,7 @@ class CameraGalleryCard extends LitElement {
         border: 0;
         padding: 0;
         overflow: hidden;
-        background: rgba(255, 255, 255, 0.06);
+        background: var(--cg-ui-bg);
         outline: none;
         cursor: pointer;
         position: relative;
@@ -1818,10 +2362,10 @@ class CameraGalleryCard extends LitElement {
         inset: 0;
         border-radius: inherit;
         pointer-events: none;
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+        box-shadow: inset 0 0 0 1px var(--cg-ui-stroke);
       }
       .tthumb.on::after {
-        box-shadow: inset 0 0 0 2px rgba(64, 148, 255, 0.95);
+        box-shadow: inset 0 0 0 2px var(--cg-accent);
       }
       .tthumb.sel::after {
         box-shadow: inset 0 0 0 2px rgba(255, 192, 203, 0.95);
@@ -1836,7 +2380,17 @@ class CameraGalleryCard extends LitElement {
       .tph {
         width: 100%;
         height: 100%;
-        background: rgba(255, 255, 255, 0.06);
+        background: var(--cg-ui-bg);
+        display: grid;
+        place-items: center;
+      }
+      .tph.video ha-icon {
+        --ha-icon-size: 30px;
+        --mdc-icon-size: var(--ha-icon-size);
+        width: var(--ha-icon-size);
+        height: var(--ha-icon-size);
+        opacity: 0.8;
+        color: var(--cg-text2);
       }
 
       .selOverlay {
@@ -1866,8 +2420,8 @@ class CameraGalleryCard extends LitElement {
         margin: 8px 0 0 0;
         padding: 10px 12px;
         border-radius: 14px;
-        background: rgba(255, 255, 255, 0.06);
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: var(--cg-ui-bg);
+        border: 1px solid var(--cg-ui-stroke);
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -1877,7 +2431,7 @@ class CameraGalleryCard extends LitElement {
       .bulkcount {
         font-size: 13px;
         font-weight: 900;
-        color: var(--uiTxt);
+        color: var(--cg-text);
         white-space: nowrap;
         flex: 1 1 auto;
         min-width: 0;
@@ -1908,12 +2462,12 @@ class CameraGalleryCard extends LitElement {
       }
       .bulkcancel {
         border: 0;
-        background: #2e7d32;
+        background: var(--cg-success);
         color: rgba(255, 255, 255, 0.98);
       }
       .bulkdelete {
         border: 0;
-        background: #ff0000;
+        background: var(--cg-danger);
         color: rgba(255, 255, 255, 0.98);
       }
       .bulkicon ha-icon {
@@ -1936,7 +2490,9 @@ class CameraGalleryCard extends LitElement {
       .empty {
         padding: 12px;
         border-radius: 14px;
-        background: rgba(255, 255, 255, 0.06);
+        background: var(--cg-ui-bg);
+        border: 1px solid var(--cg-ui-stroke);
+        color: var(--cg-text);
       }
 
       @media (max-width: 420px) {
@@ -1961,7 +2517,8 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "camera-gallery-card",
   name: "Camera Gallery Card",
-  description: "Media gallery for Home Assistant (sensor fileList OR media_source folder)",
+  description:
+    "Media gallery for Home Assistant (sensor fileList OR media_source folder)",
 });
 
 console.info(`Camera Gallery Card v${CARD_VERSION}`);
