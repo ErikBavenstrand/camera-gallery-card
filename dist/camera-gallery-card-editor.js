@@ -1,8 +1,7 @@
-/* camera-gallery-card-editor.js
- * v1.1.0
+ /* camera-gallery-card-editor.js
  */
 
-console.warn("CAMERA GALLERY EDITOR LOADED v1.1.0");
+console.warn("CAMERA GALLERY EDITOR LOADED v1.2.0");
 
 class CameraGalleryCardEditor extends HTMLElement {
   constructor() {
@@ -11,8 +10,6 @@ class CameraGalleryCardEditor extends HTMLElement {
     this.attachShadow({ mode: "open" });
 
     this._favScrollTop = 0;
-    this._favWasOpen = false;
-
     this._raf = null;
 
     // media source dropdown cache
@@ -27,8 +24,8 @@ class CameraGalleryCardEditor extends HTMLElement {
       "sec-tsbar": false,
     };
 
-    // compact checkbox picker UI state
-    this._favPickerOpen = false;
+    // ✅ INLINE dropdown state (replaces popover)
+    this._favOpen = false;
     this._favQuery = "";
 
     // ✅ focus restore state
@@ -246,11 +243,14 @@ class CameraGalleryCardEditor extends HTMLElement {
       const id = String(media_content_id || "").trim();
       if (!id) return "";
 
+      // Standard HA provider root:
+      // media-source://media_source/<provider>/<path>
       if (id.startsWith("media-source://media_source/")) {
-        const rel = this._toRel(id).replace(/^media_source\//, "");
-        return rel;
+        // store as "provider/path"
+        return this._toRel(id);
       }
 
+      // Some providers expose direct roots, e.g. media-source://frigate
       if (id.startsWith("media-source://")) return id;
 
       return id;
@@ -265,8 +265,10 @@ class CameraGalleryCardEditor extends HTMLElement {
     try {
       const folderSet = new Set();
 
+      // ✅ Try multiple roots so we also catch providers like "media-source://frigate"
       const rootIds = [];
-      for (const root of ["media-source://media_source", "media-source://"]) {
+
+      const tryRoot = async (root) => {
         try {
           const rootRes = await browse(root);
           const ids = getChildren(rootRes)
@@ -274,20 +276,28 @@ class CameraGalleryCardEditor extends HTMLElement {
             .filter(Boolean);
           rootIds.push(...ids);
         } catch (_) {}
-      }
+      };
+
+      // Main “providers list”
+      await tryRoot("media-source://media_source");
+      // True root (often shows direct provider roots)
+      await tryRoot("media-source://");
+      // Explicit Frigate root (some setups only expose it this way)
+      await tryRoot("media-source://frigate");
 
       const uniqRootIds = Array.from(new Set(rootIds)).filter(
         (rid) => !shouldSkip(rid)
       );
 
+      // Add provider roots themselves
       for (const rid of uniqRootIds) {
         if (shouldSkip(rid)) continue;
-
         const store = normStoreValue(rid);
         const label = this._prettyLabel(store);
         if (label && !this._looksLikeFile(label)) folderSet.add(store);
       }
 
+      // Walk 2 levels deep
       for (const rid of uniqRootIds) {
         if (shouldSkip(rid)) continue;
 
@@ -351,10 +361,7 @@ class CameraGalleryCardEditor extends HTMLElement {
   }
 
   _prettyMediaFolderLabel(p) {
-    const key = String(p || "")
-      .replace(/\/+$/g, "")
-      .toLowerCase();
-
+    const key = String(p || "").replace(/\/+$/g, "").toLowerCase();
     const parts = key.split("/").filter(Boolean);
     const last = parts.pop() || "";
 
@@ -363,9 +370,17 @@ class CameraGalleryCardEditor extends HTMLElement {
     if (last === "snapshots") return "Snapshots";
     if (last === "event-search") return "Event Search";
 
-    return last
-      .replace(/[-_]/g, " ")
-      .replace(/\b\w/g, (c) => c.toUpperCase());
+    return last.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  // ✅ For <select> labels: show a friendly name + path to avoid duplicates
+  _selectOptionLabel(storeValue) {
+    const rel = this._prettyLabel(storeValue); // e.g. local/mac_share
+    const nice = this._prettyMediaFolderLabel(rel);
+    if (!rel) return nice || "";
+    // If rel is just a provider root (local/frigate/camera), keep it simple
+    if (!rel.includes("/")) return nice || rel;
+    return `${nice} — ${rel}`;
   }
 
   // ✅ ONE favorites key (array): media_folders_fav
@@ -399,9 +414,8 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._set("media_folders_fav", cleaned);
   }
 
-  _toggleFavPicker(open) {
-    this._favPickerOpen =
-      typeof open === "boolean" ? open : !this._favPickerOpen;
+  _toggleFavOpen(open) {
+    this._favOpen = typeof open === "boolean" ? open : !this._favOpen;
     this._scheduleRender();
   }
 
@@ -417,7 +431,6 @@ class CameraGalleryCardEditor extends HTMLElement {
         const en = typeof ae.selectionEnd === "number" ? ae.selectionEnd : null;
         this._focusState = {
           id: ae.id,
-          // keep a copy of typed value for safety
           value: typeof ae.value === "string" ? ae.value : null,
           start: st,
           end: en,
@@ -459,26 +472,35 @@ class CameraGalleryCardEditor extends HTMLElement {
     const baseList = Array.isArray(this._mediaFolders) ? this._mediaFolders : [];
     const favs = this._getFavFolders();
 
-    // dropdown shows ONLY favorites if favorites exist; otherwise show all
-    const listForDropdown = favs.length
-      ? baseList.filter((p) => favs.includes(p))
-      : baseList;
-
-    const mediaChoices = this._mergeChoices(
-      listForDropdown,
+    // ✅ ALWAYS show ALL folders in the dropdown.
+    // Favorites are just pinned at the top (optgroup).
+    const allChoices = this._mergeChoices(
+      baseList,
       mediaSourceIsFile ? "" : mediaSource
     );
+
+    const favChoices = favs.length
+      ? this._mergeChoices(baseList.filter((p) => favs.includes(p)), "")
+      : [];
 
     const height = Number(c.preview_height) || 320;
     const thumbSize = Number(c.thumb_size) || 140;
 
     const maxMedia = (() => {
-      const n = this._numInt(c.max_media, 200);
-      return this._clampInt(n, 1, 2000);
+      const n = this._numInt(c.max_media, 20);
+      return this._clampInt(n, 1, 100);
     })();
 
     const tsPos = String(c.bar_position || "top");
     const previewPos = String(c.preview_position || "top");
+
+    // ✅ NEW: thumb bar position (overlay on each thumb)
+    const thumbBarPos = (() => {
+      const v = String(c.thumb_bar_position || "bottom").toLowerCase().trim();
+      if (v === "top") return "top";
+      if (v === "hidden") return "hidden";
+      return "bottom";
+    })();
 
     const allServices = this._hass?.services || {};
     const shellCmds = Object.keys(allServices.shell_command || {})
@@ -614,11 +636,9 @@ class CameraGalleryCardEditor extends HTMLElement {
       --ed-pop-shadow2:${p.popShadow2};
     `;
 
-    // build picker list from ALL folders (not filtered), so you can always select favorites
+    // INLINE picker items (from ALL folders)
     const q = String(this._favQuery || "").trim().toLowerCase();
-    const pickerSource = baseList;
-
-    const pickerItems = pickerSource
+    const pickerItems = baseList
       .map((pval) => {
         const path = this._prettyLabel(pval);
         const nice = this._prettyMediaFolderLabel(path);
@@ -629,13 +649,79 @@ class CameraGalleryCardEditor extends HTMLElement {
       .sort((a, b) => a.searchKey.localeCompare(b.searchKey));
 
     const favCount = favs.length;
-    const favBtnText = favCount ? `Choose folders (${favCount})` : `Choose folders`;
+    const favBtnText = favCount ? `Folders (${favCount})` : `Folders`;
 
-    // save popover scroll before nuking DOM
-    try {
-      const list = this.shadowRoot?.querySelector("#favpop .poplist");
-      if (list) this._favScrollTop = list.scrollTop || 0;
-    } catch (_) {}
+    const favSummary = favCount
+      ? favs
+          .slice(0, 3)
+          .map((v) => this._prettyMediaFolderLabel(this._prettyLabel(v)))
+          .join(", ") + (favCount > 3 ? ` +${favCount - 3} more` : "")
+      : "Select folders to filter (pin) your favorites";
+
+    // ✅ Build <select> options with optgroups (favorites + all)
+    const buildMediaOptions = () => {
+      const esc = (s) =>
+        String(s || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+
+      const cur = mediaSource;
+      const curInFav = favChoices.includes(cur);
+      const curInAll = allChoices.includes(cur);
+
+      const option = (val) => {
+        const label = this._selectOptionLabel(val);
+        return `<option value="${esc(val)}" ${
+          val === cur ? "selected" : ""
+        }>${esc(label)}</option>`;
+      };
+
+      if (mediaLoading) {
+        return `<option value="${esc(cur)}" selected>(loading…)</option>`;
+      }
+
+      // If current value is a "file", show warning option first
+      const warning = mediaSourceIsFile
+        ? `<option value="${esc(mediaSource)}" selected>⚠️ ${esc(
+            mediaSource
+          )} (file — choose a folder)</option>`
+        : "";
+
+      // No folders at all
+      if (!allChoices.length) {
+        return `${warning}<option value="${esc(
+          cur
+        )}" selected>(no folders found)</option>`;
+      }
+
+      // With favorites: show an optgroup pinned at the top, BUT still show everything.
+      if (favChoices.length) {
+        const favOpts = favChoices.map(option).join("");
+        // All group should include all, but avoid dupes inside the group label set
+        const allGroupList = allChoices.filter((v) => !favChoices.includes(v));
+        const allOpts = allGroupList.map(option).join("");
+
+        // Ensure current value is visible even if it's not in lists (rare)
+        const orphan =
+          cur && !curInFav && !curInAll && !mediaSourceIsFile ? option(cur) : "";
+
+        return `
+          ${warning}
+          ${orphan}
+          <optgroup label="Favorites">
+            ${favOpts}
+          </optgroup>
+          <optgroup label="All folders">
+            ${allOpts}
+          </optgroup>
+        `;
+      }
+
+      // No favorites: just show all
+      return `${warning}${allChoices.map(option).join("")}`;
+    };
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -858,9 +944,64 @@ class CameraGalleryCardEditor extends HTMLElement {
           opacity: var(--ed-muted);
         }
 
-        /* compact picker */
-        .btnrow{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-        .btnmini{
+        /* INLINE dropdown */
+        .favwrap{ margin-top:10px; display:grid; gap:10px; }
+        .favbtn{
+          width:100%;
+          border-radius:12px;
+          border:1px solid var(--ed-input-border);
+          background:var(--ed-input-bg);
+          color: var(--ed-text);
+          padding:10px 12px;
+          font-size:13px;
+          font-weight:1000;
+          cursor:pointer;
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:12px;
+          box-sizing:border-box;
+          user-select:none;
+        }
+        .favbtn .sub{
+          font-size:12px;
+          font-weight:800;
+          opacity:0.75;
+          color: var(--ed-text2);
+          white-space:nowrap;
+          overflow:hidden;
+          text-overflow:ellipsis;
+          max-width: 100%;
+        }
+        .favbtn .caret{
+          width:10px;
+          height:10px;
+          transform: rotate(45deg);
+          border-right:2px solid var(--ed-arrow);
+          border-bottom:2px solid var(--ed-arrow);
+          opacity:0.8;
+          flex:0 0 auto;
+        }
+        .favbtn[aria-expanded="true"] .caret{ transform: rotate(225deg); }
+
+        .favpanel{
+          border-radius:14px;
+          border:1px solid var(--ed-row-border);
+          background: var(--ed-row-bg);
+          overflow:hidden;
+        }
+        .favpanel[hidden]{ display:none; }
+
+        .favhead{
+          padding:10px;
+          border-bottom:1px solid var(--ed-row-border);
+          display:flex;
+          gap:10px;
+          align-items:center;
+          justify-content:space-between;
+        }
+        .favhead .input{ padding:9px 10px; font-weight:800; }
+        .favhead button{
           border-radius:10px;
           border:1px solid var(--ed-input-border);
           background:var(--ed-input-bg);
@@ -871,43 +1012,17 @@ class CameraGalleryCardEditor extends HTMLElement {
           cursor:pointer;
           white-space:nowrap;
         }
-        .btnmini.primary{
-          background: var(--ed-seg-on-bg);
-          color: var(--ed-seg-on-txt);
-          border-color: transparent;
-        }
-        .pickwrap{ position:relative; }
-        .popover{
-          position:absolute;
-          z-index: 5;
-          left:0;
-          right:0;
-          margin-top:10px;
-          padding:12px;
-          border-radius:14px;
-          background: var(--ed-pop-bg);
-          backdrop-filter: blur(10px);
-          -webkit-backdrop-filter: blur(10px);
-          border: 1px solid var(--ed-pop-border);
-          box-shadow:
-            0 18px 44px var(--ed-pop-shadow1),
-            0 0 0 1px var(--ed-pop-shadow2);
-        }
-        .pophead{
-          display:flex;
-          gap:10px;
-          align-items:center;
-          justify-content:space-between;
-          margin-bottom:10px;
-        }
-        .poplist{
+
+        .favlist{
           display:grid;
           gap:8px;
           max-height: 220px;
           overflow:auto;
-          padding-right:4px;
+          padding:10px;
+          padding-right:6px;
         }
-        .chk{
+
+        .favitem{
           display:flex;
           gap:10px;
           align-items:flex-start;
@@ -917,35 +1032,36 @@ class CameraGalleryCardEditor extends HTMLElement {
           border: 1px solid var(--ed-row-border);
           cursor:pointer;
         }
-        .chk input{
+        .favitem input{
           margin-top: 2px;
           width: 18px;
           height: 18px;
           accent-color: var(--primary-color);
           flex: 0 0 auto;
         }
-        .chk .t{
-          display:grid;
-          gap:2px;
-        }
-        .chk .t .name{
+        .favitem .t{ display:grid; gap:2px; min-width:0; }
+        .favitem .name{
           font-weight: 1000;
           font-size: 13px;
           color: var(--ed-text);
         }
-        .chk .t .path{
+        .favitem .path{
           font-weight: 800;
           font-size: 12px;
           opacity: 0.75;
           color: var(--ed-text2);
           word-break: break-all;
         }
+
+        .favempty{ font-size:12px; opacity:0.8; color: var(--ed-text2); padding:6px 2px; }
       </style>
 
       <div class="wrap" style="${rootVars}">
 
         <!-- GENERAL -->
-        <div class="section" id="sec-general" data-open="${secOpenAttr("sec-general")}">
+        <div class="section" id="sec-general" data-open="${secOpenAttr(
+          "sec-general"
+        )}">
           <div class="shead" data-toggle="sec-general">
             <div class="stitle">
               <span class="ico">⚙️</span>
@@ -964,8 +1080,12 @@ class CameraGalleryCardEditor extends HTMLElement {
               <div class="lbl">Source mode</div>
               <div class="desc">Choose how this gallery loads its files</div>
               <div class="segwrap">
-                <button class="seg ${sensorModeOn ? "on" : ""}" data-src="sensor">File sensor</button>
-                <button class="seg ${mediaModeOn ? "on" : ""}" data-src="media">Media folder</button>
+                <button class="seg ${
+                  sensorModeOn ? "on" : ""
+                }" data-src="sensor">File sensor</button>
+                <button class="seg ${
+                  mediaModeOn ? "on" : ""
+                }" data-src="media">Media folder</button>
               </div>
             </div>
 
@@ -998,81 +1118,64 @@ class CameraGalleryCardEditor extends HTMLElement {
               <div class="lbl">Media source</div>
               <div class="desc">Choose the media folder that contains your recordings or snapshots</div>
               <div class="hint">Frigate users: use <code>frigate/frigate/clips</code> for clips or <code>frigate/frigate/snapshots</code> for snapshots</div>
+
               <div class="selectwrap">
                 <select class="input select ${
                   mediaSourceIsFile ? "invalid" : ""
                 }" id="mediasource" ${mediaModeOn ? "" : "disabled"}>
-                  ${
-                    mediaSourceIsFile
-                      ? `<option value="${mediaSource}" selected>⚠️ ${mediaSource} (file — choose a folder)</option>`
-                      : ""
-                  }
-                  ${
-                    mediaLoading
-                      ? `<option value="${mediaSource}" selected>(loading…)</option>`
-                      : mediaChoices.length
-                      ? mediaChoices
-                          .map((pval) => {
-                            const label = this._prettyMediaFolderLabel(this._prettyLabel(pval));
-                            return `<option value="${pval}" ${
-                              pval === mediaSource ? "selected" : ""
-                            }>${label}</option>`;
-                          })
-                          .join("")
-                      : `<option value="${mediaSource}" selected>(no folders found)</option>`
-                  }
+                  ${buildMediaOptions()}
                 </select>
                 <span class="selarrow"></span>
               </div>
 
-              <div style="margin-top:10px; display:grid; gap:10px;">
-                <div class="pickwrap">
-                  <div class="btnrow">
-                    <button class="btnmini ${this._favPickerOpen ? "primary" : ""}" id="favbtn" type="button">
-                      ${favBtnText}
-                    </button>
-                    <button class="btnmini" id="favall" type="button">All</button>
-                    <button class="btnmini" id="favnone" type="button">None</button>
+              <!-- ✅ INLINE favorites picker -->
+              <div class="favwrap">
+                <div class="favbtn" id="favbtn" role="button" tabindex="0" aria-expanded="${
+                  this._favOpen ? "true" : "false"
+                }">
+                  <div style="display:grid; gap:2px; min-width:0;">
+                    <div style="display:flex; gap:8px; align-items:center;">
+                      <span>${favBtnText}</span>
+                    </div>
+                    <div class="sub">${favSummary}</div>
+                  </div>
+                  <span class="caret" aria-hidden="true"></span>
+                </div>
+
+                <div class="favpanel" id="favpanel" ${
+                  this._favOpen ? "" : "hidden"
+                }>
+                  <div class="favhead">
+                    <input class="input" id="favquery" placeholder="Search folders…" value="${String(
+                      this._favQuery || ""
+                    ).replace(/"/g, "&quot;")}" />
+                    <button id="favdone" type="button">Done</button>
                   </div>
 
-                  ${
-                    this._favPickerOpen
-                      ? `
-                    <div class="popover" id="favpop">
-                      <div class="pophead">
-                        <input class="input" id="favquery" placeholder="Search folders…" value="${String(
-                          this._favQuery || ""
-                        ).replace(/"/g, "&quot;")}" />
-                        <button class="btnmini" id="favclose" type="button">Close</button>
-                      </div>
-                      <div class="poplist">
-                        ${
-                          mediaLoading
-                            ? `<div class="desc">(loading…)</div>`
-                            : pickerItems.length
-                            ? pickerItems
-                                .map((it) => {
-                                  const checked = favs.includes(it.value);
-                                  return `
-                                    <label class="chk">
-                                      <input type="checkbox" data-fav="${it.value}" ${
-                                    checked ? "checked" : ""
-                                  }/>
-                                      <div class="t">
-                                        <div class="name">${it.nice}</div>
-                                        <div class="path">${it.path}</div>
-                                      </div>
-                                    </label>
-                                  `;
-                                })
-                                .join("")
-                            : `<div class="desc">(no results)</div>`
-                        }
-                      </div>
-                    </div>
-                  `
-                      : ""
-                  }
+                  <div class="favlist" id="favlist">
+                    ${
+                      mediaLoading
+                        ? `<div class="favempty">(loading…)</div>`
+                        : pickerItems.length
+                        ? pickerItems
+                            .map((it) => {
+                              const checked = favs.includes(it.value);
+                              return `
+                                <label class="favitem">
+                                  <input type="checkbox" data-fav="${it.value}" ${
+                                checked ? "checked" : ""
+                              }/>
+                                  <div class="t">
+                                    <div class="name">${it.nice}</div>
+                                    <div class="path">${it.path}</div>
+                                  </div>
+                                </label>
+                              `;
+                            })
+                            .join("")
+                        : `<div class="favempty">(no results)</div>`
+                    }
+                  </div>
                 </div>
               </div>
             </div>
@@ -1097,7 +1200,9 @@ class CameraGalleryCardEditor extends HTMLElement {
               </div>
 
               <div class="selectwrap">
-                <select class="input select ${deleteOk ? "" : "invalid"}" id="delservice">
+                <select class="input select ${
+                  deleteOk ? "" : "invalid"
+                }" id="delservice">
                   ${
                     deleteChoices.length
                       ? deleteChoices
@@ -1119,7 +1224,9 @@ class CameraGalleryCardEditor extends HTMLElement {
         </div>
 
         <!-- MAIN VIEWER -->
-        <div class="section" id="sec-viewer" data-open="${secOpenAttr("sec-viewer")}">
+        <div class="section" id="sec-viewer" data-open="${secOpenAttr(
+          "sec-viewer"
+        )}">
           <div class="shead" data-toggle="sec-viewer">
             <div class="stitle">
               <span class="ico">🖼️</span>
@@ -1143,8 +1250,12 @@ class CameraGalleryCardEditor extends HTMLElement {
               <div class="lbl">Preview position</div>
               <div class="desc">Show the main viewer above or below the thumbnails</div>
               <div class="segwrap">
-                <button class="seg ${previewPos === "top" ? "on" : ""}" data-ppos="top">Top</button>
-                <button class="seg ${previewPos === "bottom" ? "on" : ""}" data-ppos="bottom">Bottom</button>
+                <button class="seg ${
+                  previewPos === "top" ? "on" : ""
+                }" data-ppos="top">Top</button>
+                <button class="seg ${
+                  previewPos === "bottom" ? "on" : ""
+                }" data-ppos="bottom">Bottom</button>
               </div>
             </div>
 
@@ -1162,7 +1273,9 @@ class CameraGalleryCardEditor extends HTMLElement {
         </div>
 
         <!-- THUMBNAILS -->
-        <div class="section" id="sec-thumbs" data-open="${secOpenAttr("sec-thumbs")}">
+        <div class="section" id="sec-thumbs" data-open="${secOpenAttr(
+          "sec-thumbs"
+        )}">
           <div class="shead" data-toggle="sec-thumbs">
             <div class="stitle">
               <span class="ico">🧩</span>
@@ -1184,13 +1297,32 @@ class CameraGalleryCardEditor extends HTMLElement {
 
             <div class="row">
               <div class="lbl">Maximum thumbnails shown</div>
-              <input class="input" id="maxmedia" type="number" min="1" max="2000" value="${maxMedia}" />
+              <input class="input" id="maxmedia" type="number" min="1" max="100" value="${maxMedia}" />
+            </div>
+
+            <!-- ✅ NEW: thumb overlay bar -->
+            <div class="row">
+              <div class="lbl">Thumbnail bar position</div>
+              <div class="desc">Show the small bar (time + icon) on each thumbnail</div>
+              <div class="segwrap">
+                <button class="seg ${
+                  thumbBarPos === "top" ? "on" : ""
+                }" data-tbpos="top">Top</button>
+                <button class="seg ${
+                  thumbBarPos === "bottom" ? "on" : ""
+                }" data-tbpos="bottom">Bottom</button>
+                <button class="seg ${
+                  thumbBarPos === "hidden" ? "on" : ""
+                }" data-tbpos="hidden">Hidden</button>
+              </div>
             </div>
           </div>
         </div>
 
         <!-- TIMESTAMP BAR -->
-        <div class="section" id="sec-tsbar" data-open="${secOpenAttr("sec-tsbar")}">
+        <div class="section" id="sec-tsbar" data-open="${secOpenAttr(
+          "sec-tsbar"
+        )}">
           <div class="shead" data-toggle="sec-tsbar">
             <div class="stitle">
               <span class="ico">🕒</span>
@@ -1207,9 +1339,15 @@ class CameraGalleryCardEditor extends HTMLElement {
             <div class="row">
               <div class="lbl">Timestamp bar position</div>
               <div class="segwrap">
-                <button class="seg ${tsPos === "top" ? "on" : ""}" data-pos="top">Top</button>
-                <button class="seg ${tsPos === "bottom" ? "on" : ""}" data-pos="bottom">Bottom</button>
-                <button class="seg ${tsPos === "hidden" ? "on" : ""}" data-pos="hidden">Hidden</button>
+                <button class="seg ${
+                  tsPos === "top" ? "on" : ""
+                }" data-pos="top">Top</button>
+                <button class="seg ${
+                  tsPos === "bottom" ? "on" : ""
+                }" data-pos="bottom">Bottom</button>
+                <button class="seg ${
+                  tsPos === "hidden" ? "on" : ""
+                }" data-pos="hidden">Hidden</button>
               </div>
             </div>
 
@@ -1229,9 +1367,9 @@ class CameraGalleryCardEditor extends HTMLElement {
       </div>
     `;
 
-        // restore popover scroll after re-render
+    // restore inline list scroll after re-render
     try {
-      const list = this.shadowRoot?.querySelector("#favpop .poplist");
+      const list = this.shadowRoot?.getElementById("favlist");
       if (list && Number.isFinite(this._favScrollTop)) {
         list.scrollTop = this._favScrollTop;
       }
@@ -1269,9 +1407,18 @@ class CameraGalleryCardEditor extends HTMLElement {
       this._set("media_source", String(e.target.value || "").trim())
     );
 
-    // open/close picker (always allowed; UI is muted if not in media mode)
-    $("favbtn")?.addEventListener("click", () => this._toggleFavPicker());
-    $("favclose")?.addEventListener("click", () => this._toggleFavPicker(false));
+    // ✅ INLINE dropdown open/close
+    const toggle = (open) => this._toggleFavOpen(open);
+
+    $("favbtn")?.addEventListener("click", () => toggle());
+    $("favbtn")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+
+    $("favdone")?.addEventListener("click", () => toggle(false));
 
     // search
     $("favquery")?.addEventListener("input", (e) => {
@@ -1279,39 +1426,25 @@ class CameraGalleryCardEditor extends HTMLElement {
       this._scheduleRender();
     });
 
-    // all / none (writes ONE key)
-    $("favall")?.addEventListener("click", () => {
-      const all = (Array.isArray(this._mediaFolders) ? this._mediaFolders : []).map(String);
-      this._setFavFolders(all);
-    });
-
-    $("favnone")?.addEventListener("click", () => {
-      this._setFavFolders([]); // removes key
-    });
-
-    const pop = $("favpop");
-    const poplist = this.shadowRoot?.querySelector("#favpop .poplist");
-
-    // bind scroll listener once per render-cycle (to the new DOM node)
-    if (poplist) {
-      poplist.addEventListener(
+    // scroll remember
+    const favlist = $("favlist");
+    if (favlist) {
+      favlist.addEventListener(
         "scroll",
         () => {
-          this._favScrollTop = poplist.scrollTop || 0;
+          this._favScrollTop = favlist.scrollTop || 0;
         },
         { passive: true }
       );
     }
 
-    pop?.addEventListener("change", (e) => {
+    // checkbox changes (multi-select)
+    $("favpanel")?.addEventListener("change", (e) => {
       const t = e.target;
       if (!t || t.tagName !== "INPUT" || t.type !== "checkbox") return;
 
       const val = String(t.getAttribute("data-fav") || "");
       if (!val) return;
-
-      // keep scroll stable when checking/unchecking (DOM rebuild)
-      // scrollTop will be saved+restored by the _render() hooks above
 
       const current = new Set(this._getFavFolders());
       if (t.checked) current.add(val);
@@ -1353,15 +1486,18 @@ class CameraGalleryCardEditor extends HTMLElement {
     // max_media handler (live + on change)
     const pushMaxMedia = (raw) => {
       const n = this._numInt(raw, 1);
-      const v = this._clampInt(n, 1, 2000);
+      const v = this._clampInt(n, 1, 100);
       this._set("max_media", v);
     };
-    $("maxmedia")?.addEventListener("input", (e) =>
-      pushMaxMedia(e.target.value)
-    );
-    $("maxmedia")?.addEventListener("change", (e) =>
-      pushMaxMedia(e.target.value)
-    );
+    $("maxmedia")?.addEventListener("input", (e) => pushMaxMedia(e.target.value));
+    $("maxmedia")?.addEventListener("change", (e) => pushMaxMedia(e.target.value));
+
+    // ✅ NEW: thumb_bar_position segmented buttons
+    this.shadowRoot.querySelectorAll(".seg[data-tbpos]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        this._set("thumb_bar_position", btn.dataset.tbpos)
+      );
+    });
 
     $("clicktoopen")?.addEventListener("change", (e) => {
       this._set("preview_click_to_open", !!e.target.checked);
@@ -1392,14 +1528,20 @@ class CameraGalleryCardEditor extends HTMLElement {
       if (fs && fs.id) {
         const el = $(fs.id);
         if (el && typeof el.focus === "function") {
-          // re-apply value (mainly for favquery safety)
-          if (fs.value != null && typeof el.value === "string" && el.value !== fs.value) {
+          if (
+            fs.value != null &&
+            typeof el.value === "string" &&
+            el.value !== fs.value
+          ) {
             el.value = fs.value;
           }
           el.focus({ preventScroll: true });
 
-          // restore caret/selection if possible
-          if (fs.start != null && fs.end != null && typeof el.setSelectionRange === "function") {
+          if (
+            fs.start != null &&
+            fs.end != null &&
+            typeof el.setSelectionRange === "function"
+          ) {
             el.setSelectionRange(fs.start, fs.end);
           }
         }
@@ -1412,4 +1554,4 @@ if (!customElements.get("camera-gallery-card-editor")) {
   customElements.define("camera-gallery-card-editor", CameraGalleryCardEditor);
 }
 
-console.info("CAMERA GALLERY EDITOR: registered OK");
+console.info("CAMERA GALLERY EDITOR: registered OK v1.1.3");
