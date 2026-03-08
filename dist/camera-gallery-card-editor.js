@@ -1,7 +1,50 @@
- /* camera-gallery-card-editor.js
+/* camera-gallery-card-editor.js
+ * v1.4.8
+ *
+ * CHANGE:
+ * - ✅ Removed Live provider option entirely
+ * - ✅ Live provider is no longer editable in the editor
+ * - ✅ Legacy live_provider config is stripped automatically
+ * - ✅ Added dedicated Live tab
+ * - ✅ Live settings moved out of Viewer tab
+ * - ✅ Live preview toggle now lives in Live tab
+ * - ✅ Live settings only visible when Live preview is enabled
+ * - ✅ Added Camera entity selector
+ * - ✅ Added Show live toggle switch
+ * - ✅ Added Start in live mode switch
+ * - ✅ Preview bar settings remain in Viewer tab
+ * - ✅ Thumbnail size field restored
+ * - ✅ Maximum thumbnails shown field restored
+ * - ✅ Tabbed editor UI kept
+ * - ✅ File sensors + Media folders still use real <textarea>
+ * - ✅ Live validation for sensors / media folders
+ * - ✅ Autocomplete dropdown for sensors / media folders
+ * - ✅ Media folder autocomplete browses actual Home Assistant media-source folders
+ * - ✅ Subfolders under clips / snapshots are suggested dynamically
+ * - ✅ Suggestion dropdown no longer flickers as aggressively
+ * - ✅ Long media-source paths are fully visible in suggestions
+ * - ✅ Native <select> kept for delete service
+ * - ✅ Stable typing (no config-changed during input)
+ * - ✅ Number fields still commit on change / blur
  */
 
-console.warn("CAMERA GALLERY EDITOR LOADED v1.2.0");
+console.warn(
+  "CAMERA GALLERY EDITOR LOADED v1.4.8-live-provider-removed"
+);
+
+const AVAILABLE_OBJECT_FILTERS = [
+  "person",
+  "car",
+  "dog",
+  "cat",
+  "truck",
+  "bus",
+  "bicycle",
+  "motorcycle",
+  "bird",
+];
+
+const MAX_VISIBLE_OBJECT_FILTERS = 4;
 
 class CameraGalleryCardEditor extends HTMLElement {
   constructor() {
@@ -9,27 +52,22 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._config = {};
     this.attachShadow({ mode: "open" });
 
-    this._favScrollTop = 0;
     this._raf = null;
+    this._activeTab = "general";
+    this._focusState = null;
 
-    // media source dropdown cache
-    this._mediaFolders = null; // array of folder choices (strings)
-    this._mediaFoldersLoading = false;
-
-    // keep section open/close state across renders
-    this._secOpen = {
-      "sec-general": true,
-      "sec-viewer": false,
-      "sec-thumbs": false,
-      "sec-tsbar": false,
+    this._suggestState = {
+      entities: { open: false, items: [], index: -1 },
+      mediasources: { open: false, items: [], index: -1 },
     };
 
-    // ✅ INLINE dropdown state (replaces popover)
-    this._favOpen = false;
-    this._favQuery = "";
-
-    // ✅ focus restore state
-    this._focusState = null;
+    this._mediaBrowseCache = new Map();
+    this._mediaSuggestReq = 0;
+    this._mediaSuggestTimer = null;
+    this._lastSuggestFingerprint = {
+      entities: "",
+      mediasources: "",
+    };
   }
 
   _scheduleRender() {
@@ -40,18 +78,92 @@ class CameraGalleryCardEditor extends HTMLElement {
   _stripAlwaysTrueKeys(cfg) {
     const next = { ...(cfg || {}) };
 
-    // this option is ALWAYS true in the card and should never be stored in config
     if ("preview_close_on_tap" in next) delete next.preview_close_on_tap;
 
-    // legacy/old keys - ensure YAML stays clean
     if ("filter_folders_enabled" in next) delete next.filter_folders_enabled;
     if ("media_folder_filter" in next) delete next.media_folder_filter;
     if ("media_folder_favorites" in next) delete next.media_folder_favorites;
+    if ("media_folders_fav" in next) delete next.media_folders_fav;
+
+    if ("live_provider" in next) delete next.live_provider;
 
     return next;
   }
 
-  // ─── Light/dark detection ──────────────────────────────────────────
+  _normalizeObjectFilters(listOrSingle) {
+    const arr = Array.isArray(listOrSingle)
+      ? listOrSingle
+      : listOrSingle
+        ? [listOrSingle]
+        : [];
+
+    const out = [];
+    const seen = new Set();
+    const allowed = new Set(
+      AVAILABLE_OBJECT_FILTERS.map((x) => String(x).toLowerCase())
+    );
+
+    for (const raw of arr) {
+      const v = String(raw || "").toLowerCase().trim();
+      if (!v) continue;
+      if (!allowed.has(v)) continue;
+      if (seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+      if (out.length >= MAX_VISIBLE_OBJECT_FILTERS) break;
+    }
+
+    return out;
+  }
+
+  _toggleObjectFilter(value) {
+    const v = String(value || "").toLowerCase().trim();
+    if (!v) return;
+    if (!AVAILABLE_OBJECT_FILTERS.includes(v)) return;
+
+    const current = this._normalizeObjectFilters(
+      this._config.object_filters || []
+    );
+    const set = new Set(current);
+
+    if (set.has(v)) {
+      set.delete(v);
+    } else {
+      if (set.size >= MAX_VISIBLE_OBJECT_FILTERS) return;
+      set.add(v);
+    }
+
+    const nextArr = Array.from(set);
+    const next = { ...this._config };
+
+    if (nextArr.length) next.object_filters = nextArr;
+    else delete next.object_filters;
+
+    this._config = this._stripAlwaysTrueKeys(next);
+    this._fire();
+    this._scheduleRender();
+  }
+
+  _objectLabel(v) {
+    const s = String(v || "").toLowerCase();
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+
+  _objectIcon(v) {
+    const map = {
+      person: "mdi:account",
+      car: "mdi:car",
+      dog: "mdi:dog",
+      cat: "mdi:cat",
+      truck: "mdi:truck",
+      bus: "mdi:bus",
+      bicycle: "mdi:bicycle",
+      motorcycle: "mdi:motorbike",
+      bird: "mdi:bird",
+    };
+    return map[v] || "mdi:shape";
+  }
+
   _parseCssColorToRgb(v) {
     const s = String(v || "").trim().toLowerCase();
     if (!s) return null;
@@ -62,16 +174,18 @@ class CameraGalleryCardEditor extends HTMLElement {
     if (s.startsWith("#")) {
       const hex = s.slice(1);
       if (hex.length === 3) {
-        const r = parseInt(hex[0] + hex[0], 16);
-        const g = parseInt(hex[1] + hex[1], 16);
-        const b = parseInt(hex[2] + hex[2], 16);
-        return { r, g, b };
+        return {
+          r: parseInt(hex[0] + hex[0], 16),
+          g: parseInt(hex[1] + hex[1], 16),
+          b: parseInt(hex[2] + hex[2], 16),
+        };
       }
       if (hex.length >= 6) {
-        const r = parseInt(hex.slice(0, 2), 16);
-        const g = parseInt(hex.slice(2, 4), 16);
-        const b = parseInt(hex.slice(4, 6), 16);
-        return { r, g, b };
+        return {
+          r: parseInt(hex.slice(0, 2), 16),
+          g: parseInt(hex.slice(2, 4), 16),
+          b: parseInt(hex.slice(4, 6), 16),
+        };
       }
     }
     return null;
@@ -101,85 +215,9 @@ class CameraGalleryCardEditor extends HTMLElement {
     }
   }
 
-  set hass(hass) {
-    this._hass = hass;
-
-    // if user is interacting with inputs/selects, don't re-render (prevents dropdown closing)
-    const ae = this.shadowRoot?.activeElement;
-    const interacting =
-      ae &&
-      (ae.id === "entity" ||
-        ae.id === "mediasource" ||
-        ae.id === "delservice" ||
-        ae.id === "height" ||
-        ae.id === "thumb" ||
-        ae.id === "maxmedia" ||
-        ae.id === "barop" ||
-        ae.id === "favquery") &&
-      ae.matches(":focus");
-
-    if (interacting) return;
-
-    // load media folders once
-    if (!this._mediaFolders && !this._mediaFoldersLoading) {
-      this._loadMediaFolders();
-    }
-
-    this._scheduleRender();
-  }
-
-  setConfig(config) {
-    this._config = this._stripAlwaysTrueKeys({ ...(config || {}) });
-
-    // legacy cleanup (also on load)
-    if ("shell_command" in this._config) {
-      const next = { ...this._config };
-      delete next.shell_command;
-      this._config = next;
-    }
-
-    this._scheduleRender();
-  }
-
-  _fire() {
-    this.dispatchEvent(
-      new CustomEvent("config-changed", {
-        detail: { config: { ...this._config } },
-        bubbles: true,
-        composed: true,
-      })
-    );
-  }
-
-  _set(key, value) {
-    // never allow this key to exist in config (prevents YAML showing it)
-    if (key === "preview_close_on_tap") return;
-
-    this._config = { ...this._config, [key]: value };
-    this._config = this._stripAlwaysTrueKeys(this._config);
-
-    // legacy cleanup always
-    if (key !== "shell_command" && "shell_command" in this._config) {
-      const next = { ...this._config };
-      delete next.shell_command;
-      this._config = next;
-    }
-
-    this._fire();
-    this._scheduleRender();
-  }
-
-  _mergeChoices(list, current) {
-    const set = new Set(Array.isArray(list) ? list : []);
-    const cur = String(current || "").trim();
-    if (cur) set.add(cur);
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }
-
   _looksLikeFile(relPath) {
     const v = String(relPath || "");
     if (v.startsWith("media-source://")) return false;
-
     const last = v.split("/").pop() || "";
     return /\.(jpg|jpeg|png|gif|webp|mp4|mov|mkv|avi|m4v|wav|mp3|aac|flac|pdf|txt|json)$/i.test(
       last
@@ -213,222 +251,669 @@ class CameraGalleryCardEditor extends HTMLElement {
     return Math.min(max, Math.max(min, Math.round(n)));
   }
 
-  async _loadMediaFolders() {
-    if (this._mediaFoldersLoading) return;
-    if (!this._hass?.callWS) return;
+  _parseTextList(raw) {
+    const s = String(raw || "");
+    const parts = s
+      .split(/\n|,/g)
+      .map((x) => String(x || "").trim())
+      .filter(Boolean);
 
-    this._mediaFoldersLoading = true;
+    const out = [];
+    const seen = new Set();
+    for (const p of parts) {
+      const key = String(p).trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(String(p).trim());
+    }
+    return out;
+  }
 
-    const browse = async (media_content_id) =>
-      await this._hass.callWS({
-        type: "media_source/browse_media",
-        media_content_id,
-      });
+  _sourcesToText(arr) {
+    const list = Array.isArray(arr)
+      ? arr.map(String).map((s) => s.trim()).filter(Boolean)
+      : [];
+    return list.join("\n");
+  }
 
-    const getChildren = (res) =>
-      Array.isArray(res?.children) ? res.children : [];
+  _setActiveTab(tab) {
+    this._activeTab = String(tab || "general");
+    this._scheduleRender();
+  }
 
-    const isFolder = (item) => {
-      const mc = item?.media_class;
-      const mct = item?.media_content_type;
+  _setControlValue(el, value) {
+    if (!el) return;
+    try {
+      el.value = value;
+    } catch (_) {}
+    try {
+      if ("_value" in el) el._value = value;
+    } catch (_) {}
+  }
 
-      if (mc) return mc === "directory";
-      if (mct) return mct === "directory";
+  _fire() {
+    this.dispatchEvent(
+      new CustomEvent("config-changed", {
+        detail: { config: { ...this._config } },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
 
-      const rel = this._toRel(item?.media_content_id);
-      return !!rel && !this._looksLikeFile(rel);
-    };
+  _set(key, value) {
+    if (key === "preview_close_on_tap") return;
+    if (key === "live_provider") return;
 
-    const normStoreValue = (media_content_id) => {
-      const id = String(media_content_id || "").trim();
-      if (!id) return "";
+    this._config = { ...this._config, [key]: value };
+    this._config = this._stripAlwaysTrueKeys(this._config);
 
-      // Standard HA provider root:
-      // media-source://media_source/<provider>/<path>
-      if (id.startsWith("media-source://media_source/")) {
-        // store as "provider/path"
-        return this._toRel(id);
+    if (key !== "shell_command" && "shell_command" in this._config) {
+      const next = { ...this._config };
+      delete next.shell_command;
+      this._config = next;
+    }
+
+    this._fire();
+    this._scheduleRender();
+  }
+
+  _validateSensors(raw) {
+    if (!raw) return "neutral";
+
+    const lines = raw
+      .split(/\n|,/g)
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+    if (!lines.length) return "neutral";
+
+    for (const id of lines) {
+      if (!id.startsWith("sensor.")) return "invalid";
+      if (!this._hass?.states?.[id]) return "invalid";
+    }
+
+    return "valid";
+  }
+
+  _validateMediaFolders(raw) {
+    if (!raw) return "neutral";
+
+    const lines = raw
+      .split(/\n|,/g)
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+    if (!lines.length) return "neutral";
+
+    for (const path of lines) {
+      if (!path.startsWith("media-source://")) return "invalid";
+      if (/\.(jpg|jpeg|png|mp4|mov|mkv|avi|json|txt)$/i.test(path)) {
+        return "invalid";
       }
+    }
 
-      // Some providers expose direct roots, e.g. media-source://frigate
-      if (id.startsWith("media-source://")) return id;
+    return "valid";
+  }
 
-      return id;
-    };
+  _getTextareaLineInfo(el) {
+    const value = String(el?.value || "");
+    const caret =
+      typeof el.selectionStart === "number" ? el.selectionStart : value.length;
 
-    const shouldSkip = (media_content_id) => {
-      const store = normStoreValue(media_content_id);
-      const label = this._prettyLabel(store);
-      return label === "radio_browser" || label.startsWith("radio_browser/");
-    };
+    const before = value.slice(0, caret);
+    const after = value.slice(caret);
+
+    const lineStart = before.lastIndexOf("\n") + 1;
+    const nextNl = after.indexOf("\n");
+    const lineEnd = nextNl === -1 ? value.length : caret + nextNl;
+
+    const line = value.slice(lineStart, lineEnd);
+    const lineCaret = caret - lineStart;
+
+    return { value, caret, lineStart, lineEnd, line, lineCaret };
+  }
+
+  _replaceCurrentLine(el, newLine) {
+    const info = this._getTextareaLineInfo(el);
+    const before = info.value.slice(0, info.lineStart);
+    const after = info.value.slice(info.lineEnd);
+    const nextValue = before + newLine + after;
+
+    el.value = nextValue;
+
+    const pos = before.length + newLine.length;
+    try {
+      el.setSelectionRange(pos, pos);
+      el.focus({ preventScroll: true });
+    } catch (_) {}
+  }
+
+  _collectEntitySuggestions() {
+    if (!this._hass) return [];
+    return Object.values(this._hass.states)
+      .filter(
+        (e) =>
+          e.entity_id.startsWith("sensor.") &&
+          e.attributes?.fileList !== undefined
+      )
+      .map((e) => e.entity_id)
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  _normalizeMediaSourceValue(v) {
+    let s = String(v || "").trim();
+    if (!s) return "";
+    s = s.replace(/\s+/g, "");
+    s = s.replace(/\/{2,}$/g, "");
+    return s;
+  }
+
+  _getDefaultMediaSuggestions() {
+    const defaults = [
+      "media-source://frigate/frigate/event-search/clips",
+      "media-source://frigate/frigate/event-search/snapshots",
+      "media-source://media_source/local",
+      "media-source://media_source/local/mac_share",
+    ];
+
+    const cfg = Array.isArray(this._config.media_sources)
+      ? this._config.media_sources
+          .map(String)
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
+
+    const set = new Set([...defaults, ...cfg]);
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }
+
+  _isFolderNode(node) {
+    const cls = String(node?.media_class || "").toLowerCase();
+    const type = String(node?.media_content_type || "").toLowerCase();
+    const id = String(node?.media_content_id || "");
+
+    if (cls === "directory" || cls === "app" || cls === "channel") return true;
+    if (type === "directory") return true;
+    if (id.startsWith("media-source://") && !/\.[a-z0-9]{2,6}$/i.test(id)) {
+      return true;
+    }
+    return false;
+  }
+
+  _sortUniqueStrings(arr) {
+    const out = [];
+    const seen = new Set();
+    for (const v of arr || []) {
+      const s = String(v || "").trim();
+      if (!s) continue;
+      const key = s.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(s);
+    }
+    return out.sort((a, b) => a.localeCompare(b));
+  }
+
+  _mediaBaseAndNeedle(rawLine) {
+    const line = this._normalizeMediaSourceValue(rawLine);
+
+    if (!line.startsWith("media-source://")) {
+      return { base: "", needle: line };
+    }
+
+    const lastSlash = line.lastIndexOf("/");
+    if (lastSlash <= "media-source://".length - 1) {
+      return { base: line, needle: "" };
+    }
+
+    const tail = line.slice(lastSlash + 1);
+    const parent = line.slice(0, lastSlash);
+
+    if (!tail) return { base: parent, needle: "" };
+
+    return { base: parent, needle: tail };
+  }
+
+  async _browseMediaFolders(mediaContentId) {
+    const id = this._normalizeMediaSourceValue(mediaContentId);
+    if (!id || !this._hass?.callWS) return [];
+
+    if (this._mediaBrowseCache.has(id)) {
+      return this._mediaBrowseCache.get(id);
+    }
 
     try {
-      const folderSet = new Set();
-
-      // ✅ Try multiple roots so we also catch providers like "media-source://frigate"
-      const rootIds = [];
-
-      const tryRoot = async (root) => {
-        try {
-          const rootRes = await browse(root);
-          const ids = getChildren(rootRes)
-            .map((it) => it?.media_content_id)
-            .filter(Boolean);
-          rootIds.push(...ids);
-        } catch (_) {}
-      };
-
-      // Main “providers list”
-      await tryRoot("media-source://media_source");
-      // True root (often shows direct provider roots)
-      await tryRoot("media-source://");
-      // Explicit Frigate root (some setups only expose it this way)
-      await tryRoot("media-source://frigate");
-
-      const uniqRootIds = Array.from(new Set(rootIds)).filter(
-        (rid) => !shouldSkip(rid)
-      );
-
-      // Add provider roots themselves
-      for (const rid of uniqRootIds) {
-        if (shouldSkip(rid)) continue;
-        const store = normStoreValue(rid);
-        const label = this._prettyLabel(store);
-        if (label && !this._looksLikeFile(label)) folderSet.add(store);
-      }
-
-      // Walk 2 levels deep
-      for (const rid of uniqRootIds) {
-        if (shouldSkip(rid)) continue;
-
-        let level1 = null;
-        try {
-          level1 = await browse(rid);
-        } catch (_) {
-          continue;
-        }
-
-        const kids1 = getChildren(level1);
-
-        for (const k1 of kids1) {
-          if (!isFolder(k1)) continue;
-          if (shouldSkip(k1?.media_content_id)) continue;
-
-          const id1 = k1?.media_content_id;
-          const store1 = normStoreValue(id1);
-          const label1 = this._prettyLabel(store1);
-          if (label1 && !this._looksLikeFile(label1)) folderSet.add(store1);
-
-          if (!id1) continue;
-
-          try {
-            const level2 = await browse(id1);
-            const kids2 = getChildren(level2);
-
-            for (const k2 of kids2) {
-              if (!isFolder(k2)) continue;
-              if (shouldSkip(k2?.media_content_id)) continue;
-
-              const id2 = k2?.media_content_id;
-              const store2 = normStoreValue(id2);
-              const label2 = this._prettyLabel(store2);
-              if (label2 && !this._looksLikeFile(label2)) folderSet.add(store2);
-            }
-          } catch (_) {}
-        }
-      }
-
-      this._mediaFolders = Array.from(folderSet).sort((a, b) => {
-        const aa = this._prettyLabel(a);
-        const bb = this._prettyLabel(b);
-
-        const aLocal = aa === "local" || aa.startsWith("local/");
-        const bLocal = bb === "local" || bb.startsWith("local/");
-        if (aLocal && !bLocal) return -1;
-        if (!aLocal && bLocal) return 1;
-
-        return aa.localeCompare(bb, undefined, {
-          numeric: true,
-          sensitivity: "base",
-        });
+      const result = await this._hass.callWS({
+        type: "media_source/browse_media",
+        media_content_id: id,
       });
-    } catch (e) {
-      this._mediaFolders = [];
-    } finally {
-      this._mediaFoldersLoading = false;
-      this._scheduleRender();
+
+      const children = Array.isArray(result?.children) ? result.children : [];
+      const folders = children
+        .filter((child) => this._isFolderNode(child))
+        .map((child) => String(child.media_content_id || "").trim())
+        .filter((v) => v.startsWith("media-source://"));
+
+      const clean = this._sortUniqueStrings(folders);
+      this._mediaBrowseCache.set(id, clean);
+      return clean;
+    } catch (_) {
+      this._mediaBrowseCache.set(id, []);
+      return [];
     }
   }
 
-  _prettyMediaFolderLabel(p) {
-    const key = String(p || "").replace(/\/+$/g, "").toLowerCase();
-    const parts = key.split("/").filter(Boolean);
-    const last = parts.pop() || "";
+  async _collectMediaSuggestionsDynamic(query) {
+    const defaults = this._getDefaultMediaSuggestions();
+    const q = this._normalizeMediaSourceValue(query);
 
-    // Special Frigate cases
-    if (last === "clips") return "Clips";
-    if (last === "snapshots") return "Snapshots";
-    if (last === "event-search") return "Event Search";
+    if (!q) return defaults.slice(0, 8);
 
-    return last.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-  }
-
-  // ✅ For <select> labels: show a friendly name + path to avoid duplicates
-  _selectOptionLabel(storeValue) {
-    const rel = this._prettyLabel(storeValue); // e.g. local/mac_share
-    const nice = this._prettyMediaFolderLabel(rel);
-    if (!rel) return nice || "";
-    // If rel is just a provider root (local/frigate/camera), keep it simple
-    if (!rel.includes("/")) return nice || rel;
-    return `${nice} — ${rel}`;
-  }
-
-  // ✅ ONE favorites key (array): media_folders_fav
-  _getFavFolders() {
-    const raw = this._config?.media_folders_fav;
-    if (!raw) return [];
-    if (Array.isArray(raw)) {
-      return raw.map(String).map((s) => s.trim()).filter(Boolean);
+    if (!q.startsWith("media-source://")) {
+      return defaults
+        .filter((v) => v.toLowerCase().includes(q.toLowerCase()))
+        .slice(0, 8);
     }
-    // fallback if someone stored as string
-    return String(raw)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+
+    const exactFolders = await this._browseMediaFolders(q);
+    if (exactFolders.length) return exactFolders.slice(0, 8);
+
+    const { base, needle } = this._mediaBaseAndNeedle(q);
+
+    if (!base) {
+      return defaults
+        .filter((v) => v.toLowerCase().includes(q.toLowerCase()))
+        .slice(0, 8);
+    }
+
+    const baseFolders = await this._browseMediaFolders(base);
+    if (!baseFolders.length) {
+      return defaults
+        .filter((v) => v.toLowerCase().includes(q.toLowerCase()))
+        .slice(0, 8);
+    }
+
+    const filtered = !needle
+      ? baseFolders
+      : baseFolders.filter((v) => {
+          const tail = v.slice(base.length + 1).toLowerCase();
+          return tail.includes(needle.toLowerCase());
+        });
+
+    return filtered.slice(0, 8);
   }
 
-  _setFavFolders(nextArray) {
-    const cleaned = Array.from(
-      new Set((nextArray || []).map((x) => String(x).trim()).filter(Boolean))
-    );
+  _filterSuggestions(list, query) {
+    const q = String(query || "").trim().toLowerCase();
+    if (!q) return list.slice(0, 8);
+    return list
+      .filter((v) => String(v).toLowerCase().includes(q))
+      .slice(0, 8);
+  }
 
-    if (!cleaned.length) {
-      const next = { ...this._config };
-      delete next.media_folders_fav; // keep YAML clean
-      this._config = next;
-      this._fire();
-      this._scheduleRender();
+  _openSuggestions(id, items) {
+    const prev = this._suggestState[id] || {
+      open: false,
+      items: [],
+      index: -1,
+    };
+
+    const sameItems =
+      JSON.stringify(prev.items || []) === JSON.stringify(items || []);
+
+    this._suggestState[id] = {
+      open: !!items.length,
+      items,
+      index: sameItems
+        ? Math.min(
+            prev.index >= 0 ? prev.index : 0,
+            Math.max(items.length - 1, 0)
+          )
+        : items.length
+          ? 0
+          : -1,
+    };
+
+    this._renderSuggestions(id);
+  }
+
+  _closeSuggestions(id) {
+    this._suggestState[id] = { open: false, items: [], index: -1 };
+    this._lastSuggestFingerprint[id] = "";
+    this._renderSuggestions(id);
+  }
+
+  _renderSuggestions(id) {
+    const box = this.shadowRoot?.getElementById(`${id}-suggestions`);
+    if (!box) return;
+
+    const state = this._suggestState[id] || { open: false, items: [], index: -1 };
+
+    if (!state.open || !state.items.length) {
+      box.innerHTML = "";
+      box.hidden = true;
       return;
     }
 
-    this._set("media_folders_fav", cleaned);
+    const activeItem =
+      state.index >= 0 && state.items[state.index] ? state.items[state.index] : "";
+
+    box.hidden = false;
+    box.innerHTML = `
+      ${state.items
+        .map(
+          (item, idx) => `
+            <button
+              type="button"
+              class="sugg-item ${idx === state.index ? "active" : ""}"
+              data-sugg-id="${id}"
+              data-sugg-value="${item.replace(/"/g, "&quot;")}"
+              title="${item.replace(/"/g, "&quot;")}"
+            >
+              ${item}
+            </button>
+          `
+        )
+        .join("")}
+      ${
+        activeItem
+          ? `<div class="sugg-active-path">${activeItem}</div>`
+          : ""
+      }
+    `;
+
+    box.querySelectorAll("[data-sugg-id]").forEach((btn) => {
+      btn.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        this._applySuggestion(id, btn.dataset.suggValue || "");
+      });
+    });
   }
 
-  _toggleFavOpen(open) {
-    this._favOpen = typeof open === "boolean" ? open : !this._favOpen;
+  _applySuggestion(id, value) {
+    const el = this.shadowRoot?.getElementById(id);
+    if (!el) return;
+
+    this._replaceCurrentLine(el, value);
+
+    if (id === "entities") {
+      this._commitEntities(false);
+      this._applyFieldValidation("entities");
+    } else if (id === "mediasources") {
+      this._commitMediaSources(false);
+      this._applyFieldValidation("mediasources");
+    }
+
+    this._closeSuggestions(id);
+  }
+
+  async _updateSuggestions(id) {
+    const el = this.shadowRoot?.getElementById(id);
+    if (!el) return;
+
+    const info = this._getTextareaLineInfo(el);
+    const query = String(info.line || "").trim();
+
+    if (id === "entities") {
+      const source = this._collectEntitySuggestions();
+      const items = this._filterSuggestions(source, query).filter(
+        (v) => String(v).trim() !== query
+      );
+
+      const fingerprint = JSON.stringify(items);
+      if (this._lastSuggestFingerprint[id] === fingerprint) return;
+      this._lastSuggestFingerprint[id] = fingerprint;
+
+      if (!items.length) {
+        this._closeSuggestions(id);
+        return;
+      }
+
+      this._openSuggestions(id, items);
+      return;
+    }
+
+    if (id === "mediasources") {
+      clearTimeout(this._mediaSuggestTimer);
+
+      this._mediaSuggestTimer = setTimeout(async () => {
+        const reqId = ++this._mediaSuggestReq;
+        const items = (await this._collectMediaSuggestionsDynamic(query)).filter(
+          (v) => String(v).trim() !== query
+        );
+
+        if (reqId !== this._mediaSuggestReq) return;
+
+        const fingerprint = JSON.stringify(items);
+        if (this._lastSuggestFingerprint[id] === fingerprint) return;
+        this._lastSuggestFingerprint[id] = fingerprint;
+
+        if (!items.length) {
+          this._closeSuggestions(id);
+          return;
+        }
+
+        this._openSuggestions(id, items);
+      }, 120);
+    }
+  }
+
+  _moveSuggestion(id, dir) {
+    const state = this._suggestState[id];
+    if (!state?.open || !state.items.length) return;
+
+    let idx = state.index + dir;
+    if (idx < 0) idx = state.items.length - 1;
+    if (idx >= state.items.length) idx = 0;
+
+    this._suggestState[id] = { ...state, index: idx };
+    this._renderSuggestions(id);
+  }
+
+  _acceptSuggestion(id) {
+    const state = this._suggestState[id];
+    if (!state?.open || !state.items.length) return false;
+    const idx = state.index >= 0 ? state.index : 0;
+    const value = state.items[idx];
+    this._applySuggestion(id, value);
+    return true;
+  }
+
+  _applyFieldValidation(id) {
+    const el = this.shadowRoot?.getElementById(id);
+    if (!el) return;
+    const field = el.closest(".field");
+    if (!field) return;
+
+    field.classList.remove("valid", "invalid");
+
+    let state = "neutral";
+    if (id === "entities") state = this._validateSensors(el.value);
+    if (id === "mediasources") state = this._validateMediaFolders(el.value);
+
+    if (state === "valid") field.classList.add("valid");
+    if (state === "invalid") field.classList.add("invalid");
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+
+    const ae = this.shadowRoot?.activeElement;
+    const interacting =
+      ae &&
+      (ae.id === "entities" ||
+        ae.id === "mediasources" ||
+        ae.id === "delservice" ||
+        ae.id === "height" ||
+        ae.id === "thumb" ||
+        ae.id === "maxmedia" ||
+        ae.id === "barop" ||
+        ae.id === "livecam") &&
+      ae.matches(":focus");
+
+    if (interacting) return;
+
     this._scheduleRender();
+  }
+
+  setConfig(config) {
+    this._config = this._stripAlwaysTrueKeys({ ...(config || {}) });
+
+    if ("shell_command" in this._config) {
+      const next = { ...this._config };
+      delete next.shell_command;
+      this._config = next;
+    }
+
+    try {
+      const cfg = { ...(config || {}) };
+
+      const normArr = (arr) =>
+        (arr || [])
+          .map(String)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+      const entArr = Array.isArray(cfg.entities) ? cfg.entities : null;
+      const singleEntity = String(cfg.entity || "").trim();
+
+      const pickedEntities =
+        (entArr && normArr(entArr)) || (singleEntity ? [singleEntity] : []);
+
+      const hasEntities =
+        Array.isArray(this._config.entities) && this._config.entities.length;
+
+      if (
+        !hasEntities &&
+        pickedEntities.length &&
+        ("entity" in cfg || singleEntity)
+      ) {
+        const next = { ...this._config, entities: pickedEntities };
+        delete next.entity;
+        this._config = this._stripAlwaysTrueKeys(next);
+        this._fire();
+      }
+
+      const msArr = Array.isArray(cfg.media_sources) ? cfg.media_sources : null;
+      const favArr = Array.isArray(cfg.media_folders_fav)
+        ? cfg.media_folders_fav
+        : null;
+      const single = String(cfg.media_source || "").trim();
+
+      const pickedMedia =
+        (msArr && normArr(msArr)) ||
+        (favArr && normArr(favArr)) ||
+        (single ? [single] : []);
+
+      const hasMediaSources =
+        Array.isArray(this._config.media_sources) &&
+        this._config.media_sources.length;
+
+      const hasLegacyMedia =
+        "media_source" in cfg || "media_folders_fav" in cfg;
+      if (
+        !hasMediaSources &&
+        pickedMedia.length &&
+        (hasLegacyMedia || single)
+      ) {
+        const next = { ...this._config, media_sources: pickedMedia };
+        delete next.media_source;
+        delete next.media_folders_fav;
+        this._config = this._stripAlwaysTrueKeys(next);
+        this._fire();
+      }
+
+      const rawObjectFilters = Array.isArray(cfg.object_filters)
+        ? cfg.object_filters
+        : String(cfg.object_filters || "").trim()
+          ? [cfg.object_filters]
+          : [];
+
+      const normObjectFilters = this._normalizeObjectFilters(rawObjectFilters);
+      const currentObjectFilters = Array.isArray(this._config.object_filters)
+        ? this._normalizeObjectFilters(this._config.object_filters)
+        : [];
+
+      if (
+        JSON.stringify(normObjectFilters) !==
+        JSON.stringify(currentObjectFilters)
+      ) {
+        const next = { ...this._config };
+        if (normObjectFilters.length) next.object_filters = normObjectFilters;
+        else delete next.object_filters;
+        this._config = this._stripAlwaysTrueKeys(next);
+        this._fire();
+      }
+    } catch (_) {}
+
+    this._scheduleRender();
+  }
+
+  _commitEntities(commit = false) {
+    const entitiesEl = this.shadowRoot?.getElementById("entities");
+    const raw = String(entitiesEl?.value || "");
+    const arr = this._parseTextList(raw);
+
+    if (!arr.length) {
+      const next = { ...this._config };
+      delete next.entities;
+      delete next.entity;
+      this._config = this._stripAlwaysTrueKeys(next);
+      if (commit) {
+        this._fire();
+        this._scheduleRender();
+      }
+      return;
+    }
+
+    const next = { ...this._config, entities: arr };
+    delete next.entity;
+    this._config = this._stripAlwaysTrueKeys(next);
+
+    if (commit) {
+      this._fire();
+      this._scheduleRender();
+    }
+  }
+
+  _commitMediaSources(commit = false) {
+    const mediaEl = this.shadowRoot?.getElementById("mediasources");
+    const raw = String(mediaEl?.value || "");
+    const arr = this._parseTextList(raw);
+
+    if (!arr.length) {
+      const next = { ...this._config };
+      delete next.media_sources;
+      delete next.media_source;
+      this._config = this._stripAlwaysTrueKeys(next);
+      if (commit) {
+        this._fire();
+        this._scheduleRender();
+      }
+      return;
+    }
+
+    const next = { ...this._config, media_sources: arr };
+    delete next.media_source;
+    this._config = this._stripAlwaysTrueKeys(next);
+
+    if (commit) {
+      this._fire();
+      this._scheduleRender();
+    }
   }
 
   _render() {
     const c = this._config || {};
 
-    // ✅ SAVE focus + caret BEFORE nuking innerHTML
     try {
       const ae = this.shadowRoot?.activeElement;
       if (ae && ae.id) {
         const st =
           typeof ae.selectionStart === "number" ? ae.selectionStart : null;
-        const en = typeof ae.selectionEnd === "number" ? ae.selectionEnd : null;
+        const en =
+          typeof ae.selectionEnd === "number" ? ae.selectionEnd : null;
         this._focusState = {
           id: ae.id,
           value: typeof ae.value === "string" ? ae.value : null,
@@ -446,46 +931,38 @@ class CameraGalleryCardEditor extends HTMLElement {
     const sensorModeOn = sourceMode === "sensor";
     const mediaModeOn = sourceMode === "media";
 
-    const fileSensor = String(c.entity || "").trim();
-
-    const sensorOptions = this._hass
-      ? Object.values(this._hass.states)
-          .filter(
-            (e) =>
-              e.entity_id.startsWith("sensor.") &&
-              e.attributes?.fileList !== undefined
-          )
-          .map((e) => e.entity_id)
-          .sort((a, b) => a.localeCompare(b))
+    const entitiesArr = Array.isArray(c.entities)
+      ? c.entities.map(String).map((s) => s.trim()).filter(Boolean)
       : [];
+    const legacyEntity = String(c.entity || "").trim();
+    const effectiveEntities = entitiesArr.length
+      ? entitiesArr
+      : legacyEntity
+        ? [legacyEntity]
+        : [];
+    const entitiesText = this._sourcesToText(effectiveEntities);
 
-    const isSensorDomain = /^sensor\./i.test(fileSensor);
-    const entityExists = !!this._hass?.states?.[fileSensor];
+    const invalidEntities = effectiveEntities.filter((id) => {
+      const isSensorDomain = /^sensor\./i.test(id);
+      const exists = !!this._hass?.states?.[id];
+      return !isSensorDomain || !exists;
+    });
 
-    const mediaSource = String(c.media_source || "").trim();
-    const mediaLoading = this._mediaFoldersLoading === true;
+    const mediaSourcesArr = Array.isArray(c.media_sources)
+      ? c.media_sources.map(String).map((s) => s.trim()).filter(Boolean)
+      : [];
+    const mediaSourcesText = this._sourcesToText(mediaSourcesArr);
 
-    const mediaSourceIsFile =
-      !mediaSource.startsWith("media-source://") &&
-      this._looksLikeFile(mediaSource);
-
-    const baseList = Array.isArray(this._mediaFolders) ? this._mediaFolders : [];
-    const favs = this._getFavFolders();
-
-    // ✅ ALWAYS show ALL folders in the dropdown.
-    // Favorites are just pinned at the top (optgroup).
-    const allChoices = this._mergeChoices(
-      baseList,
-      mediaSourceIsFile ? "" : mediaSource
+    const mediaHasFile = mediaSourcesArr.some((s) =>
+      this._looksLikeFile(this._prettyLabel(s))
     );
 
-    const favChoices = favs.length
-      ? this._mergeChoices(baseList.filter((p) => favs.includes(p)), "")
-      : [];
+    const objectFiltersArr = this._normalizeObjectFilters(c.object_filters || []);
+    const selectedCount = objectFiltersArr.length;
+    const maxReached = selectedCount >= MAX_VISIBLE_OBJECT_FILTERS;
 
     const height = Number(c.preview_height) || 320;
     const thumbSize = Number(c.thumb_size) || 140;
-
     const maxMedia = (() => {
       const n = this._numInt(c.max_media, 20);
       return this._clampInt(n, 1, 100);
@@ -494,7 +971,6 @@ class CameraGalleryCardEditor extends HTMLElement {
     const tsPos = String(c.bar_position || "top");
     const previewPos = String(c.preview_position || "top");
 
-    // ✅ NEW: thumb bar position (overlay on each thumb)
     const thumbBarPos = (() => {
       const v = String(c.thumb_bar_position || "bottom").toLowerCase().trim();
       if (v === "top") return "top";
@@ -508,7 +984,8 @@ class CameraGalleryCardEditor extends HTMLElement {
       .sort((a, b) => a.localeCompare(b));
 
     const deleteService = String(c.delete_service || c.shell_command || "").trim();
-    const deleteOk = /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(deleteService);
+    const deleteOk =
+      !deleteService || /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(deleteService);
 
     const deleteChoices = (() => {
       const set = new Set(shellCmds);
@@ -525,15 +1002,15 @@ class CameraGalleryCardEditor extends HTMLElement {
     const barDisabled = tsPos === "hidden";
     const clickToOpen = c.preview_click_to_open === true;
 
-    const entityChoices = (() => {
-      const set = new Set(sensorOptions);
-      if (fileSensor) set.add(fileSensor);
-      return Array.from(set).sort((a, b) => a.localeCompare(b));
-    })();
+    const liveEnabled = c.live_enabled === true;
+    const liveCameraEntity = String(c.live_camera_entity || "").trim();
+    const showLiveToggle = c.show_live_toggle !== false;
+    const liveDefault = c.live_default === true;
 
-    const secOpenAttr = (id) => (this._secOpen[id] ? "true" : "false");
+    const cameraEntities = Object.keys(this._hass?.states || {})
+      .filter((id) => id.startsWith("camera."))
+      .sort((a, b) => a.localeCompare(b));
 
-    // Theme-aware palette
     const isLight = this._isLightTheme();
 
     const dark = {
@@ -545,24 +1022,41 @@ class CameraGalleryCardEditor extends HTMLElement {
       text2: "rgba(255,255,255,0.72)",
       inputBg: "rgba(255,255,255,0.06)",
       inputBorder: "rgba(255,255,255,0.08)",
-      chevronBg: "rgba(255,255,255,0.06)",
-      chevronBorder: "rgba(255,255,255,0.10)",
+      selectBg: "rgba(255,255,255,0.06)",
+      selectBorder: "rgba(255,255,255,0.08)",
       segBg: "rgba(255,255,255,0.06)",
       segBorder: "rgba(255,255,255,0.10)",
       segTxt: "rgba(255,255,255,0.78)",
       segOnBg: "#ffffff",
       segOnTxt: "rgba(0,0,0,0.95)",
-      arrow: "rgba(255,255,255,0.85)",
+      arrow: "rgba(255,255,255,0.82)",
       pillBg: "rgba(255,255,255,0.10)",
       pillBorder: "rgba(255,255,255,0.10)",
+      pillTxt: "rgba(255,255,255,0.98)",
       muted: "0.55",
       invalid: "rgba(255, 77, 77, 0.85)",
       invalidGlow: "rgba(255, 77, 77, 0.18)",
-      popBg: "rgba(20, 20, 24, 0.94)",
-      popBorder: "rgba(255,255,255,0.14)",
-      popShadow1: "rgba(0,0,0,0.55)",
-      popShadow2: "rgba(0,0,0,0.25)",
-      pillTxt: "rgba(255,255,255,0.92)",
+      valid: "rgba(46,204,113,0.95)",
+      validGlow: "rgba(46,204,113,0.18)",
+      chipBg: "rgba(255,255,255,0.04)",
+      chipBorder: "rgba(255,255,255,0.10)",
+      chipTxt: "rgba(255,255,255,0.92)",
+      chipOnBg: "rgba(255,255,255,0.12)",
+      chipOnBorder: "rgba(255,255,255,0.20)",
+      chipOnTxt: "rgba(255,255,255,0.98)",
+      chipIconBg: "rgba(255,255,255,0.08)",
+      chipOnIconBg: "rgba(255,255,255,0.14)",
+      chipDisabled: "0.42",
+      tabBg: "rgba(255,255,255,0.04)",
+      tabBorder: "rgba(255,255,255,0.08)",
+      tabTxt: "rgba(255,255,255,0.76)",
+      tabOnBg: "rgba(255,255,255,0.12)",
+      tabOnBorder: "rgba(255,255,255,0.18)",
+      tabOnTxt: "rgba(255,255,255,0.98)",
+      suggBg: "rgba(20,20,20,0.96)",
+      suggBorder: "rgba(255,255,255,0.10)",
+      suggHover: "rgba(255,255,255,0.10)",
+      suggActive: "rgba(255,255,255,0.16)",
     };
 
     const lightPal = {
@@ -574,26 +1068,41 @@ class CameraGalleryCardEditor extends HTMLElement {
       text2: "rgba(0,0,0,0.62)",
       inputBg: "rgba(0,0,0,0.03)",
       inputBorder: "rgba(0,0,0,0.12)",
-      chevronBg: "rgba(0,0,0,0.04)",
-      chevronBorder: "rgba(0,0,0,0.12)",
+      selectBg: "rgba(0,0,0,0.03)",
+      selectBorder: "rgba(0,0,0,0.12)",
       segBg: "rgba(0,0,0,0.05)",
       segBorder: "rgba(0,0,0,0.10)",
       segTxt: "rgba(0,0,0,0.68)",
       segOnBg: "rgba(0,0,0,0.88)",
       segOnTxt: "rgba(255,255,255,0.98)",
       arrow: "rgba(0,0,0,0.60)",
-      pillBg: "rgba(0,0,0,0.06)",
-      pillBorder: "rgba(0,0,0,0.10)",
       muted: "0.65",
-      invalid: "rgba(219, 68, 55, 0.85)",
-      invalidGlow: "rgba(219, 68, 55, 0.18)",
-      popBg: "rgba(255,255,255,0.96)",
-      popBorder: "rgba(0,0,0,0.14)",
-      popShadow1: "rgba(0,0,0,0.18)",
-      popShadow2: "rgba(0,0,0,0.10)",
+      invalid: "rgba(219,68,55,0.90)",
+      invalidGlow: "rgba(219,68,55,0.18)",
+      valid: "rgba(46, 160, 67, 0.95)",
+      validGlow: "rgba(46, 160, 67, 0.18)",
+      chipBg: "rgba(0,0,0,0.03)",
+      chipBorder: "rgba(0,0,0,0.10)",
+      chipTxt: "rgba(0,0,0,0.88)",
+      chipOnBg: "rgba(0,0,0,0.08)",
+      chipOnBorder: "rgba(0,0,0,0.16)",
+      chipOnTxt: "rgba(0,0,0,0.92)",
+      chipIconBg: "rgba(0,0,0,0.06)",
+      chipOnIconBg: "rgba(0,0,0,0.10)",
+      chipDisabled: "0.46",
       pillTxt: "rgba(255,255,255,0.98)",
       pillBg: "rgba(0,0,0,0.55)",
       pillBorder: "rgba(0,0,0,0.18)",
+      tabBg: "rgba(0,0,0,0.03)",
+      tabBorder: "rgba(0,0,0,0.10)",
+      tabTxt: "rgba(0,0,0,0.70)",
+      tabOnBg: "rgba(0,0,0,0.08)",
+      tabOnBorder: "rgba(0,0,0,0.16)",
+      tabOnTxt: "rgba(0,0,0,0.92)",
+      suggBg: "rgba(255,255,255,0.98)",
+      suggBorder: "rgba(0,0,0,0.12)",
+      suggHover: "rgba(0,0,0,0.05)",
+      suggActive: "rgba(0,0,0,0.09)",
     };
 
     const p = isLight ? lightPal : dark;
@@ -603,224 +1112,284 @@ class CameraGalleryCardEditor extends HTMLElement {
       --ed-section-border:${p.sectionBorder};
       --ed-row-bg:${p.rowBg};
       --ed-row-border:${p.rowBorder};
-
       --ed-text:${p.text};
       --ed-text2:${p.text2};
-
       --ed-input-bg:${p.inputBg};
       --ed-input-border:${p.inputBorder};
-
-      --ed-chev-bg:${p.chevronBg};
-      --ed-chev-border:${p.chevronBorder};
-
+      --ed-select-bg:${p.selectBg};
+      --ed-select-border:${p.selectBorder};
       --ed-seg-bg:${p.segBg};
       --ed-seg-border:${p.segBorder};
       --ed-seg-txt:${p.segTxt};
       --ed-seg-on-bg:${p.segOnBg};
       --ed-seg-on-txt:${p.segOnTxt};
-
       --ed-arrow:${p.arrow};
-
       --ed-pill-bg:${p.pillBg};
       --ed-pill-border:${p.pillBorder};
       --ed-pill-txt:${p.pillTxt};
-
       --ed-muted:${p.muted};
-
       --ed-invalid:${p.invalid};
       --ed-invalid-glow:${p.invalidGlow};
-
-      --ed-pop-bg:${p.popBg};
-      --ed-pop-border:${p.popBorder};
-      --ed-pop-shadow1:${p.popShadow1};
-      --ed-pop-shadow2:${p.popShadow2};
+      --ed-valid:${p.valid};
+      --ed-valid-glow:${p.validGlow};
+      --ed-chip-bg:${p.chipBg};
+      --ed-chip-border:${p.chipBorder};
+      --ed-chip-txt:${p.chipTxt};
+      --ed-chip-on-bg:${p.chipOnBg};
+      --ed-chip-on-border:${p.chipOnBorder};
+      --ed-chip-on-txt:${p.chipOnTxt};
+      --ed-chip-on-icon-bg:${p.chipOnIconBg};
+      --ed-chip-icon-bg:${p.chipIconBg};
+      --ed-chip-disabled:${p.chipDisabled};
+      --ed-tab-bg:${p.tabBg};
+      --ed-tab-border:${p.tabBorder};
+      --ed-tab-txt:${p.tabTxt};
+      --ed-tab-on-bg:${p.tabOnBg};
+      --ed-tab-on-border:${p.tabOnBorder};
+      --ed-tab-on-txt:${p.tabOnTxt};
+      --ed-sugg-bg:${p.suggBg};
+      --ed-sugg-border:${p.suggBorder};
+      --ed-sugg-hover:${p.suggHover};
+      --ed-sugg-active:${p.suggActive};
     `;
 
-    // INLINE picker items (from ALL folders)
-    const q = String(this._favQuery || "").trim().toLowerCase();
-    const pickerItems = baseList
-      .map((pval) => {
-        const path = this._prettyLabel(pval);
-        const nice = this._prettyMediaFolderLabel(path);
-        const searchKey = `${nice} ${path}`.toLowerCase();
-        return { value: String(pval), path, nice, searchKey };
-      })
-      .filter((it) => !q || it.searchKey.includes(q))
-      .sort((a, b) => a.searchKey.localeCompare(b.searchKey));
-
-    const favCount = favs.length;
-    const favBtnText = favCount ? `Folders (${favCount})` : `Folders`;
-
-    const favSummary = favCount
-      ? favs
-          .slice(0, 3)
-          .map((v) => this._prettyMediaFolderLabel(this._prettyLabel(v)))
-          .join(", ") + (favCount > 3 ? ` +${favCount - 3} more` : "")
-      : "Select folders to filter (pin) your favorites";
-
-    // ✅ Build <select> options with optgroups (favorites + all)
-    const buildMediaOptions = () => {
-      const esc = (s) =>
-        String(s || "")
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;");
-
-      const cur = mediaSource;
-      const curInFav = favChoices.includes(cur);
-      const curInAll = allChoices.includes(cur);
-
-      const option = (val) => {
-        const label = this._selectOptionLabel(val);
-        return `<option value="${esc(val)}" ${
-          val === cur ? "selected" : ""
-        }>${esc(label)}</option>`;
-      };
-
-      if (mediaLoading) {
-        return `<option value="${esc(cur)}" selected>(loading…)</option>`;
-      }
-
-      // If current value is a "file", show warning option first
-      const warning = mediaSourceIsFile
-        ? `<option value="${esc(mediaSource)}" selected>⚠️ ${esc(
-            mediaSource
-          )} (file — choose a folder)</option>`
-        : "";
-
-      // No folders at all
-      if (!allChoices.length) {
-        return `${warning}<option value="${esc(
-          cur
-        )}" selected>(no folders found)</option>`;
-      }
-
-      // With favorites: show an optgroup pinned at the top, BUT still show everything.
-      if (favChoices.length) {
-        const favOpts = favChoices.map(option).join("");
-        // All group should include all, but avoid dupes inside the group label set
-        const allGroupList = allChoices.filter((v) => !favChoices.includes(v));
-        const allOpts = allGroupList.map(option).join("");
-
-        // Ensure current value is visible even if it's not in lists (rare)
-        const orphan =
-          cur && !curInFav && !curInAll && !mediaSourceIsFile ? option(cur) : "";
-
-        return `
-          ${warning}
-          ${orphan}
-          <optgroup label="Favorites">
-            ${favOpts}
-          </optgroup>
-          <optgroup label="All folders">
-            ${allOpts}
-          </optgroup>
-        `;
-      }
-
-      // No favorites: just show all
-      return `${warning}${allChoices.map(option).join("")}`;
-    };
+    const tabBtn = (key, label) => `
+      <button
+        type="button"
+        class="tabbtn ${this._activeTab === key ? "on" : ""}"
+        data-tab="${key}"
+      >
+        <span>${label}</span>
+      </button>
+    `;
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host { display:block; padding:8px 0; color: var(--ed-text); }
-        .wrap { display:grid; gap:14px; }
+        :host{
+          display:block;
+          padding:8px 0;
+          color:var(--ed-text);
+          box-sizing:border-box;
+          min-width:0;
+        }
 
-        .section{
-          padding:14px;
+        .wrap{ display:grid; gap:14px; min-width:0; }
+        .desc, code { overflow-wrap:anywhere; word-break:break-word; }
+        .tabs{ display:grid; gap:12px; }
+
+        .tabbar{
+          display:grid;
+          grid-template-columns:repeat(4,minmax(0,1fr));
+          gap:8px;
+          padding:8px;
           border-radius:16px;
           background:var(--ed-section-bg);
           border:1px solid var(--ed-section-border);
         }
 
-        .shead{
+        .tabbtn{
+          appearance:none;
+          -webkit-appearance:none;
+          border:1px solid var(--ed-tab-border);
+          background:var(--ed-tab-bg);
+          color:var(--ed-tab-txt);
+          border-radius:12px;
+          min-height:42px;
+          padding:10px 12px;
+          cursor:pointer;
+          font-size:13px;
+          font-weight:900;
           display:flex;
           align-items:center;
-          justify-content:space-between;
-          gap:10px;
-          cursor:pointer;
-          user-select:none;
+          justify-content:center;
+          gap:8px;
+          text-align:center;
+          transition:0.18s ease;
+          min-width:0;
         }
 
-        .stitle{
+        .tabbtn.on{
+          background:var(--ed-tab-on-bg);
+          border-color:var(--ed-tab-on-border);
+          color:var(--ed-tab-on-txt);
+        }
+
+        .tabpanel{
+          padding:14px;
+          border-radius:16px;
+          background:var(--ed-section-bg);
+          border:1px solid var(--ed-section-border);
+          display:grid;
+          gap:12px;
+        }
+
+        .paneltitle{
           display:flex;
           align-items:center;
           gap:10px;
           font-size:16px;
           font-weight:1000;
-          color: var(--ed-text);
+          color:var(--ed-text);
         }
 
-        .ico{
-          width:18px;
-          height:18px;
-          display:inline-grid;
-          place-items:center;
-          opacity:0.9;
-        }
-
-        .chev{
-          width:28px;
-          height:28px;
-          border-radius:10px;
-          border:1px solid var(--ed-chev-border);
-          background:var(--ed-chev-bg);
+        .row{
           display:grid;
-          place-items:center;
-          opacity:0.85;
-          transition:0.18s ease;
-          color: var(--ed-text);
-        }
-
-        .chev svg{
-          width:14px;
-          height:14px;
-          transform:rotate(0deg);
-          transition:0.18s ease;
-        }
-
-        .section[data-open="false"] .chev svg{ transform:rotate(-90deg); }
-
-        .sbody{ margin-top:12px; display:grid; gap:12px; }
-        .section[data-open="false"] .sbody{ display:none; }
-
-        .row {
-          display:grid;
-          gap:8px;
+          gap:10px;
           padding:14px;
           border-radius:14px;
           background:var(--ed-row-bg);
           border:1px solid var(--ed-row-border);
-          color: var(--ed-text);
+          color:var(--ed-text);
+          min-width:0;
         }
 
-        .lbl { font-size:13px; font-weight:900; color: var(--ed-text); }
-        .desc { font-size:12px; opacity:0.8; color: var(--ed-text2); }
+        .lbl{ font-size:13px; font-weight:900; color:var(--ed-text); }
+        .desc{ font-size:12px; opacity:0.8; color:var(--ed-text2); }
+        code{ opacity:0.9; }
 
-        code { opacity: 0.9; }
+        ha-textfield, ha-slider{ width:100%; }
 
-        .input {
+        .field{
+          position:relative;
+          min-width:0;
+        }
+
+        .field textarea{
           width:100%;
           box-sizing:border-box;
           border-radius:10px;
           border:1px solid var(--ed-input-border);
           background:var(--ed-input-bg);
           color:var(--ed-text);
-          padding:10px 12px;
+          padding:12px;
           font-size:13px;
           font-weight:800;
           outline:none;
+          resize:vertical;
+          min-height:108px;
+          line-height:1.4;
+          white-space:pre-wrap;
+          font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
         }
 
-        .input.invalid{
-          border-color: var(--ed-invalid);
-          box-shadow: 0 0 0 2px var(--ed-invalid-glow);
+        .field textarea:disabled{
+          opacity:0.65;
+          cursor:not-allowed;
         }
 
-        .segwrap { display:flex; gap:8px; }
-        .seg {
+        .field.valid textarea{
+          border-color:var(--ed-valid);
+          box-shadow:0 0 0 2px var(--ed-valid-glow);
+        }
+
+        .field.invalid textarea{
+          border-color:var(--ed-invalid);
+          box-shadow:0 0 0 2px var(--ed-invalid-glow);
+        }
+
+        .suggestions{
+          position:absolute;
+          left:0;
+          right:0;
+          top:calc(100% + 6px);
+          background:var(--ed-sugg-bg);
+          border:1px solid var(--ed-sugg-border);
+          border-radius:12px;
+          box-shadow:0 10px 30px rgba(0,0,0,0.18);
+          padding:6px;
+          display:grid;
+          gap:4px;
+          z-index:999;
+          max-height:260px;
+          overflow:auto;
+        }
+
+        .suggestions[hidden]{ display:none; }
+
+        .sugg-item{
+          appearance:none;
+          -webkit-appearance:none;
+          border:0;
+          background:transparent;
+          color:var(--ed-text);
+          text-align:left;
+          padding:10px 12px;
+          border-radius:10px;
+          cursor:pointer;
+          font-size:12px;
+          font-weight:800;
+          font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+          white-space:normal;
+          overflow:visible;
+          text-overflow:clip;
+          word-break:break-word;
+          overflow-wrap:anywhere;
+          line-height:1.35;
+        }
+
+        .sugg-item:hover{
+          background:var(--ed-sugg-hover);
+        }
+
+        .sugg-item.active{
+          background:var(--ed-sugg-active);
+        }
+
+        .sugg-active-path{
+          padding:8px 10px;
+          font-size:11px;
+          opacity:0.75;
+          word-break:break-word;
+          overflow-wrap:anywhere;
+          border-top:1px solid var(--ed-sugg-border);
+          margin-top:2px;
+        }
+
+        .selectwrap{ position:relative; min-width:0; }
+
+        .select{
+          width:100%;
+          box-sizing:border-box;
+          border-radius:10px;
+          border:1px solid var(--ed-select-border);
+          background:var(--ed-select-bg);
+          color:var(--ed-text);
+          padding:10px 40px 10px 12px;
+          font-size:13px;
+          font-weight:800;
+          outline:none;
+          min-width:0;
+          appearance:none;
+          -webkit-appearance:none;
+          cursor:pointer;
+        }
+
+        .select:disabled{
+          opacity:0.65;
+          cursor:not-allowed;
+        }
+
+        .selarrow{
+          position:absolute;
+          top:50%;
+          right:16px;
+          width:10px;
+          height:10px;
+          transform:translateY(-60%) rotate(45deg);
+          border-right:2px solid var(--ed-arrow);
+          border-bottom:2px solid var(--ed-arrow);
+          pointer-events:none;
+          opacity:0.9;
+        }
+
+        .select.invalid{
+          border-color:var(--ed-invalid);
+          box-shadow:0 0 0 2px var(--ed-invalid-glow);
+        }
+
+        .segwrap{ display:flex; gap:8px; }
+
+        .seg{
           flex:1;
           border:1px solid var(--ed-seg-border);
           background:var(--ed-seg-bg);
@@ -830,102 +1399,35 @@ class CameraGalleryCardEditor extends HTMLElement {
           font-size:13px;
           font-weight:800;
           cursor:pointer;
+          min-width:0;
         }
-        .seg.on {
+
+        .seg.on{
           background:var(--ed-seg-on-bg);
           color:var(--ed-seg-on-txt);
           border-color:transparent;
-        }
-
-        .selectwrap{ position:relative; }
-        select.select{
-          appearance:none;
-          -webkit-appearance:none;
-          padding-right:44px;
-          cursor:pointer;
-        }
-        .selarrow{
-          position:absolute;
-          top:50%;
-          right:20px;
-          width:10px;
-          height:10px;
-          transform:translateY(-50%) rotate(45deg);
-          border-right:2px solid var(--ed-arrow);
-          border-bottom:2px solid var(--ed-arrow);
-          pointer-events:none;
-          opacity:0.9;
         }
 
         .togrow{
           display:flex;
           align-items:center;
           justify-content:space-between;
-          color: var(--ed-text);
           gap:12px;
-        }
-
-        .toggle{
-          appearance:none;
-          -webkit-appearance:none;
-          width:46px;
-          height:28px;
-          border-radius:999px;
-          position:relative;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          cursor:pointer;
-          flex: 0 0 auto;
-        }
-
-        .toggle::after{
-          content:"";
-          position:absolute;
-          top:3px;
-          left:3px;
-          width:22px;
-          height:22px;
-          border-radius:999px;
-          background:rgba(255,255,255,0.92);
-          transition:0.18s ease;
-        }
-
-        .toggle:checked{
-          background:var(--ed-seg-on-bg);
-          border-color:transparent;
-        }
-
-        .toggle:checked::after{
-          transform:translateX(18px);
-          background:var(--ed-seg-on-txt);
+          min-width:0;
         }
 
         .barrow{
+          display:grid;
+          gap:10px;
+          min-width:0;
+        }
+
+        .barrow-top{
           display:flex;
           align-items:center;
+          justify-content:space-between;
           gap:12px;
         }
-
-        .hint {
-          margin: 6px 0 10px 0;
-          font-size: 12px;
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          opacity: 0.9;
-          color: var(--ed-text2);
-        }
-
-        .hint ha-icon { --mdc-icon-size: 14px; color: var(--ed-text2); }
-
-        .hint a {
-          color: var(--primary-color);
-          text-decoration: none;
-          font-weight: 700;
-        }
-        .hint a:hover { text-decoration: underline; }
-
-        .slider { width:100%; accent-color: var(--primary-color); }
 
         .pillval{
           min-width:52px;
@@ -936,563 +1438,641 @@ class CameraGalleryCardEditor extends HTMLElement {
           border:1px solid var(--ed-pill-border);
           font-size:12px;
           font-weight:1000;
-          color: var(--ed-pill-txt);
+          color:var(--ed-pill-txt);
         }
 
-        /* NOTE: muted no longer blocks clicks (fix) */
-        .muted{
-          opacity: var(--ed-muted);
-        }
+        .muted{ opacity:var(--ed-muted); }
 
-        /* INLINE dropdown */
-        .favwrap{ margin-top:10px; display:grid; gap:10px; }
-        .favbtn{
-          width:100%;
-          border-radius:12px;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color: var(--ed-text);
-          padding:10px 12px;
-          font-size:13px;
-          font-weight:1000;
-          cursor:pointer;
+        .hint{
+          margin:6px 0 2px 0;
+          font-size:12px;
+          opacity:0.9;
+          color:var(--ed-text2);
           display:flex;
           align-items:center;
-          justify-content:space-between;
-          gap:12px;
-          box-sizing:border-box;
-          user-select:none;
+          gap:8px;
+          flex-wrap:wrap;
         }
-        .favbtn .sub{
-          font-size:12px;
-          font-weight:800;
-          opacity:0.75;
-          color: var(--ed-text2);
-          white-space:nowrap;
+
+        .hint ha-icon{ --mdc-icon-size:14px; color:var(--ed-text2); }
+        .hint a{
+          color:var(--primary-color);
+          text-decoration:none;
+          font-weight:700;
+        }
+        .hint a:hover{ text-decoration:underline; }
+
+        .chip-grid{
+          display:grid;
+          grid-template-columns:repeat(auto-fit,minmax(110px,1fr));
+          gap:8px;
+          margin-top:4px;
+        }
+
+        .objchip{
+          display:grid;
+          grid-template-columns:34px 1fr;
+          align-items:center;
+          column-gap:10px;
+          width:100%;
+          min-height:40px;
+          padding:0 10px;
+          border-radius:10px;
+          border:1px solid var(--ed-chip-border);
+          background:var(--ed-chip-bg);
+          color:var(--ed-chip-txt);
+          cursor:pointer;
+          transition:0.18s ease;
+          box-sizing:border-box;
+          font-size:13px;
+          font-weight:900;
+          text-align:left;
+        }
+
+        .objchip:hover{ background:rgba(255,255,255,0.08); }
+        .objchip.on{
+          background:var(--ed-chip-on-bg);
+          border-color:var(--ed-chip-on-border);
+          color:var(--ed-chip-on-txt);
+        }
+        .objchip.disabled{
+          opacity:var(--ed-chip-disabled);
+          cursor:not-allowed;
+        }
+
+        .objchip-icon{
+          width:34px;
+          height:34px;
+          min-width:34px;
+          border-radius:999px;
+          display:grid;
+          place-items:center;
+          background:var(--ed-chip-icon-bg);
+        }
+
+        .objchip.on .objchip-icon{
+          background:var(--ed-chip-on-icon-bg);
+          color:inherit;
+        }
+
+        .objchip-icon ha-icon{
+          --mdc-icon-size:18px;
+          color:inherit;
+          width:18px;
+          height:18px;
+          display:block;
+        }
+
+        .objchip-label{
+          min-width:0;
           overflow:hidden;
           text-overflow:ellipsis;
-          max-width: 100%;
+          white-space:nowrap;
+          color:inherit;
         }
-        .favbtn .caret{
-          width:10px;
-          height:10px;
-          transform: rotate(45deg);
-          border-right:2px solid var(--ed-arrow);
-          border-bottom:2px solid var(--ed-arrow);
-          opacity:0.8;
-          flex:0 0 auto;
-        }
-        .favbtn[aria-expanded="true"] .caret{ transform: rotate(225deg); }
 
-        .favpanel{
-          border-radius:14px;
-          border:1px solid var(--ed-row-border);
-          background: var(--ed-row-bg);
-          overflow:hidden;
-        }
-        .favpanel[hidden]{ display:none; }
-
-        .favhead{
-          padding:10px;
-          border-bottom:1px solid var(--ed-row-border);
+        .objmeta{
           display:flex;
-          gap:10px;
           align-items:center;
           justify-content:space-between;
-        }
-        .favhead .input{ padding:9px 10px; font-weight:800; }
-        .favhead button{
-          border-radius:10px;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color: var(--ed-text);
-          padding:9px 10px;
-          font-size:12px;
-          font-weight:1000;
-          cursor:pointer;
-          white-space:nowrap;
-        }
-
-        .favlist{
-          display:grid;
-          gap:8px;
-          max-height: 220px;
-          overflow:auto;
-          padding:10px;
-          padding-right:6px;
-        }
-
-        .favitem{
-          display:flex;
           gap:10px;
-          align-items:flex-start;
-          padding:10px;
-          border-radius:12px;
-          background: var(--ed-row-bg);
-          border: 1px solid var(--ed-row-border);
-          cursor:pointer;
-        }
-        .favitem input{
-          margin-top: 2px;
-          width: 18px;
-          height: 18px;
-          accent-color: var(--primary-color);
-          flex: 0 0 auto;
-        }
-        .favitem .t{ display:grid; gap:2px; min-width:0; }
-        .favitem .name{
-          font-weight: 1000;
-          font-size: 13px;
-          color: var(--ed-text);
-        }
-        .favitem .path{
-          font-weight: 800;
-          font-size: 12px;
-          opacity: 0.75;
-          color: var(--ed-text2);
-          word-break: break-all;
+          flex-wrap:wrap;
+          margin-top:2px;
         }
 
-        .favempty{ font-size:12px; opacity:0.8; color: var(--ed-text2); padding:6px 2px; }
+        @media (max-width:900px){
+          .tabbar{
+            grid-template-columns:repeat(2,minmax(0,1fr));
+          }
+        }
       </style>
 
       <div class="wrap" style="${rootVars}">
-
-        <!-- GENERAL -->
-        <div class="section" id="sec-general" data-open="${secOpenAttr(
-          "sec-general"
-        )}">
-          <div class="shead" data-toggle="sec-general">
-            <div class="stitle">
-              <span class="ico">⚙️</span>
-              <span>General</span>
-            </div>
-            <div class="chev" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M8 10l4 4 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </div>
+        <div class="tabs">
+          <div class="tabbar">
+            ${tabBtn("general", "General")}
+            ${tabBtn("viewer", "Viewer")}
+            ${tabBtn("live", "Live")}
+            ${tabBtn("thumbs", "Thumbnails")}
           </div>
 
-          <div class="sbody">
-
-            <div class="row">
-              <div class="lbl">Source mode</div>
-              <div class="desc">Choose how this gallery loads its files</div>
-              <div class="segwrap">
-                <button class="seg ${
-                  sensorModeOn ? "on" : ""
-                }" data-src="sensor">File sensor</button>
-                <button class="seg ${
-                  mediaModeOn ? "on" : ""
-                }" data-src="media">Media folder</button>
-              </div>
-            </div>
-
-            <div class="row ${sensorModeOn ? "" : "muted"}">
-              <div class="lbl">File sensor</div>
-              <div class="desc">Sensor entity that contains the <code>fileList</code> attribute</div>
-
-              <div class="selectwrap">
-                <select class="input select ${
-                  fileSensor && (!isSensorDomain || !entityExists) ? "invalid" : ""
-                }" id="entity" ${sensorModeOn ? "" : "disabled"}>
-                  ${
-                    entityChoices.length
-                      ? entityChoices
-                          .map(
-                            (id) =>
-                              `<option value="${id}" ${
-                                id === fileSensor ? "selected" : ""
-                              }>${id}</option>`
-                          )
-                          .join("")
-                      : `<option value="" selected>(no sensors found)</option>`
-                  }
-                </select>
-                <span class="selarrow"></span>
-              </div>
-            </div>
-
-            <div class="row ${mediaModeOn ? "" : "muted"}">
-              <div class="lbl">Media source</div>
-              <div class="desc">Choose the media folder that contains your recordings or snapshots</div>
-              <div class="hint">Frigate users: use <code>frigate/frigate/clips</code> for clips or <code>frigate/frigate/snapshots</code> for snapshots</div>
-
-              <div class="selectwrap">
-                <select class="input select ${
-                  mediaSourceIsFile ? "invalid" : ""
-                }" id="mediasource" ${mediaModeOn ? "" : "disabled"}>
-                  ${buildMediaOptions()}
-                </select>
-                <span class="selarrow"></span>
+          ${
+            this._activeTab === "general"
+              ? `
+            <div class="tabpanel" data-panel="general">
+              <div class="paneltitle">
+                <span>⚙️</span>
+                <span>General</span>
               </div>
 
-              <!-- ✅ INLINE favorites picker -->
-              <div class="favwrap">
-                <div class="favbtn" id="favbtn" role="button" tabindex="0" aria-expanded="${
-                  this._favOpen ? "true" : "false"
-                }">
-                  <div style="display:grid; gap:2px; min-width:0;">
-                    <div style="display:flex; gap:8px; align-items:center;">
-                      <span>${favBtnText}</span>
-                    </div>
-                    <div class="sub">${favSummary}</div>
-                  </div>
-                  <span class="caret" aria-hidden="true"></span>
+              <div class="row">
+                <div class="lbl">Source mode</div>
+                <div class="desc">Choose how this gallery loads its files</div>
+                <div class="segwrap">
+                  <button class="seg ${sensorModeOn ? "on" : ""}" data-src="sensor">File sensor</button>
+                  <button class="seg ${mediaModeOn ? "on" : ""}" data-src="media">Media folders</button>
+                </div>
+              </div>
+
+              <div class="row ${sensorModeOn ? "" : "muted"}">
+                <div class="lbl">File sensors</div>
+                <div class="desc">Enter <b>one</b> sensor per line</div>
+
+                <div class="field" id="entities-field">
+                  <textarea
+                    id="entities"
+                    rows="4"
+                    ${sensorModeOn ? "" : "disabled"}
+                    placeholder="sensor.gallery_auto&#10;sensor.gallery_muis"
+                  ></textarea>
+                  <div class="suggestions" id="entities-suggestions" hidden></div>
                 </div>
 
-                <div class="favpanel" id="favpanel" ${
-                  this._favOpen ? "" : "hidden"
-                }>
-                  <div class="favhead">
-                    <input class="input" id="favquery" placeholder="Search folders…" value="${String(
-                      this._favQuery || ""
-                    ).replace(/"/g, "&quot;")}" />
-                    <button id="favdone" type="button">Done</button>
-                  </div>
+                ${
+                  invalidEntities.length
+                    ? `<div class="desc">⚠️ Invalid / missing sensor(s): <code>${invalidEntities.join(
+                        "</code>, <code>"
+                      )}</code></div>`
+                    : ``
+                }
+              </div>
 
-                  <div class="favlist" id="favlist">
+              <div class="row ${mediaModeOn ? "" : "muted"}">
+                <div class="lbl">Media folders</div>
+                <div class="desc">Enter <strong>one</strong> folder per line</div>
+
+                <div class="field" id="mediasources-field">
+                  <textarea
+                    id="mediasources"
+                    rows="4"
+                    placeholder=" "
+                    ${mediaModeOn ? "" : "disabled"}
+                  ></textarea>
+                  <div class="suggestions" id="mediasources-suggestions" hidden></div>
+                </div>
+
+                ${
+                  mediaHasFile
+                    ? `<div class="desc">⚠️ One of your entries looks like a file (extension). This field expects folders.</div>`
+                    : ``
+                }
+              </div>
+
+              <div class="row">
+                <div class="lbl">Delete service</div>
+
+                <div class="desc">
+                  Select the Home Assistant service used to delete a file
+                  (usually <code>shell_command.*</code>)
+                </div>
+
+                <div class="hint">
+                  <ha-icon icon="mdi:help-circle-outline"></ha-icon>
+                  <a
+                    href="https://github.com/TheScubadiver/camera-gallery-card?tab=readme-ov-file#delete-setup"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    How to configure the shell command
+                  </a>
+                </div>
+
+                <div class="selectwrap">
+                  <select class="select ${deleteOk ? "" : "invalid"}" id="delservice">
                     ${
-                      mediaLoading
-                        ? `<div class="favempty">(loading…)</div>`
-                        : pickerItems.length
-                        ? pickerItems
-                            .map((it) => {
-                              const checked = favs.includes(it.value);
-                              return `
-                                <label class="favitem">
-                                  <input type="checkbox" data-fav="${it.value}" ${
-                                checked ? "checked" : ""
-                              }/>
-                                  <div class="t">
-                                    <div class="name">${it.nice}</div>
-                                    <div class="path">${it.path}</div>
-                                  </div>
-                                </label>
-                              `;
-                            })
+                      deleteChoices.length
+                        ? `<option value=""></option>` +
+                          deleteChoices
+                            .map(
+                              (id) =>
+                                `<option value="${id}" ${id === deleteService ? "selected" : ""}>${id}</option>`
+                            )
                             .join("")
-                        : `<div class="favempty">(no results)</div>`
+                        : `<option value="" selected>(no shell_command services found)</option>`
                     }
-                  </div>
+                  </select>
+                  <span class="selarrow"></span>
                 </div>
               </div>
             </div>
+          `
+              : ``
+          }
 
-            <div class="row">
-              <div class="lbl">Delete service</div>
-
-              <div class="desc">
-                Select the Home Assistant service used to delete a file
-                (usually <code>shell_command.*</code>)
+          ${
+            this._activeTab === "viewer"
+              ? `
+            <div class="tabpanel" data-panel="viewer">
+              <div class="paneltitle">
+                <span>🖼️</span>
+                <span>Preview</span>
               </div>
 
-              <div class="hint">
-                <ha-icon icon="mdi:help-circle-outline"></ha-icon>
-                <a
-                  href="https://github.com/TheScubadiver/camera-gallery-card?tab=readme-ov-file#delete-setup"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  How to configure the shell command
-                </a>
+              <div class="row">
+                <div class="lbl">Height</div>
+                <ha-textfield id="height" label="Height" type="number"></ha-textfield>
               </div>
 
-              <div class="selectwrap">
-                <select class="input select ${
-                  deleteOk ? "" : "invalid"
-                }" id="delservice">
+              <div class="row">
+                <div class="lbl">Position</div>
+                <div class="segwrap">
+                  <button class="seg ${previewPos === "top" ? "on" : ""}" data-ppos="top">Top</button>
+                  <button class="seg ${previewPos === "bottom" ? "on" : ""}" data-ppos="bottom">Bottom</button>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Open-on-click</div>
+                <div class="desc">Only show the main viewer after selecting a thumbnail. Click on the preview to close</div>
+                <div class="togrow">
+                  <span>${clickToOpen ? "Enabled" : "Disabled"}</span>
+                  <ha-switch id="clicktoopen" ${clickToOpen ? "checked" : ""}></ha-switch>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Preview bar position</div>
+                <div class="segwrap">
+                  <button class="seg ${tsPos === "top" ? "on" : ""}" data-pos="top">Top</button>
+                  <button class="seg ${tsPos === "bottom" ? "on" : ""}" data-pos="bottom">Bottom</button>
+                  <button class="seg ${tsPos === "hidden" ? "on" : ""}" data-pos="hidden">Hidden</button>
+                </div>
+              </div>
+
+              <div class="row ${barDisabled ? "muted" : ""}">
+                <div class="lbl">Preview bar opacity</div>
+                <div class="barrow">
+                  <div class="barrow-top">
+                    <div class="desc">Preview bar opacity</div>
+                    <div class="pillval" id="barval">${barOpacity}%</div>
+                  </div>
+                  <ha-slider id="barop" min="0" max="100" step="1" ${barDisabled ? "disabled" : ""}></ha-slider>
+                </div>
+              </div>
+            </div>
+          `
+              : ``
+          }
+
+          ${
+            this._activeTab === "live"
+              ? `
+            <div class="tabpanel" data-panel="live">
+              <div class="paneltitle">
+                <span>📹</span>
+                <span>Live</span>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Live preview</div>
+                <div class="desc">Enable live camera mode inside the gallery preview</div>
+                <div class="togrow">
+                  <span>${liveEnabled ? "Enabled" : "Disabled"}</span>
+                  <ha-switch id="liveenabled" ${liveEnabled ? "checked" : ""}></ha-switch>
+                </div>
+              </div>
+
+              ${
+                liveEnabled
+                  ? `
+                <div class="row">
+                  <div class="lbl">Camera entity</div>
+                  <div class="desc">Select the camera entity used for live mode</div>
+
+                  <div class="selectwrap">
+                    <select class="select" id="livecam">
+                      <option value=""></option>
+                      ${cameraEntities
+                        .map(
+                          (id) =>
+                            `<option value="${id}" ${
+                              id === liveCameraEntity ? "selected" : ""
+                            }>${id}</option>`
+                        )
+                        .join("")}
+                    </select>
+                    <span class="selarrow"></span>
+                  </div>
+                </div>
+
+                <div class="row">
+                  <div class="lbl">Show live toggle</div>
+                  <div class="desc">Show the live button in the top bar</div>
+                  <div class="togrow">
+                    <span>${showLiveToggle ? "Shown" : "Hidden"}</span>
+                    <ha-switch id="showlivetoggle" ${
+                      showLiveToggle ? "checked" : ""
+                    }></ha-switch>
+                  </div>
+                </div>
+
+                <div class="row">
+                  <div class="lbl">Start in live mode</div>
+                  <div class="desc">Open the card in live mode by default</div>
+                  <div class="togrow">
+                    <span>${liveDefault ? "Yes" : "No"}</span>
+                    <ha-switch id="livedefault" ${
+                      liveDefault ? "checked" : ""
+                    }></ha-switch>
+                  </div>
+                </div>
+              `
+                  : ``
+              }
+            </div>
+          `
+              : ``
+          }
+
+          ${
+            this._activeTab === "thumbs"
+              ? `
+            <div class="tabpanel" data-panel="thumbs">
+              <div class="paneltitle">
+                <span>🧩</span>
+                <span>Thumbnails</span>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Thumbnail size</div>
+                <div class="desc">Set the size of each thumbnail in pixels</div>
+                <ha-textfield
+                  id="thumb"
+                  label="Thumbnail size"
+                  type="number"
+                ></ha-textfield>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Maximum thumbnails shown</div>
+                <div class="desc">Maximum number of media items loaded into the gallery</div>
+                <ha-textfield
+                  id="maxmedia"
+                  label="Maximum thumbnails shown"
+                  type="number"
+                ></ha-textfield>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Visible object filters</div>
+                <div class="objmeta">
+                  <div class="desc">Selected: ${selectedCount}/${MAX_VISIBLE_OBJECT_FILTERS}</div>
                   ${
-                    deleteChoices.length
-                      ? deleteChoices
-                          .map(
-                            (id) =>
-                              `<option value="${id}" ${
-                                id === deleteService ? "selected" : ""
-                              }>${id}</option>`
-                          )
-                          .join("")
-                      : `<option value="" selected>(no shell_command services found)</option>`
+                    maxReached
+                      ? `<div class="desc">Max reached. Remove one to select another.</div>`
+                      : `<div class="desc">Click to enable or disable a filter button.</div>`
                   }
-                </select>
-                <span class="selarrow"></span>
+                </div>
+
+                <div class="chip-grid">
+                  ${AVAILABLE_OBJECT_FILTERS.map((obj) => {
+                    const isOn = objectFiltersArr.includes(obj);
+                    const isDisabled = !isOn && maxReached;
+                    return `
+                      <button
+                        type="button"
+                        class="objchip ${isOn ? "on" : ""} ${isDisabled ? "disabled" : ""}"
+                        data-objchip="${obj}"
+                        ${isDisabled ? 'aria-disabled="true"' : ""}
+                        title="${this._objectLabel(obj)}"
+                      >
+                        <span class="objchip-icon">
+                          <ha-icon icon="${this._objectIcon(obj)}"></ha-icon>
+                        </span>
+                        <span class="objchip-label">${this._objectLabel(obj)}</span>
+                      </button>
+                    `;
+                  }).join("")}
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="lbl">Thumbnail bar position</div>
+                <div class="segwrap">
+                  <button class="seg ${thumbBarPos === "top" ? "on" : ""}" data-tbpos="top">Top</button>
+                  <button class="seg ${thumbBarPos === "bottom" ? "on" : ""}" data-tbpos="bottom">Bottom</button>
+                  <button class="seg ${thumbBarPos === "hidden" ? "on" : ""}" data-tbpos="hidden">Hidden</button>
+                </div>
               </div>
             </div>
-
-          </div>
+          `
+              : ``
+          }
         </div>
-
-        <!-- MAIN VIEWER -->
-        <div class="section" id="sec-viewer" data-open="${secOpenAttr(
-          "sec-viewer"
-        )}">
-          <div class="shead" data-toggle="sec-viewer">
-            <div class="stitle">
-              <span class="ico">🖼️</span>
-              <span>Main viewer</span>
-            </div>
-            <div class="chev" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M8 10l4 4 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </div>
-          </div>
-
-          <div class="sbody">
-            <div class="row">
-              <div class="lbl">Viewer height</div>
-              <div class="desc">Height of the main image/video viewer (px)</div>
-              <input class="input" id="height" type="number" value="${height}" />
-            </div>
-
-            <div class="row">
-              <div class="lbl">Preview position</div>
-              <div class="desc">Show the main viewer above or below the thumbnails</div>
-              <div class="segwrap">
-                <button class="seg ${
-                  previewPos === "top" ? "on" : ""
-                }" data-ppos="top">Top</button>
-                <button class="seg ${
-                  previewPos === "bottom" ? "on" : ""
-                }" data-ppos="bottom">Bottom</button>
-              </div>
-            </div>
-
-            <div class="row">
-              <div class="lbl">Open on thumbnail click</div>
-              <div class="desc">Only show the main viewer after selecting a thumbnail. Click on the preview to close</div>
-              <div class="togrow">
-                <span>${clickToOpen ? "Enabled" : "Disabled"}</span>
-                <input class="toggle" id="clicktoopen" type="checkbox" ${
-                  clickToOpen ? "checked" : ""
-                }/>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- THUMBNAILS -->
-        <div class="section" id="sec-thumbs" data-open="${secOpenAttr(
-          "sec-thumbs"
-        )}">
-          <div class="shead" data-toggle="sec-thumbs">
-            <div class="stitle">
-              <span class="ico">🧩</span>
-              <span>Thumbnails</span>
-            </div>
-            <div class="chev" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M8 10l4 4 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </div>
-          </div>
-
-          <div class="sbody">
-            <div class="row">
-              <div class="lbl">Thumbnail size</div>
-              <div class="desc">Size of each thumbnail (px)</div>
-              <input class="input" id="thumb" type="number" value="${thumbSize}" />
-            </div>
-
-            <div class="row">
-              <div class="lbl">Maximum thumbnails shown</div>
-              <input class="input" id="maxmedia" type="number" min="1" max="100" value="${maxMedia}" />
-            </div>
-
-            <!-- ✅ NEW: thumb overlay bar -->
-            <div class="row">
-              <div class="lbl">Thumbnail bar position</div>
-              <div class="desc">Show the small bar (time + icon) on each thumbnail</div>
-              <div class="segwrap">
-                <button class="seg ${
-                  thumbBarPos === "top" ? "on" : ""
-                }" data-tbpos="top">Top</button>
-                <button class="seg ${
-                  thumbBarPos === "bottom" ? "on" : ""
-                }" data-tbpos="bottom">Bottom</button>
-                <button class="seg ${
-                  thumbBarPos === "hidden" ? "on" : ""
-                }" data-tbpos="hidden">Hidden</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- TIMESTAMP BAR -->
-        <div class="section" id="sec-tsbar" data-open="${secOpenAttr(
-          "sec-tsbar"
-        )}">
-          <div class="shead" data-toggle="sec-tsbar">
-            <div class="stitle">
-              <span class="ico">🕒</span>
-              <span>Timestamp bar</span>
-            </div>
-            <div class="chev" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M8 10l4 4 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </div>
-          </div>
-
-          <div class="sbody">
-            <div class="row">
-              <div class="lbl">Timestamp bar position</div>
-              <div class="segwrap">
-                <button class="seg ${
-                  tsPos === "top" ? "on" : ""
-                }" data-pos="top">Top</button>
-                <button class="seg ${
-                  tsPos === "bottom" ? "on" : ""
-                }" data-pos="bottom">Bottom</button>
-                <button class="seg ${
-                  tsPos === "hidden" ? "on" : ""
-                }" data-pos="hidden">Hidden</button>
-              </div>
-            </div>
-
-            <div class="row ${barDisabled ? "muted" : ""}">
-              <div class="lbl">Bar opacity</div>
-              <div class="desc">Opacity of the timestamp bar (0–100)</div>
-              <div class="barrow">
-                <input class="slider" id="barop" type="range" min="0" max="100" value="${barOpacity}" ${
-                  barDisabled ? "disabled" : ""
-                }/>
-                <div class="pillval" id="barval">${barOpacity}%</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
       </div>
     `;
 
-    // restore inline list scroll after re-render
-    try {
-      const list = this.shadowRoot?.getElementById("favlist");
-      if (list && Number.isFinite(this._favScrollTop)) {
-        list.scrollTop = this._favScrollTop;
-      }
-    } catch (_) {}
-
     const $ = (id) => this.shadowRoot.getElementById(id);
 
-    // section toggles
-    this.shadowRoot.querySelectorAll("[data-toggle]").forEach((h) => {
-      h.addEventListener("click", () => {
-        const id = h.getAttribute("data-toggle");
-        const sec = this.shadowRoot.getElementById(id);
-        if (!sec) return;
+    const entitiesEl = $("entities");
+    const mediaEl = $("mediasources");
+    const delserviceEl = $("delservice");
+    const heightEl = $("height");
+    const thumbEl = $("thumb");
+    const maxmediaEl = $("maxmedia");
+    const baropEl = $("barop");
+    const barvalEl = $("barval");
+    const livecamEl = $("livecam");
 
-        const open = sec.getAttribute("data-open") !== "false";
-        const next = !open;
+    this._setControlValue(entitiesEl, entitiesText);
+    this._setControlValue(mediaEl, mediaSourcesText);
+    this._setControlValue(heightEl, String(height));
+    this._setControlValue(thumbEl, String(thumbSize));
+    this._setControlValue(maxmediaEl, String(maxMedia));
+    this._setControlValue(baropEl, barOpacity);
 
-        sec.setAttribute("data-open", next ? "true" : "false");
-        this._secOpen[id] = next;
-      });
+    if (delserviceEl) delserviceEl.value = deleteService;
+    if (livecamEl) livecamEl.value = liveCameraEntity;
+
+    this._applyFieldValidation("entities");
+    this._applyFieldValidation("mediasources");
+
+    this.shadowRoot.querySelectorAll("[data-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => this._setActiveTab(btn.dataset.tab));
     });
 
-    // source mode buttons
     this.shadowRoot.querySelectorAll("[data-src]").forEach((btn) => {
       btn.addEventListener("click", () =>
         this._set("source_mode", btn.dataset.src)
       );
     });
 
-    $("entity")?.addEventListener("change", (e) =>
-      this._set("entity", String(e.target.value || "").trim())
-    );
+    const bindTextarea = (id, commitFn) => {
+      const el = $(id);
+      if (!el) return;
 
-    $("mediasource")?.addEventListener("change", (e) =>
-      this._set("media_source", String(e.target.value || "").trim())
-    );
+      el.addEventListener("focus", () => {
+        this._updateSuggestions(id);
+      });
 
-    // ✅ INLINE dropdown open/close
-    const toggle = (open) => this._toggleFavOpen(open);
+      el.addEventListener("input", () => {
+        commitFn(false);
+        this._applyFieldValidation(id);
+        this._updateSuggestions(id);
+      });
 
-    $("favbtn")?.addEventListener("click", () => toggle());
-    $("favbtn")?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        toggle();
-      }
+      el.addEventListener("change", () => {
+        commitFn(true);
+        this._applyFieldValidation(id);
+        this._closeSuggestions(id);
+      });
+
+      el.addEventListener("blur", () => {
+        setTimeout(() => {
+          const active = this.shadowRoot?.activeElement;
+          const suggBox = this.shadowRoot?.getElementById(`${id}-suggestions`);
+
+          if (active && suggBox && suggBox.contains(active)) return;
+
+          commitFn(true);
+          this._applyFieldValidation(id);
+          this._closeSuggestions(id);
+        }, 120);
+      });
+
+      el.addEventListener("keydown", (e) => {
+        const state = this._suggestState[id];
+
+        if (state?.open && e.key === "ArrowDown") {
+          e.preventDefault();
+          this._moveSuggestion(id, 1);
+          return;
+        }
+
+        if (state?.open && e.key === "ArrowUp") {
+          e.preventDefault();
+          this._moveSuggestion(id, -1);
+          return;
+        }
+
+        if (state?.open && e.key === "Enter") {
+          if (this._acceptSuggestion(id)) {
+            e.preventDefault();
+            return;
+          }
+        }
+
+        if (state?.open && e.key === "Escape") {
+          e.preventDefault();
+          this._closeSuggestions(id);
+        }
+      });
+    };
+
+    bindTextarea("entities", this._commitEntities.bind(this));
+    bindTextarea("mediasources", this._commitMediaSources.bind(this));
+
+    this.shadowRoot.querySelectorAll("[data-objchip]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (btn.classList.contains("disabled")) return;
+        this._toggleObjectFilter(btn.dataset.objchip);
+      });
     });
 
-    $("favdone")?.addEventListener("click", () => toggle(false));
+    const commitDeleteService = () => {
+      const v = String(delserviceEl?.value || "").trim();
 
-    // search
-    $("favquery")?.addEventListener("input", (e) => {
-      this._favQuery = String(e.target.value || "");
-      this._scheduleRender();
-    });
-
-    // scroll remember
-    const favlist = $("favlist");
-    if (favlist) {
-      favlist.addEventListener(
-        "scroll",
-        () => {
-          this._favScrollTop = favlist.scrollTop || 0;
-        },
-        { passive: true }
-      );
-    }
-
-    // checkbox changes (multi-select)
-    $("favpanel")?.addEventListener("change", (e) => {
-      const t = e.target;
-      if (!t || t.tagName !== "INPUT" || t.type !== "checkbox") return;
-
-      const val = String(t.getAttribute("data-fav") || "");
-      if (!val) return;
-
-      const current = new Set(this._getFavFolders());
-      if (t.checked) current.add(val);
-      else current.delete(val);
-
-      this._setFavFolders(Array.from(current));
-    });
-
-    $("delservice")?.addEventListener("change", (e) => {
-      const v = String(e.target.value || "").trim();
       if (!v) {
         const next = { ...this._config };
         delete next.delete_service;
         delete next.preview_close_on_tap;
-
-        this._config = next;
+        this._config = this._stripAlwaysTrueKeys(next);
         this._fire();
         this._scheduleRender();
         return;
       }
-      this._set("delete_service", v);
-    });
 
-    $("height")?.addEventListener("change", (e) =>
-      this._set("preview_height", Number(e.target.value) || 320)
+      this._set("delete_service", v);
+    };
+
+    delserviceEl?.addEventListener("change", commitDeleteService);
+
+    const commitNumberField = (key, el, fallback, commit = false) => {
+      const raw = String(el?.value ?? "").trim();
+
+      if (raw === "") {
+        if (commit) {
+          this._set(key, fallback);
+        } else {
+          this._config = this._stripAlwaysTrueKeys({
+            ...this._config,
+            [key]: fallback,
+          });
+        }
+        return;
+      }
+
+      const n = Number(raw);
+      const v = Number.isFinite(n) ? n : fallback;
+
+      if (commit) {
+        this._set(key, v);
+      } else {
+        this._config = this._stripAlwaysTrueKeys({
+          ...this._config,
+          [key]: v,
+        });
+      }
+    };
+
+    heightEl?.addEventListener("input", () =>
+      commitNumberField("preview_height", heightEl, 320, false)
+    );
+    heightEl?.addEventListener("change", () =>
+      commitNumberField("preview_height", heightEl, 320, true)
+    );
+    heightEl?.addEventListener("blur", () =>
+      commitNumberField("preview_height", heightEl, 320, true)
     );
 
-    // preview position segmented buttons
     this.shadowRoot.querySelectorAll(".seg[data-ppos]").forEach((btn) => {
       btn.addEventListener("click", () =>
         this._set("preview_position", btn.dataset.ppos)
       );
     });
 
-    $("thumb")?.addEventListener("change", (e) =>
-      this._set("thumb_size", Number(e.target.value) || 140)
+    thumbEl?.addEventListener("input", () =>
+      commitNumberField("thumb_size", thumbEl, 140, false)
+    );
+    thumbEl?.addEventListener("change", () =>
+      commitNumberField("thumb_size", thumbEl, 140, true)
+    );
+    thumbEl?.addEventListener("blur", () =>
+      commitNumberField("thumb_size", thumbEl, 140, true)
     );
 
-    // max_media handler (live + on change)
-    const pushMaxMedia = (raw) => {
+    const pushMaxMedia = (commit = false) => {
+      const raw = String(maxmediaEl?.value ?? "").trim();
+
+      if (raw === "") {
+        if (commit) {
+          this._set("max_media", 1);
+        } else {
+          this._config = this._stripAlwaysTrueKeys({
+            ...this._config,
+            max_media: 1,
+          });
+        }
+        return;
+      }
+
       const n = this._numInt(raw, 1);
       const v = this._clampInt(n, 1, 100);
-      this._set("max_media", v);
-    };
-    $("maxmedia")?.addEventListener("input", (e) => pushMaxMedia(e.target.value));
-    $("maxmedia")?.addEventListener("change", (e) => pushMaxMedia(e.target.value));
 
-    // ✅ NEW: thumb_bar_position segmented buttons
+      if (commit) {
+        this._set("max_media", v);
+      } else {
+        this._config = this._stripAlwaysTrueKeys({
+          ...this._config,
+          max_media: v,
+        });
+      }
+    };
+
+    maxmediaEl?.addEventListener("input", () => pushMaxMedia(false));
+    maxmediaEl?.addEventListener("change", () => pushMaxMedia(true));
+    maxmediaEl?.addEventListener("blur", () => pushMaxMedia(true));
+
     this.shadowRoot.querySelectorAll(".seg[data-tbpos]").forEach((btn) => {
       btn.addEventListener("click", () =>
         this._set("thumb_bar_position", btn.dataset.tbpos)
@@ -1503,38 +2083,77 @@ class CameraGalleryCardEditor extends HTMLElement {
       this._set("preview_click_to_open", !!e.target.checked);
     });
 
-    // timestamp position segmented buttons
+    $("liveenabled")?.addEventListener("change", (e) => {
+      const enabled = !!e.target.checked;
+
+      if (enabled) {
+        this._set("live_enabled", true);
+        return;
+      }
+
+      const next = { ...this._config };
+      delete next.live_enabled;
+      delete next.live_camera_entity;
+      delete next.show_live_toggle;
+      delete next.live_default;
+      delete next.live_provider;
+
+      this._config = this._stripAlwaysTrueKeys(next);
+      this._fire();
+      this._scheduleRender();
+    });
+
+    livecamEl?.addEventListener("change", (e) => {
+      const v = String(e.target.value || "").trim();
+      if (!v) {
+        const next = { ...this._config };
+        delete next.live_camera_entity;
+        this._config = this._stripAlwaysTrueKeys(next);
+        this._fire();
+        this._scheduleRender();
+        return;
+      }
+      this._set("live_camera_entity", v);
+    });
+
+    $("showlivetoggle")?.addEventListener("change", (e) => {
+      this._set("show_live_toggle", !!e.target.checked);
+    });
+
+    $("livedefault")?.addEventListener("change", (e) => {
+      this._set("live_default", !!e.target.checked);
+    });
+
     this.shadowRoot.querySelectorAll(".seg[data-pos]").forEach((btn) => {
       btn.addEventListener("click", () =>
         this._set("bar_position", btn.dataset.pos)
       );
     });
 
-    // bar opacity live update
-    const barop = $("barop");
-    const barval = $("barval");
-    barop?.addEventListener("input", (e) => {
+    const updateBarVal = (v) => {
+      if (barvalEl) barvalEl.textContent = `${v}%`;
+    };
+
+    baropEl?.addEventListener("input", (e) => {
       const v = Number(e.target.value);
-      if (barval) barval.textContent = `${v}%`;
+      updateBarVal(v);
     });
-    barop?.addEventListener("change", (e) => {
+
+    baropEl?.addEventListener("change", (e) => {
       const v = Number(e.target.value);
+      updateBarVal(v);
       this._set("bar_opacity", Number.isFinite(v) ? v : 45);
     });
 
-    // ✅ RESTORE focus + caret AFTER render
     try {
       const fs = this._focusState;
       if (fs && fs.id) {
         const el = $(fs.id);
         if (el && typeof el.focus === "function") {
-          if (
-            fs.value != null &&
-            typeof el.value === "string" &&
-            el.value !== fs.value
-          ) {
+          if (fs.value != null && typeof el.value === "string" && el.value !== fs.value) {
             el.value = fs.value;
           }
+
           el.focus({ preventScroll: true });
 
           if (
@@ -1547,6 +2166,9 @@ class CameraGalleryCardEditor extends HTMLElement {
         }
       }
     } catch (_) {}
+
+    this._renderSuggestions("entities");
+    this._renderSuggestions("mediasources");
   }
 }
 
@@ -1554,4 +2176,6 @@ if (!customElements.get("camera-gallery-card-editor")) {
   customElements.define("camera-gallery-card-editor", CameraGalleryCardEditor);
 }
 
-console.info("CAMERA GALLERY EDITOR: registered OK v1.1.3");
+console.info(
+  "CAMERA GALLERY EDITOR: registered OK v1.4.8-live-provider-removed"
+);

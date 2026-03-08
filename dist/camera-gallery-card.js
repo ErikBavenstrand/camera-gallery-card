@@ -1,18 +1,21 @@
 /**
  * Camera Gallery Card
+ * Version: 1.1.9
+ *
+ * CHANGE (1.1.9):
+ * - ✅ live_provider removed from YAML/config
+ * - ✅ Live provider is now hardcoded to WebRTC
+ * - ✅ Image fallback mode removed as configurable provider
+ * - ✅ Live refresh timer logic simplified
  */
 
-const CARD_VERSION = "1.2.0";
+const CARD_VERSION = "1.1.9";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
 const PREVIEW_WIDTH = "100%";
 
-// thumbs (UI only — NOT a cap anymore)
 const THUMBS_ENABLED = true;
-// NOTE: THUMBS_COUNT is no longer used to limit visible thumbs.
-// It’s kept for compatibility, but max_media controls the visible count.
-const THUMBS_COUNT = 8;
 
 const THUMB_SIZE = 86;
 const THUMB_RADIUS = 14;
@@ -34,21 +37,39 @@ const DEFAULT_DELETE_PREFIX = "/config/www/";
 // bar opacity default (0-100)
 const DEFAULT_BAR_OPACITY = 45;
 
-// ✅ media-source safety limits
-const DEFAULT_MAX_MEDIA = 20; // ALSO used as visible cap now
-const DEFAULT_RESOLVE_BATCH = 10; // resolve N urls concurrently per batch
-const DEFAULT_WALK_DEPTH = 8; // directory recursion depth limit
+// media-source safety limits
+const DEFAULT_MAX_MEDIA = 20; // visible cap
+const DEFAULT_RESOLVE_BATCH = 10;
+const DEFAULT_WALK_DEPTH = 8; // max folder depth
+const DEFAULT_BROWSE_TIMEOUT_MS = 8000; // prevent infinite loading
+const DEFAULT_PER_ROOT_MIN_LIMIT = 40; // sane minimum
 
 const DEFAULT_PREVIEW_CLICK_TO_OPEN = false;
-
-// ✅ default: alleen relevant in click-to-open mode
 const DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED = true;
 
-// ✅ NEW (kept)
 const DEFAULT_SOURCE_MODE = "sensor"; // "sensor" | "media"
-
-// ✅ NEW (1.0.6)
 const DEFAULT_PREVIEW_POSITION = "top"; // "top" | "bottom"
+
+const DEFAULT_VISIBLE_OBJECT_FILTERS = [];
+const MAX_VISIBLE_OBJECT_FILTERS = 4;
+
+// LIVE
+const DEFAULT_LIVE_ENABLED = false;
+const DEFAULT_LIVE_DEFAULT = false;
+const DEFAULT_SHOW_LIVE_TOGGLE = true;
+const DEFAULT_LIVE_LABEL = "Live Camera";
+
+const AVAILABLE_OBJECT_FILTERS = [
+  "person",
+  "car",
+  "dog",
+  "cat",
+  "truck",
+  "bus",
+  "bicycle",
+  "motorcycle",
+  "bird",
+];
 
 const STYLE = {
   card_background:
@@ -101,9 +122,7 @@ class CameraGalleryCard extends LitElement {
 
       _selectedIndex: { type: Number },
       _selectedDay: { type: String },
-      _filterAll: { type: Boolean },
 
-      _scrubMinute: { type: Number },
       _swipeStartX: { type: Number },
       _swipeStartY: { type: Number },
       _swiping: { type: Boolean },
@@ -116,6 +135,10 @@ class CameraGalleryCard extends LitElement {
       _navHideT: { type: Number },
 
       _previewOpen: { type: Boolean },
+      _objectFilters: { type: Array },
+
+      _viewMode: { type: String }, // "media" | "live"
+      _liveTick: { type: Number },
     };
   }
 
@@ -126,11 +149,15 @@ class CameraGalleryCard extends LitElement {
 
   static getStubConfig() {
     return {
-      source_mode: DEFAULT_SOURCE_MODE, // "sensor" | "media"
-      preview_position: DEFAULT_PREVIEW_POSITION, // "top" | "bottom"
+      source_mode: DEFAULT_SOURCE_MODE,
+      preview_position: DEFAULT_PREVIEW_POSITION,
 
       entity: "",
+      entities: [],
+
       media_source: "",
+      media_sources: [],
+
       delete_service: "",
 
       preview_height: 320,
@@ -143,13 +170,23 @@ class CameraGalleryCard extends LitElement {
 
       preview_click_to_open: DEFAULT_PREVIEW_CLICK_TO_OPEN,
       preview_close_on_tap: DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED,
+
+      object_filters: DEFAULT_VISIBLE_OBJECT_FILTERS,
+
+      live_enabled: DEFAULT_LIVE_ENABLED,
+      live_camera_entity: "",
+      live_default: DEFAULT_LIVE_DEFAULT,
+      show_live_toggle: DEFAULT_SHOW_LIVE_TOGGLE,
+      live_label: DEFAULT_LIVE_LABEL,
     };
   }
 
   constructor() {
     super();
 
-    // ✅ MUST exist before setConfig() can be called
+    this._liveCard = null;
+    this._liveCardConfigKey = "";
+
     this._posterCache = new Map();
     this._posterPending = new Set();
     this._deleted = new Set();
@@ -157,26 +194,28 @@ class CameraGalleryCard extends LitElement {
     this._selectMode = false;
     this._selectedSet = new Set();
     this._pendingScrollToI = null;
+    this._forceThumbReset = false;
 
     this._showNav = false;
     this._navHideT = null;
 
     this._previewOpen = false;
+    this._objectFilters = [];
+
+    this._viewMode = "media";
+    this._liveTick = Date.now();
 
     this._ms = {
       key: "",
       loading: false,
       loadedAt: 0,
-      list: [], // [{ id, title, mime, cls }]
-      urlCache: new Map(), // media_content_id -> resolved url
+      roots: [],
+      list: [],
+      urlCache: new Map(),
     };
 
     this._msResolveInFlight = false;
     this._msResolveQueued = new Set();
-  }
-
-  connectedCallback() {
-    super.connectedCallback();
   }
 
   disconnectedCallback() {
@@ -189,11 +228,11 @@ class CameraGalleryCard extends LitElement {
     this._hass = hass;
     this.requestUpdate();
   }
+
   get hass() {
     return this._hass;
   }
 
-  // ✅ Light/Dark detect (for non-Graphite themes)
   _isDarkMode() {
     const dm = this._hass?.themes?.darkMode;
     if (typeof dm === "boolean") return dm;
@@ -206,7 +245,6 @@ class CameraGalleryCard extends LitElement {
     }
   }
 
-  // ✅ Graphite detect (Graphite should stay Graphite)
   _isGraphiteTheme() {
     const name =
       this._hass?.themes?.theme ||
@@ -221,6 +259,9 @@ class CameraGalleryCard extends LitElement {
       const wrap = this.renderRoot?.querySelector(".tthumbs");
       if (!wrap) return;
       wrap.scrollLeft = 0;
+      try {
+        wrap.scrollTo({ left: 0, behavior: "auto" });
+      } catch (_) {}
     });
   }
 
@@ -235,23 +276,21 @@ class CameraGalleryCard extends LitElement {
     }, 2500);
   }
 
-  _navPrev(listLen) {
-    if (this._selectMode) return;
+  _navPrev() {
+    if (this._selectMode || this._isLiveActive()) return;
     const i = this._selectedIndex ?? 0;
     if (i <= 0) return;
     this._selectedIndex = i - 1;
-    this._scrubMinute = NaN;
     this._pendingScrollToI = this._selectedIndex;
     this.requestUpdate();
     this._showNavChevrons();
   }
 
   _navNext(listLen) {
-    if (this._selectMode) return;
+    if (this._selectMode || this._isLiveActive()) return;
     const i = this._selectedIndex ?? 0;
     if (i >= listLen - 1) return;
     this._selectedIndex = i + 1;
-    this._scrubMinute = NaN;
     this._pendingScrollToI = this._selectedIndex;
     this.requestUpdate();
     this._showNavChevrons();
@@ -288,7 +327,225 @@ class CameraGalleryCard extends LitElement {
     return Math.max(1, Math.min(100, Math.round(n)));
   }
 
+  _normalizeVisibleObjectFilters(listOrSingle) {
+    const arr = Array.isArray(listOrSingle)
+      ? listOrSingle
+      : listOrSingle
+        ? [listOrSingle]
+        : [];
+
+    const out = [];
+    const seen = new Set();
+    const allowed = new Set(
+      AVAILABLE_OBJECT_FILTERS.map((x) => String(x).toLowerCase())
+    );
+
+    for (const raw of arr) {
+      const v = String(raw || "").toLowerCase().trim();
+      if (!v || !allowed.has(v) || seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+      if (out.length >= MAX_VISIBLE_OBJECT_FILTERS) break;
+    }
+
+    return out;
+  }
+
+  _getVisibleObjectFilters() {
+    return Array.isArray(this.config?.object_filters)
+      ? this.config.object_filters
+      : [];
+  }
+
+  _sensorNormalizeEntities(listOrSingle, fallbackSingle = "") {
+    const arr = Array.isArray(listOrSingle)
+      ? listOrSingle
+      : listOrSingle
+        ? [listOrSingle]
+        : fallbackSingle
+          ? [fallbackSingle]
+          : [];
+
+    const out = [];
+    const seen = new Set();
+
+    for (const raw of arr) {
+      const v = String(raw ?? "").trim();
+      if (!v) continue;
+      const k = v.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(v);
+    }
+
+    return out;
+  }
+
+  _sensorEntityList() {
+    const arr = Array.isArray(this.config?.entities) ? this.config.entities : [];
+    const clean = arr.map((x) => String(x || "").trim()).filter(Boolean);
+    if (clean.length) return clean;
+
+    const single = String(this.config?.entity || "").trim();
+    return single ? [single] : [];
+  }
+
+  async _ensureLiveCard() {
+    const entity = String(this.config?.live_camera_entity || "").trim();
+    if (!entity) {
+      this._liveCard = null;
+      this._liveCardConfigKey = "";
+      return null;
+    }
+
+    const cfg = {
+      type: "custom:webrtc-camera",
+      entity,
+      mode: "webrtc",
+      muted: true,
+      ui: false,
+      background: false,
+    };
+
+    const key = JSON.stringify(cfg);
+
+    if (this._liveCard && this._liveCardConfigKey === key) {
+      this._liveCard.hass = this._hass;
+      return this._liveCard;
+    }
+
+    const helpers = await window.loadCardHelpers?.();
+    if (!helpers) {
+      console.warn("[camera-gallery-card] loadCardHelpers unavailable");
+      return null;
+    }
+
+    const card = await helpers.createCardElement(cfg);
+    card.hass = this._hass;
+
+    try {
+      card.style.setProperty("width", "100%");
+      card.style.setProperty("height", "100%");
+      card.style.setProperty("display", "block");
+    } catch (_) {}
+
+    this._liveCard = card;
+    this._liveCardConfigKey = key;
+    return card;
+  }
+
+  async _mountLiveCard() {
+    if (!this._isLiveActive()) return;
+
+    const host = this.renderRoot?.querySelector("#live-card-host");
+    if (!host) return;
+
+    const card = await this._ensureLiveCard();
+    if (!card) return;
+
+    if (card.parentElement !== host) {
+      host.innerHTML = "";
+      host.appendChild(card);
+    }
+
+    card.hass = this._hass;
+
+    // 🔧 remove RTC label from webrtc-camera
+    const removeRTC = () => {
+      const rtc = card.querySelector?.(".mode, .webrtc-mode");
+      if (rtc) rtc.remove();
+    };
+
+    removeRTC();
+
+    const obs = new MutationObserver(removeRTC);
+    obs.observe(card, { childList: true, subtree: true });
+  }
+
+  _renderLiveCardHost() {
+    return html`<div id="live-card-host" class="live-card-host"></div>`;
+  }
+
+  _jsonEq(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  _configChangedKeys(prev = {}, next = {}) {
+    const keys = new Set([
+      ...Object.keys(prev || {}),
+      ...Object.keys(next || {}),
+    ]);
+    return Array.from(keys).filter((k) => !this._jsonEq(prev?.[k], next?.[k]));
+  }
+
+  _isUiOnlyConfigChange(keys = []) {
+    if (!keys.length) return false;
+
+    const uiOnlyKeys = new Set([
+      "preview_height",
+      "bar_position",
+      "thumb_size",
+      "bar_opacity",
+      "thumb_bar_position",
+      "preview_click_to_open",
+      "preview_close_on_tap",
+      "preview_position",
+      "object_filters",
+      "live_enabled",
+      "live_camera_entity",
+      "live_default",
+      "show_live_toggle",
+      "live_label",
+    ]);
+
+    return keys.every((k) => uiOnlyKeys.has(k));
+  }
+
+  _isSourceConfigChange(keys = []) {
+    const sourceKeys = new Set([
+      "source_mode",
+      "entity",
+      "entities",
+      "media_source",
+      "media_sources",
+      "max_media",
+      "delete_service",
+      "allow_delete",
+      "allow_bulk_delete",
+      "delete_confirm",
+    ]);
+
+    return keys.some((k) => sourceKeys.has(k));
+  }
+
+  _hasLiveConfig() {
+    return (
+      !!this.config?.live_enabled &&
+      !!String(this.config?.live_camera_entity || "").trim()
+    );
+  }
+
+  _isLiveActive() {
+    return this._hasLiveConfig() && this._viewMode === "live";
+  }
+
+  _setViewMode(nextMode) {
+    const mode = nextMode === "live" ? "live" : "media";
+    if (mode === "live" && !this._hasLiveConfig()) return;
+
+    this._viewMode = mode;
+    this._showNav = false;
+
+    if (this.config?.preview_click_to_open) {
+      this._previewOpen = mode === "live" ? true : !!this._previewOpen;
+    }
+
+    this.requestUpdate();
+  }
+
   setConfig(config) {
+    const prevConfig = this.config ? { ...this.config } : null;
+
     const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
     const num = (v, d) => {
       if (v === null || v === undefined) return d;
@@ -315,45 +572,59 @@ class CameraGalleryCard extends LitElement {
       100
     );
 
-    // ✅ max_media is now the SINGLE cap for what is shown
     const max_media = this._normMaxMedia(config.max_media ?? DEFAULT_MAX_MEDIA);
 
-    // ✅ NEW: source mode (mutual exclusive)
     let source_mode = this._normSourceMode(
       config.source_mode ?? DEFAULT_SOURCE_MODE
     );
 
-    // ✅ NEW: preview position
     const preview_position = this._normPreviewPosition(
       config.preview_position ?? DEFAULT_PREVIEW_POSITION
     );
 
     const entityRaw = String(config?.entity || "").trim();
-    const mediaRaw = String(config?.media_source || "").trim();
+    const sensorEntitiesClean = this._sensorNormalizeEntities(
+      config?.entities,
+      entityRaw
+    );
 
-    // If user didn't set source_mode explicitly, infer from provided fields
+    const mediaRaw = String(config?.media_source || "").trim();
+    const mediaArrRaw = Array.isArray(config?.media_sources)
+      ? config.media_sources
+      : Array.isArray(config?.media_folders_fav)
+        ? config.media_folders_fav
+        : null;
+
+    const mediaSourcesClean = Array.isArray(mediaArrRaw)
+      ? mediaArrRaw.map((x) => String(x ?? "").trim()).filter(Boolean)
+      : [];
+
+    const visibleObjectFilters = this._normalizeVisibleObjectFilters(
+      config.object_filters ?? DEFAULT_VISIBLE_OBJECT_FILTERS
+    );
+
     if (
       config.source_mode === undefined ||
       config.source_mode === null ||
       String(config.source_mode).trim() === ""
     ) {
-      if (mediaRaw && !entityRaw) source_mode = "media";
-      else source_mode = "sensor";
+      if ((mediaSourcesClean.length || mediaRaw) && !sensorEntitiesClean.length) {
+        source_mode = "media";
+      } else {
+        source_mode = "sensor";
+      }
     }
 
-    // Enforce mutual exclusive + validate required field
     if (source_mode === "sensor") {
-      if (!entityRaw) {
+      if (!sensorEntitiesClean.length) {
         throw new Error(
-          "camera-gallery-card: 'entity' is required in source_mode: sensor"
+          "camera-gallery-card: 'entity' or 'entities' is required in source_mode: sensor"
         );
       }
-    } else {
-      if (!mediaRaw) {
-        throw new Error(
-          "camera-gallery-card: 'media_source' is required in source_mode: media"
-        );
-      }
+    } else if (!mediaRaw && !mediaSourcesClean.length) {
+      throw new Error(
+        "camera-gallery-card: 'media_source' OR 'media_sources' is required in source_mode: media"
+      );
     }
 
     const allow_delete =
@@ -376,10 +647,8 @@ class CameraGalleryCard extends LitElement {
         ? !!config.delete_confirm
         : DEFAULT_DELETE_CONFIRM;
 
-    const wantsDelete = source_mode === "sensor" && !!allow_delete;
+    const wantsDelete = source_mode === "sensor" && allow_delete;
 
-    // ✅ FIX: delete_service is NOT required to use the card.
-    // If allow_delete is true but delete_service missing, just disable delete features.
     let effectiveAllowDelete = allow_delete;
     let effectiveAllowBulkDelete = allow_bulk_delete;
 
@@ -388,14 +657,12 @@ class CameraGalleryCard extends LitElement {
       effectiveAllowBulkDelete = false;
     }
 
-    // validate service format ONLY if provided
     if (delete_service && !/^[a-z0-9_]+\.[a-z0-9_]+$/i.test(delete_service)) {
       throw new Error(
         "camera-gallery-card: 'delete_service' must be 'domain.service'"
       );
     }
 
-    // ✅ FIX: DEFINE THESE (this was missing and caused your error)
     const preview_click_to_open =
       config.preview_click_to_open !== undefined
         ? !!config.preview_click_to_open
@@ -405,15 +672,42 @@ class CameraGalleryCard extends LitElement {
       config.preview_close_on_tap !== undefined
         ? !!config.preview_close_on_tap
         : preview_click_to_open
-        ? DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED
-        : false;
+          ? DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED
+          : false;
 
-    this.config = {
+    const normalizedMediaRoots =
+      source_mode === "media"
+        ? this._msNormalizeRoots(
+            mediaSourcesClean.length ? mediaSourcesClean : mediaRaw
+          )
+        : [];
+
+    const live_enabled =
+      config.live_enabled !== undefined
+        ? !!config.live_enabled
+        : DEFAULT_LIVE_ENABLED;
+
+    const live_camera_entity = String(config.live_camera_entity || "").trim();
+    const live_default =
+      config.live_default !== undefined
+        ? !!config.live_default
+        : DEFAULT_LIVE_DEFAULT;
+    const show_live_toggle =
+      config.show_live_toggle !== undefined
+        ? !!config.show_live_toggle
+        : DEFAULT_SHOW_LIVE_TOGGLE;
+    const live_label =
+      String(config.live_label || "").trim() || DEFAULT_LIVE_LABEL;
+
+    const nextConfig = {
       source_mode,
       preview_position,
 
-      entity: source_mode === "sensor" ? entityRaw : "",
+      entity: source_mode === "sensor" ? sensorEntitiesClean[0] || "" : "",
+      entities: source_mode === "sensor" ? sensorEntitiesClean : [],
+
       media_source: source_mode === "media" ? mediaRaw : "",
+      media_sources: source_mode === "media" ? normalizedMediaRoots : [],
 
       preview_height: Number(config.preview_height) || 320,
       bar_position,
@@ -423,7 +717,6 @@ class CameraGalleryCard extends LitElement {
 
       max_media,
 
-      // ✅ use the effective toggles (may be auto-disabled)
       allow_delete: effectiveAllowDelete,
       allow_bulk_delete: effectiveAllowBulkDelete,
 
@@ -432,49 +725,110 @@ class CameraGalleryCard extends LitElement {
 
       preview_click_to_open,
       preview_close_on_tap,
+
+      object_filters: visibleObjectFilters,
+
+      live_enabled,
+      live_camera_entity,
+      live_default,
+      show_live_toggle,
+      live_label,
     };
 
+    this.config = nextConfig;
+
+    const changedKeys = prevConfig
+      ? this._configChangedKeys(prevConfig, nextConfig)
+      : [];
+    const uiOnlyChange = prevConfig
+      ? this._isUiOnlyConfigChange(changedKeys)
+      : false;
+    const sourceChange = prevConfig
+      ? this._isSourceConfigChange(changedKeys)
+      : true;
+
     if (this._selectedIndex === undefined) this._selectedIndex = 0;
-    if (this._filterAll === undefined) this._filterAll = false;
-    if (this._scrubMinute === undefined) this._scrubMinute = NaN;
     if (this._swipeStartX === undefined) this._swipeStartX = 0;
     if (this._swipeStartY === undefined) this._swipeStartY = 0;
     if (this._swiping === undefined) this._swiping = false;
 
     if (!this._selectedSet) this._selectedSet = new Set();
     if (this._selectMode === undefined) this._selectMode = false;
+    if (!Array.isArray(this._objectFilters)) this._objectFilters = [];
 
-    // preview open/close behavior
-    if (this.config.preview_click_to_open) {
-      if (this._previewOpen === undefined) this._previewOpen = false;
-      if (this._previewOpen !== true) this._previewOpen = false;
-    } else {
-      this._previewOpen = true;
+    const visibleSet = new Set(this._getVisibleObjectFilters());
+    this._objectFilters = this._objectFilters.filter((x) => visibleSet.has(x));
+
+    if (!prevConfig) {
+      this._previewOpen = this.config.preview_click_to_open ? false : true;
+      this._viewMode =
+        this._hasLiveConfig() && this.config.live_default ? "live" : "media";
+    } else if (
+      prevConfig.preview_click_to_open !== this.config.preview_click_to_open
+    ) {
+      this._previewOpen = !this.config.preview_click_to_open;
     }
 
-    // ✅ media-source cache reset on key change (only when in media mode)
+    if (sourceChange) {
+      this._selectedIndex = 0;
+      this._pendingScrollToI = 0;
+      this._selectedSet.clear();
+      this._selectMode = false;
+      this._forceThumbReset = false;
+      this._previewOpen = !this.config.preview_click_to_open;
+    }
+
+    if (!this._hasLiveConfig()) {
+      this._viewMode = "media";
+    }
+
     if (this.config.source_mode === "media") {
-      const key = this._msNormalizeRoot(this.config?.media_source);
-      if (key && this._ms.key && key !== this._ms.key) {
+      const prevKey = prevConfig
+        ? this._msKeyFromRoots(
+            prevConfig?.media_sources,
+            prevConfig?.media_source
+          )
+        : "";
+      const nextKey = this._msKeyFromRoots(
+        this.config?.media_sources,
+        this.config?.media_source
+      );
+
+      if (!prevConfig || (sourceChange && prevKey !== nextKey)) {
         this._ms.key = "";
+        this._ms.roots = [];
         this._ms.list = [];
         this._ms.urlCache = new Map();
         this._ms.loadedAt = 0;
         this._ms.loading = false;
       }
     }
+
+    if (prevConfig && uiOnlyChange) {
+      this.requestUpdate();
+    }
   }
 
   updated(changedProps) {
+    const dayChanged = changedProps.has("_selectedDay");
+    const filterChanged = changedProps.has("_objectFilters");
+
+    if (this._forceThumbReset || dayChanged || filterChanged) {
+      this._forceThumbReset = false;
+      this._pendingScrollToI = null;
+      this._resetThumbScrollToStart();
+      return;
+    }
+
     if (this._pendingScrollToI != null) {
       const i = this._pendingScrollToI;
       this._pendingScrollToI = null;
       this._scrollThumbIntoView(i);
     }
 
-    const dayChanged = changedProps.has("_selectedDay");
-    const filterChanged = changedProps.has("_filterAll");
-    if (dayChanged || filterChanged) this._resetThumbScrollToStart();
+    if (this._isLiveActive()) {
+      this._mountLiveCard();
+    }
   }
 
   async _scrollThumbIntoView(filteredIndexI) {
@@ -482,35 +836,43 @@ class CameraGalleryCard extends LitElement {
       await this.updateComplete;
     } catch (_) {}
 
-    await new Promise((r) =>
-      requestAnimationFrame(() => requestAnimationFrame(r))
+    await new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
     );
 
     const wrap = this.renderRoot?.querySelector(".tthumbs");
     if (!wrap) return;
 
-    let btn = wrap.querySelector(`button.tthumb[data-i="${filteredIndexI}"]`);
+    const btn = wrap.querySelector(`button.tthumb[data-i="${filteredIndexI}"]`);
     if (!btn) return;
 
+    const wrapRect = wrap.getBoundingClientRect();
+    const btnRect = btn.getBoundingClientRect();
+
+    const currentScroll = wrap.scrollLeft;
+    const btnCenterInScrollSpace =
+      currentScroll + (btnRect.left - wrapRect.left) + btnRect.width / 2;
+
+    const target = btnCenterInScrollSpace - wrap.clientWidth / 2;
     const max = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
-    if (max <= 0) return;
+    const clamped = Math.max(0, Math.min(max, target));
 
-    const target = Math.min(
-      max,
-      Math.max(0, btn.offsetLeft - wrap.clientWidth / 2 + btn.clientWidth / 2)
-    );
-
-    wrap.scrollLeft = target;
     try {
-      wrap.scrollTo({ left: target, behavior: "auto" });
-    } catch (_) {}
+      wrap.scrollTo({
+        left: clamped,
+        behavior: "smooth",
+      });
+    } catch (_) {
+      wrap.scrollLeft = clamped;
+    }
   }
 
   _toWebPath(p) {
     if (!p) return "";
     const v = String(p).trim();
-    if (v.startsWith("/config/www/"))
+    if (v.startsWith("/config/www/")) {
       return "/local/" + v.slice("/config/www/".length);
+    }
     if (v === "/config/www") return "/local";
     return v;
   }
@@ -520,14 +882,16 @@ class CameraGalleryCard extends LitElement {
     let clean = String(src).trim();
     clean = clean.split("?")[0].split("#")[0];
     try {
-      if (clean.startsWith("http://") || clean.startsWith("https://"))
+      if (clean.startsWith("http://") || clean.startsWith("https://")) {
         clean = new URL(clean).pathname;
+      }
     } catch (_) {}
     try {
       clean = decodeURIComponent(clean);
     } catch (_) {}
-    if (clean.startsWith("/local/"))
+    if (clean.startsWith("/local/")) {
       return "/config/www/" + clean.slice("/local/".length);
+    }
     if (clean.startsWith("/config/www/")) return clean;
     return "";
   }
@@ -538,6 +902,32 @@ class CameraGalleryCard extends LitElement {
 
   _isMediaSourceId(v) {
     return String(v || "").startsWith("media-source://");
+  }
+
+  _activeObjectFilters() {
+    return Array.isArray(this._objectFilters)
+      ? this._objectFilters
+          .map((x) => String(x || "").toLowerCase().trim())
+          .filter(Boolean)
+      : [];
+  }
+
+  _isObjectFilterActive(value) {
+    const v = String(value || "").toLowerCase().trim();
+    return this._activeObjectFilters().includes(v);
+  }
+
+  _matchesObjectFilterValue(src, filterValues) {
+    const active = Array.isArray(filterValues)
+      ? filterValues
+          .map((x) => String(x || "").toLowerCase().trim())
+          .filter(Boolean)
+      : [];
+
+    if (!active.length) return true;
+
+    const obj = this._objectForSrc(src);
+    return !!obj && active.includes(obj);
   }
 
   _serviceParts() {
@@ -580,8 +970,9 @@ class CameraGalleryCard extends LitElement {
   }
 
   async _ensurePoster(src) {
-    if (!src || this._posterCache.has(src) || this._posterPending.has(src))
+    if (!src || this._posterCache.has(src) || this._posterPending.has(src)) {
       return;
+    }
     this._posterPending.add(src);
     try {
       const dataUrl = await this._captureFirstFrame(src);
@@ -632,9 +1023,11 @@ class CameraGalleryCard extends LitElement {
         }
       };
 
-      v.addEventListener("error", () => fail(new Error("video load error")), {
-        once: true,
-      });
+      v.addEventListener(
+        "error",
+        () => fail(new Error("video load error")),
+        { once: true }
+      );
       v.addEventListener(
         "loadedmetadata",
         () => {
@@ -655,24 +1048,45 @@ class CameraGalleryCard extends LitElement {
     });
   }
 
+  // ─── LIVE ──────────────────────────────────────────────────────────
+
+  _renderLiveInner() {
+    const entity = String(this.config?.live_camera_entity || "").trim();
+    if (!entity) {
+      return html`<div class="preview-empty">No live camera configured.</div>`;
+    }
+
+    const st = this._hass?.states?.[entity];
+    if (!st) {
+      return html`<div class="preview-empty">Camera entity not found: ${entity}</div>`;
+    }
+
+    return html`
+      <div class="live-stage">
+        ${this._renderLiveCardHost()}
+      </div>
+    `;
+  }
+
   // ─── Media Source ────────────────────────────────────────────────
 
-  // ✅ meta lookup for mime/class/title
   _msMetaById(id) {
     const it = (this._ms?.list || []).find((x) => x.id === id);
     if (!it) return { mime: "", cls: "", title: "" };
     return { mime: it.mime || "", cls: it.cls || "", title: it.title || "" };
   }
 
-  // ─── Object detection (thumb icon) ───────────────────────────────
-
   _detectObjectFromText(text) {
     const s = String(text || "").toLowerCase();
-
     if (/\bperson\b/.test(s)) return "person";
     if (/\bcat\b/.test(s)) return "cat";
+    if (/\bdog\b/.test(s)) return "dog";
     if (/\bcar\b/.test(s)) return "car";
-
+    if (/\btruck\b/.test(s)) return "truck";
+    if (/\bbus\b/.test(s)) return "bus";
+    if (/\bbicycle\b/.test(s)) return "bicycle";
+    if (/\bmotorcycle\b/.test(s)) return "motorcycle";
+    if (/\bbird\b/.test(s)) return "bird";
     return null;
   }
 
@@ -680,17 +1094,18 @@ class CameraGalleryCard extends LitElement {
     if (!obj) return "";
     if (obj === "person") return "mdi:account";
     if (obj === "cat") return "mdi:cat";
+    if (obj === "dog") return "mdi:dog";
     if (obj === "car") return "mdi:car";
+    if (obj === "truck") return "mdi:truck";
+    if (obj === "bus") return "mdi:bus";
+    if (obj === "bicycle") return "mdi:bicycle";
+    if (obj === "motorcycle") return "mdi:motorbike";
+    if (obj === "bird") return "mdi:bird";
     return "";
   }
 
-  // ✅ icon color only (balk stays neutral)
-  _objectColor(obj) {
-    if (!obj) return "rgba(var(--rgb-primary-text-color, 255,255,255), 0.92)";
-    if (obj === "person") return "#4da3ff"; // blauw
-    if (obj === "cat") return "#ffb347"; // oranje
-    if (obj === "car") return "#7ed957"; // groen
-    return "rgba(var(--rgb-primary-text-color, 255,255,255), 0.92)";
+  _objectColor() {
+    return "rgba(255,255,255,0.92)";
   }
 
   _objectForSrc(src) {
@@ -703,7 +1118,119 @@ class CameraGalleryCard extends LitElement {
     return this._detectObjectFromText(src);
   }
 
-  // ✅ small time formatter for thumbbar
+  _matchesObjectFilter(src) {
+    return this._matchesObjectFilterValue(src, this._objectFilters);
+  }
+
+  _filterLabel(v) {
+    const s = String(v || "").toLowerCase();
+    if (s === "person") return "person";
+    if (s === "car") return "car";
+    if (s === "dog") return "dog";
+    if (s === "cat") return "cat";
+    if (s === "truck") return "truck";
+    if (s === "bus") return "bus";
+    if (s === "bicycle") return "bicycle";
+    if (s === "motorcycle") return "motorcycle";
+    if (s === "bird") return "bird";
+    return "selected";
+  }
+
+  _filterLabelList(values) {
+    const arr = Array.isArray(values)
+      ? values
+          .map((x) => String(x || "").toLowerCase().trim())
+          .filter(Boolean)
+      : [];
+
+    if (!arr.length) return "selected";
+    return arr.map((v) => this._filterLabel(v)).join(", ");
+  }
+
+  _setObjectFilter(next) {
+    const clicked = String(next || "").toLowerCase().trim();
+    if (!clicked) return;
+
+    const visible = new Set(this._getVisibleObjectFilters());
+    if (!visible.has(clicked)) return;
+
+    const currentFilters = this._activeObjectFilters().filter((x) =>
+      visible.has(x)
+    );
+    const set = new Set(currentFilters);
+
+    if (set.has(clicked)) set.delete(clicked);
+    else set.add(clicked);
+
+    const nextFilters = Array.from(set);
+
+    const rawItems = this._items();
+
+    const withDt = rawItems.map((src, idx) => {
+      const dtMs = this._dtMsFromSrc(src);
+      const dayKey = this._extractDayKey(src);
+      return { src, idx, dtMs, dayKey };
+    });
+
+    withDt.sort((a, b) => {
+      const aOk = Number.isFinite(a.dtMs);
+      const bOk = Number.isFinite(b.dtMs);
+      if (aOk && bOk && b.dtMs !== a.dtMs) return b.dtMs - a.dtMs;
+      if (aOk && !bOk) return -1;
+      if (!aOk && bOk) return 1;
+      return b.idx - a.idx;
+    });
+
+    const allWithDay = withDt.map((x) => ({ src: x.src, dayKey: x.dayKey }));
+    const days = this._uniqueDays(allWithDay);
+    const newestDay = days[0] ?? null;
+    const activeDay = this._selectedDay ?? newestDay;
+
+    const dayFiltered = !activeDay
+      ? allWithDay
+      : allWithDay.filter((x) => x.dayKey === activeDay);
+
+    const currentFiltered = dayFiltered.filter((x) =>
+      this._matchesObjectFilterValue(x.src, currentFilters)
+    );
+
+    const currentIdx = Math.min(
+      Math.max(this._selectedIndex ?? 0, 0),
+      Math.max(0, currentFiltered.length - 1)
+    );
+
+    const currentSelectedSrc =
+      currentFiltered.length > 0 ? currentFiltered[currentIdx]?.src : "";
+
+    const nextFiltered = dayFiltered.filter((x) =>
+      this._matchesObjectFilterValue(x.src, nextFilters)
+    );
+
+    let nextIndex = 0;
+
+    if (currentSelectedSrc) {
+      const keepIdx = nextFiltered.findIndex(
+        (x) => x.src === currentSelectedSrc
+      );
+      if (keepIdx >= 0) nextIndex = keepIdx;
+    }
+
+    this._objectFilters = nextFilters;
+    this._selectedIndex = nextIndex;
+    this._pendingScrollToI = null;
+    this._forceThumbReset = true;
+
+    if (this.config?.preview_click_to_open) {
+      this._previewOpen = false;
+    }
+
+    if (this._isLiveActive()) {
+      this._setViewMode("media");
+    }
+
+    this.requestUpdate();
+  }
+
   _formatTimeFromMs(ms) {
     if (!Number.isFinite(ms)) return "";
     try {
@@ -716,7 +1243,6 @@ class CameraGalleryCard extends LitElement {
     }
   }
 
-  // ✅ smarter video check for media-source resolved urls
   _isVideoSmart(urlOrTitle, mime, cls) {
     const m = String(mime || "").toLowerCase();
     const c = String(cls || "").toLowerCase();
@@ -732,11 +1258,12 @@ class CameraGalleryCard extends LitElement {
     const strip = (s) =>
       String(s || "").replace(/^\/+/, "").replace(/\/+$/, "");
 
-    // ✅ FIX: even if user already passed a full media-source:// URI,
-    // normalize path (collapse // and strip trailing slashes)
     if (v.startsWith("media-source://")) {
-      let rest = v.slice("media-source://".length);
-      rest = rest.replace(/\/{2,}/g, "/").replace(/\/+$/g, "");
+      let rest = v
+        .slice("media-source://".length)
+        .replace(/\/{2,}/g, "/")
+        .replace(/\/+$/g, "");
+      if (rest.startsWith("local/")) rest = `media_source/${rest}`;
       return `media-source://${rest}`;
     }
 
@@ -747,19 +1274,55 @@ class CameraGalleryCard extends LitElement {
       return rest ? `media-source://frigate/${rest}` : `media-source://frigate`;
     }
 
-    if (/frigate-fa:5000/i.test(v)) {
-      const after = v.split(/frigate-fa:5000/i)[1] || "";
-      const path = strip(after).toLowerCase();
-      if (!path) return "media-source://frigate";
-      return `media-source://frigate/frigate/${path}`;
-    }
-
     v = v.replace(/^media\//, "");
     return `media-source://media_source/${v}`;
   }
 
+  _msNormalizeRoots(listOrSingle) {
+    const arr = Array.isArray(listOrSingle)
+      ? listOrSingle
+      : listOrSingle
+        ? [listOrSingle]
+        : [];
+
+    const out = [];
+    const seen = new Set();
+
+    for (const raw of arr) {
+      const n = this._msNormalizeRoot(raw);
+      if (!n) continue;
+      const k = String(n).toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(n);
+    }
+
+    return out;
+  }
+
+  _msKeyFromRoots(rootsArr, fallbackSingle) {
+    const roots =
+      Array.isArray(rootsArr) && rootsArr.length
+        ? this._msNormalizeRoots(rootsArr)
+        : this._msNormalizeRoots(fallbackSingle);
+
+    if (!roots.length) return "";
+    return roots
+      .slice()
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      .join(" | ");
+  }
+
+  _wsWithTimeout(payload, timeoutMs = DEFAULT_BROWSE_TIMEOUT_MS) {
+    const p = this._hass.callWS(payload);
+    const t = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`WS timeout: ${payload?.type}`)), timeoutMs)
+    );
+    return Promise.race([p, t]);
+  }
+
   async _msBrowse(rootId) {
-    return await this._hass.callWS({
+    return await this._wsWithTimeout({
       type: "media_source/browse_media",
       media_content_id: rootId,
     });
@@ -769,57 +1332,18 @@ class CameraGalleryCard extends LitElement {
     const cached = this._ms?.urlCache?.get(mediaId);
     if (cached) return cached;
 
-    const r = await this._hass.callWS({
-      type: "media_source/resolve_media",
-      media_content_id: mediaId,
-      expires: 60 * 60,
-    });
+    const r = await this._wsWithTimeout(
+      {
+        type: "media_source/resolve_media",
+        media_content_id: mediaId,
+        expires: 60 * 60,
+      },
+      12000
+    );
 
     const url = r?.url ? String(r.url) : "";
     if (url) this._ms.urlCache.set(mediaId, url);
     return url;
-  }
-
-  async _msWalk(id, out, depth = 0, limit = 100) {
-    if (!id) return;
-    if (depth > DEFAULT_WALK_DEPTH) return;
-    if (out.length >= limit) return; // ⭐ STOP vroeg
-
-    const node = await this._msBrowse(id);
-    const children = Array.isArray(node?.children) ? node.children : [];
-
-    // leaf node
-    if (!children.length) {
-      if (node?.media_content_id) {
-        const ok = this._msIsRenderable(
-          node?.mime_type,
-          node?.media_class,
-          node?.title
-        );
-        if (ok) out.push(node);
-      }
-      return;
-    }
-
-    for (const ch of children) {
-      if (out.length >= limit) return; // ⭐ STOP vroeg
-
-      const cls = String(ch?.media_class || "").toLowerCase();
-      const mid = String(ch?.media_content_id || "");
-      if (!mid) continue;
-
-      if (cls === "directory") {
-        await this._msWalk(mid, out, depth + 1, limit);
-        if (out.length >= limit) return; // ⭐ STOP ook na recursion
-      } else {
-        const ok = this._msIsRenderable(
-          ch?.mime_type,
-          ch?.media_class,
-          ch?.title
-        );
-        if (ok) out.push(ch);
-      }
-    }
   }
 
   _msIsRenderable(mime, mediaClass, title) {
@@ -836,18 +1360,78 @@ class CameraGalleryCard extends LitElement {
     return false;
   }
 
+  async _msWalkIter(rootId, limit, depthLimit) {
+    const out = [];
+    const stack = [{ id: rootId, depth: 0 }];
+
+    while (stack.length && out.length < limit) {
+      const { id, depth } = stack.pop();
+      if (!id || depth > depthLimit) continue;
+
+      let node;
+      try {
+        node = await this._msBrowse(id);
+      } catch (_) {
+        continue;
+      }
+
+      const children = Array.isArray(node?.children) ? node.children : [];
+
+      if (!children.length) {
+        if (node?.media_content_id) {
+          const ok = this._msIsRenderable(
+            node?.mime_type,
+            node?.media_class,
+            node?.title
+          );
+          if (ok) out.push(node);
+        }
+        continue;
+      }
+
+      for (let i = children.length - 1; i >= 0; i--) {
+        if (out.length >= limit) break;
+
+        const ch = children[i];
+        const mid = String(ch?.media_content_id || "");
+        if (!mid) continue;
+
+        const cls = String(ch?.media_class || "").toLowerCase();
+        if (cls === "directory") {
+          stack.push({ id: mid, depth: depth + 1 });
+        } else {
+          const ok = this._msIsRenderable(
+            ch?.mime_type,
+            ch?.media_class,
+            ch?.title
+          );
+          if (ok) out.push(ch);
+        }
+      }
+    }
+
+    return out;
+  }
+
   async _msEnsureLoaded() {
-    const root = this._msNormalizeRoot(this.config?.media_source);
-    if (!root) return;
+    const roots =
+      Array.isArray(this.config?.media_sources) &&
+      this.config.media_sources.length
+        ? this._msNormalizeRoots(this.config.media_sources)
+        : this._msNormalizeRoots(this.config?.media_source);
+
+    if (!roots.length) return;
 
     const now = Date.now();
-    const sameKey = this._ms.key === root;
+    const key = this._msKeyFromRoots(roots);
+    const sameKey = this._ms.key === key;
     const fresh = sameKey && now - (this._ms.loadedAt || 0) < 10_000;
 
     if (this._ms.loading || fresh) return;
 
     if (!sameKey) {
-      this._ms.key = root;
+      this._ms.key = key;
+      this._ms.roots = roots.slice();
       this._ms.list = [];
       this._ms.urlCache = new Map();
     }
@@ -855,13 +1439,33 @@ class CameraGalleryCard extends LitElement {
     this._ms.loading = true;
 
     try {
-      // ✅ Hard cap: only walk as deep as needed for max_media
-      const limit = this._normMaxMedia(this.config?.max_media);
+      const visibleCap = this._normMaxMedia(this.config?.max_media);
+      const internalCap = Math.min(2000, Math.max(visibleCap * 10, 300));
+
+      const walkLimitTotal = Math.min(
+        4000,
+        Math.max(internalCap * 4, internalCap + 100)
+      );
+      const perRootLimit = Math.max(
+        DEFAULT_PER_ROOT_MIN_LIMIT,
+        Math.ceil(walkLimitTotal / roots.length)
+      );
 
       const flat = [];
-      await this._msWalk(root, flat, 0, limit); // ✅ pass limit into walk
 
-      // ✅ flat now already contains ONLY renderable items and is capped
+      for (const root of roots) {
+        try {
+          const depthLimit = String(root).includes("media_source/local/")
+            ? Math.min(6, DEFAULT_WALK_DEPTH)
+            : DEFAULT_WALK_DEPTH;
+
+          const tmp = await this._msWalkIter(root, perRootLimit, depthLimit);
+          flat.push(...tmp);
+        } catch (e) {
+          console.warn("MS root failed:", root, e);
+        }
+      }
+
       let items = flat
         .filter((x) => !!x?.media_content_id)
         .map((x) => ({
@@ -872,13 +1476,7 @@ class CameraGalleryCard extends LitElement {
         }))
         .filter((x) => !!x.id);
 
-      // ✅ DEDUPE: Media Source browse can return the same media_content_id multiple times
-      // (especially with odd roots like clips/////)
-      const uniq = new Map();
-      for (const it of items) {
-        if (!uniq.has(it.id)) uniq.set(it.id, it);
-      }
-      items = Array.from(uniq.values());
+      items = this._dedupeByRelPath(items);
 
       items.sort((a, b) => {
         const am = this._dtMsFromSrc(a.id);
@@ -891,16 +1489,11 @@ class CameraGalleryCard extends LitElement {
         return a.title < b.title ? 1 : a.title > b.title ? -1 : 0;
       });
 
-      // ✅ still slice for safety (should already be <= limit)
-      this._ms.list = items.slice(0, limit);
+      this._ms.list = items.slice(0, internalCap);
       this._ms.loadedAt = Date.now();
     } catch (e) {
       console.warn("MS ensure load failed:", e);
-      console.warn(
-        "MS root used:",
-        root,
-        " | Tip: For Frigate try: 'media-source://frigate/frigate/event-search/clips'"
-      );
+      console.warn("MS roots used:", roots);
       this._ms.list = [];
     } finally {
       this._ms.loading = false;
@@ -919,8 +1512,7 @@ class CameraGalleryCard extends LitElement {
 
   _msQueueResolve(ids) {
     for (const id of ids || []) {
-      if (!id) continue;
-      if (this._ms.urlCache.has(id)) continue;
+      if (!id || this._ms.urlCache.has(id)) continue;
       this._msResolveQueued.add(id);
     }
     if (this._msResolveInFlight) return;
@@ -948,37 +1540,58 @@ class CameraGalleryCard extends LitElement {
   }
 
   // ─── Data ─────────────────────────────────────────────────────────
+
   _items() {
     const usingMediaSource = this.config?.source_mode === "media";
 
     if (usingMediaSource) {
       this._msEnsureLoaded();
-      const ids = this._msIds();
-      if (this._deleted?.size)
+
+      let ids = this._msIds();
+      ids = this._dedupeByRelPath(ids);
+
+      if (this._deleted?.size) {
         return ids.filter((id) => !this._deleted.has(id));
+      }
       return ids;
     }
 
-    const st = this._hass?.states?.[this.config.entity];
-    const raw = st?.attributes?.[ATTR_NAME];
-    if (!raw) return [];
+    const entities = this._sensorEntityList();
+    if (!entities.length) return [];
 
     let list = [];
-    if (Array.isArray(raw)) {
-      list = raw.map((x) => this._toWebPath(x)).filter(Boolean);
-    } else if (typeof raw === "string") {
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed))
-          list = parsed.map((x) => this._toWebPath(x)).filter(Boolean);
-        else list = [this._toWebPath(raw)].filter(Boolean);
-      } catch (_) {
-        list = [this._toWebPath(raw)].filter(Boolean);
+
+    for (const entityId of entities) {
+      const st = this._hass?.states?.[entityId];
+      const raw = st?.attributes?.[ATTR_NAME];
+      if (!raw) continue;
+
+      let part = [];
+
+      if (Array.isArray(raw)) {
+        part = raw.map((x) => this._toWebPath(x)).filter(Boolean);
+      } else if (typeof raw === "string") {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            part = parsed.map((x) => this._toWebPath(x)).filter(Boolean);
+          } else {
+            part = [this._toWebPath(raw)].filter(Boolean);
+          }
+        } catch (_) {
+          part = [this._toWebPath(raw)].filter(Boolean);
+        }
       }
+
+      list.push(...part);
     }
 
-    if (this._deleted?.size)
+    list = this._dedupeByRelPath(list);
+
+    if (this._deleted?.size) {
       list = list.filter((src) => !this._deleted.has(src));
+    }
+
     return list;
   }
 
@@ -1033,7 +1646,6 @@ class CameraGalleryCard extends LitElement {
     return sec * 1000;
   }
 
-  // ✅ NEW: parse "2026-03-04 12:44:42" (and variants) from filename/title
   _extractYmdHms(src) {
     const s = this._sourceNameForParsing(src);
     if (!s) return null;
@@ -1043,12 +1655,12 @@ class CameraGalleryCard extends LitElement {
     );
     if (!m) return null;
 
-    const y = m[1],
-      mo = m[2],
-      d = m[3];
-    const hh = m[4],
-      mm = m[5],
-      ss = m[6];
+    const y = m[1];
+    const mo = m[2];
+    const d = m[3];
+    const hh = m[4];
+    const mm = m[5];
+    const ss = m[6];
 
     return {
       dayKey: `${y}-${mo}-${d}`,
@@ -1081,10 +1693,10 @@ class CameraGalleryCard extends LitElement {
     const s = this._sourceNameForParsing(src);
     const m = String(s || "").match(/(\d{8})[_-](\d{6})/);
     if (!m) return null;
-    return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}T${m[2].slice(
-      0,
-      2
-    )}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
+    return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(
+      6,
+      8
+    )}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
   }
 
   _dtMsFromSrc(src) {
@@ -1101,10 +1713,10 @@ class CameraGalleryCard extends LitElement {
       const s = this._sourceNameForParsing(src);
       const m = String(s || "").match(/(\d{8})[_-](\d{6})/);
       if (!m) return null;
-      return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}T${m[2].slice(
-        0,
-        2
-      )}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
+      return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(
+        6,
+        8
+      )}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
     })();
 
     if (dtKey) {
@@ -1159,7 +1771,7 @@ class CameraGalleryCard extends LitElement {
       /\.(mp4|webm|mov|m4v|jpg|jpeg|png|webp|gif)$/i,
       ""
     );
-    return noExt.length > 42 ? noExt.slice(0, 39) + "…" : noExt;
+    return noExt.length > 42 ? `${noExt.slice(0, 39)}…` : noExt;
   }
 
   _formatDateTime(dtKey) {
@@ -1182,21 +1794,78 @@ class CameraGalleryCard extends LitElement {
     }
   }
 
+  _onThumbWheel(e) {
+    const el = e.currentTarget;
+    if (!el) return;
+
+    const maxScroll = el.scrollWidth - el.clientWidth;
+    if (maxScroll <= 0) return;
+
+    const absX = Math.abs(e.deltaX || 0);
+    const absY = Math.abs(e.deltaY || 0);
+
+    let delta = absX > absY ? e.deltaX : e.deltaY;
+
+    if (e.shiftKey && absY > 0) {
+      delta = e.deltaY;
+    }
+
+    if (!Number.isFinite(delta) || Math.abs(delta) < 0.5) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    let step = delta;
+    if (e.deltaMode === 1) step = delta * 16;
+    if (e.deltaMode === 2) step = delta * el.clientWidth * 0.85;
+
+    const next = Math.max(0, Math.min(maxScroll, el.scrollLeft + step));
+    el.scrollLeft = next;
+  }
+
   _uniqueDays(itemsWithDay) {
     const set = new Set();
-    for (const it of itemsWithDay) if (it.dayKey) set.add(it.dayKey);
+    for (const it of itemsWithDay) {
+      if (it.dayKey) set.add(it.dayKey);
+    }
     return Array.from(set).sort((a, b) => (a < b ? 1 : -1));
   }
 
   _formatDay(dayKey) {
     if (!dayKey) return "";
     try {
-      return new Intl.DateTimeFormat("en", { day: "2-digit", month: "long" })
+      return new Intl.DateTimeFormat("en", {
+        day: "2-digit",
+        month: "long",
+      })
         .format(new Date(`${dayKey}T00:00:00`))
         .replace(".", "");
     } catch (_) {
       return dayKey;
     }
+  }
+
+  _dedupeByRelPath(items) {
+    const seen = new Map();
+
+    const norm = (idOrPath) =>
+      String(idOrPath || "")
+        .replace(/^media-source:\/\/media_source\//, "")
+        .replace(/^media-source:\/\/media_source/, "")
+        .replace(/^media-source:\/\//, "")
+        .replace(/\/{2,}/g, "/")
+        .replace(/^\/+/, "")
+        .replace(/\/+$/g, "")
+        .trim()
+        .toLowerCase();
+
+    for (const it of items || []) {
+      const key = norm(it?.media_content_id || it?.path || it?.id || it);
+      if (!key) continue;
+      if (!seen.has(key)) seen.set(key, it);
+    }
+
+    return Array.from(seen.values());
   }
 
   _stepDay(delta, days, activeDay) {
@@ -1206,14 +1875,16 @@ class CameraGalleryCard extends LitElement {
     const next = days[Math.min(Math.max(i + delta, 0), days.length - 1)];
 
     this._selectedDay = next;
-    this._filterAll = false;
     this._selectedIndex = 0;
-    this._scrubMinute = NaN;
-    this._pendingScrollToI = 0;
+    this._pendingScrollToI = null;
+    this._forceThumbReset = true;
     this._exitSelectMode();
-    this._resetThumbScrollToStart();
 
     if (this.config?.preview_click_to_open) this._previewOpen = false;
+
+    if (this._isLiveActive()) {
+      this._setViewMode("media");
+    }
 
     this.requestUpdate();
   }
@@ -1233,8 +1904,8 @@ class CameraGalleryCard extends LitElement {
 
   async _bulkDelete(selectedSrcList) {
     if (this.config?.source_mode !== "sensor") return;
-
     if (!this.config?.allow_delete || !this.config?.allow_bulk_delete) return;
+
     const sp = this._serviceParts();
     if (!sp) return;
 
@@ -1281,7 +1952,8 @@ class CameraGalleryCard extends LitElement {
 
     const path = e.composedPath?.() || [];
     if (path.some((el) => el?.classList?.contains("pnavbtn"))) return;
-    if (path.some((el) => el?.tagName === "VIDEO")) return;
+    if (path.some((el) => el?.classList?.contains("viewtoggle"))) return;
+    if (path.some((el) => el?.classList?.contains("live-el"))) return;
 
     this._previewOpen = false;
     this._showNav = false;
@@ -1295,10 +1967,14 @@ class CameraGalleryCard extends LitElement {
     if (
       this._isInsideTsbar(e) ||
       path.some((el) => el?.classList?.contains("pnavbtn")) ||
-      path.some((el) => el?.tagName === "VIDEO")
+      path.some((el) => el?.tagName === "VIDEO") ||
+      path.some((el) => el?.classList?.contains("viewtoggle")) ||
+      path.some((el) => el?.classList?.contains("live-el"))
     ) {
       return;
     }
+
+    if (this._isLiveActive()) return;
 
     this._swiping = true;
     this._swipeStartX = e.clientX;
@@ -1310,11 +1986,9 @@ class CameraGalleryCard extends LitElement {
   }
 
   _onPreviewPointerUp(e, listLen) {
-    // ✅ als we niet aan het swipen zijn (bv. omdat je op VIDEO tikte),
-    // behandel dit als "tap" en toon chevrons
     if (!this._swiping) {
       if (this.config?.preview_click_to_open && !this._previewOpen) return;
-      if (this._selectMode) return;
+      if (this._selectMode || this._isLiveActive()) return;
       this._showNavChevrons();
       return;
     }
@@ -1322,6 +1996,7 @@ class CameraGalleryCard extends LitElement {
     this._swiping = false;
 
     if (this.config?.preview_click_to_open && !this._previewOpen) return;
+    if (this._isLiveActive()) return;
 
     const dx = e.clientX - this._swipeStartX;
     const dy = e.clientY - this._swipeStartY;
@@ -1336,14 +2011,13 @@ class CameraGalleryCard extends LitElement {
     if (this._selectMode) return;
 
     if (dx < 0) {
-      if ((this._selectedIndex ?? 0) < listLen - 1)
+      if ((this._selectedIndex ?? 0) < listLen - 1) {
         this._selectedIndex = (this._selectedIndex ?? 0) + 1;
-    } else {
-      if ((this._selectedIndex ?? 0) > 0)
-        this._selectedIndex = (this._selectedIndex ?? 0) - 1;
+      }
+    } else if ((this._selectedIndex ?? 0) > 0) {
+      this._selectedIndex = (this._selectedIndex ?? 0) - 1;
     }
 
-    this._scrubMinute = NaN;
     this._pendingScrollToI = this._selectedIndex ?? 0;
     this.requestUpdate();
     this._showNavChevrons();
@@ -1354,14 +2028,15 @@ class CameraGalleryCard extends LitElement {
 
     const usingMediaSource = this.config?.source_mode === "media";
     const rawItems = this._items();
+    const visibleObjectFilters = this._getVisibleObjectFilters();
 
     if (!rawItems.length) {
-      if (usingMediaSource && this._ms?.loading)
+      if (usingMediaSource && this._ms?.loading) {
         return html`<div class="empty">Loading media…</div>`;
+      }
       return html`<div class="empty">No media found.</div>`;
     }
 
-    // ✅ Build sortable list
     const withDt = rawItems.map((src, idx) => {
       const dtMs = this._dtMsFromSrc(src);
       const dayKey = this._extractDayKey(src);
@@ -1380,47 +2055,52 @@ class CameraGalleryCard extends LitElement {
     const allWithDay = withDt.map((x) => ({ src: x.src, dayKey: x.dayKey }));
     const days = this._uniqueDays(allWithDay);
     const newestDay = days[0] ?? null;
-    const activeDay = this._filterAll ? null : this._selectedDay ?? newestDay;
+    const activeDay = this._selectedDay ?? newestDay;
 
-    const filteredAll =
-      !activeDay || this._filterAll
-        ? allWithDay
-        : allWithDay.filter((x) => x.dayKey === activeDay);
+    const dayFiltered = !activeDay
+      ? allWithDay
+      : allWithDay.filter((x) => x.dayKey === activeDay);
 
-    if (!filteredAll.length)
-      return html`<div class="empty">No media for this day.</div>`;
-
-    // ✅ SINGLE VISIBLE CAP: max_media
-    const cap = this._normMaxMedia(this.config?.max_media);
-    const filtered = filteredAll.slice(0, Math.min(cap, filteredAll.length));
-
-    if (!filtered.length) return html`<div class="empty">No media found.</div>`;
-
-    if ((this._selectedIndex ?? 0) >= filtered.length) this._selectedIndex = 0;
-
-    const idx = Math.min(
-      Math.max(this._selectedIndex ?? 0, 0),
-      filtered.length - 1
+    const filteredAll = dayFiltered.filter((x) =>
+      this._matchesObjectFilter(x.src)
     );
-    const selected = filtered[idx]?.src;
 
-    // ✅ thumbs == visible items (no sampling, no THUMBS_COUNT cap)
-    const thumbs = THUMBS_ENABLED ? filtered.map((it, i) => ({ ...it, i })) : [];
+    const noResultsForFilter = !filteredAll.length;
 
-    // media-source resolve queue
+    const cap = this._normMaxMedia(this.config?.max_media);
+    const filtered = noResultsForFilter
+      ? []
+      : filteredAll.slice(0, Math.min(cap, filteredAll.length));
+
+    if (!filtered.length) this._selectedIndex = 0;
+    else if ((this._selectedIndex ?? 0) >= filtered.length)
+      this._selectedIndex = 0;
+
+    const idx = filtered.length
+      ? Math.min(Math.max(this._selectedIndex ?? 0, 0), filtered.length - 1)
+      : 0;
+
+    const selected = filtered.length ? filtered[idx]?.src : "";
+
+    const thumbs =
+      THUMBS_ENABLED && filtered.length
+        ? filtered.map((it, i) => ({ ...it, i }))
+        : [];
+
     if (usingMediaSource) {
       const want = new Set();
       if (selected && this._isMediaSourceId(selected)) want.add(selected);
-      for (const t of thumbs)
+      for (const t of thumbs) {
         if (t?.src && this._isMediaSourceId(t.src)) want.add(t.src);
+      }
       this._msQueueResolve(Array.from(want));
     }
 
     let selectedUrl = selected;
-    if (this._isMediaSourceId(selected))
+    if (this._isMediaSourceId(selected)) {
       selectedUrl = this._ms.urlCache.get(selected) || "";
+    }
 
-    // ✅ meta-based video detect in media mode
     let selectedMime = "";
     let selectedCls = "";
     let selectedTitle = "";
@@ -1431,27 +2111,22 @@ class CameraGalleryCard extends LitElement {
       selectedTitle = meta.title;
     }
 
-    const selectedIsVideo = this._isVideoSmart(
-      selectedUrl || selectedTitle,
-      selectedMime,
-      selectedCls
-    );
+    const selectedIsVideo =
+      !!selected &&
+      this._isVideoSmart(selectedUrl || selectedTitle, selectedMime, selectedCls);
+
     if (selectedIsVideo && selectedUrl) this._ensurePoster(selectedUrl);
 
-    const tsKey = this._extractDateTimeKey(selected);
-    const tsText = this._formatDateTime(tsKey);
-    const tsLabel = tsText || this._tsLabelFromFilename(selected);
+    const tsKey = selected ? this._extractDateTimeKey(selected) : "";
+    const tsText = tsKey ? this._formatDateTime(tsKey) : "";
+    const tsLabel = selected ? tsText || this._tsLabelFromFilename(selected) : "";
 
     const currentForNav = activeDay ?? newestDay;
     const dayIdx = currentForNav ? days.indexOf(currentForNav) : -1;
     const canPrev = dayIdx >= 0 && dayIdx < days.length - 1;
     const canNext = dayIdx > 0;
-    const isAll = this._filterAll === true;
-    const isToday = !isAll && currentForNav === newestDay;
+    const isToday = currentForNav === newestDay;
 
-    // ✅ Theme behavior:
-    // - Graphite: keep Graphite (use HA vars / your STYLE)
-    // - Non-Graphite: ONLY light/dark palette (ignore other theme colors)
     const isGraphite = this._isGraphiteTheme();
     const isDark = this._isDarkMode();
 
@@ -1463,84 +2138,74 @@ class CameraGalleryCard extends LitElement {
           uiBg: "rgba(255,255,255,0.10)",
           uiStroke: "rgba(255,255,255,0.18)",
           uiTxt: "var(--primary-text-color, rgba(255,255,255,0.92))",
-          uiTxt2:
-            "var(--secondary-text-color, rgba(255,255,255,0.78))",
-          uiDis:
-            "rgba(var(--rgb-disabled-text-color, 120,120,120), 0.65)",
+          uiTxt2: "var(--secondary-text-color, rgba(255,255,255,0.78))",
+          uiDis: "rgba(var(--rgb-disabled-text-color, 120,120,120), 0.65)",
 
           divider: "var(--divider-color, rgba(255,255,255,0.10))",
 
-          // overlays
           tsRgb: "0,0,0",
           pillBg: "rgba(255,255,255,0.12)",
-          thumbBg:
-            "rgba(var(--rgb-card-background-color, 255,255,255), 0.22)",
-          tbarBg:
-            "rgba(var(--rgb-card-background-color, 255,255,255), 0.72)",
+          thumbBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.22)",
+          tbarBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.72)",
           selOvA: "rgba(0,0,0,0.18)",
           selOvB: "rgba(0,0,0,0.28)",
-          bulkBg:
-            "rgba(var(--rgb-card-background-color, 255,255,255), 0.18)",
+          bulkBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.18)",
           bulkBorder:
             "rgba(var(--rgb-primary-text-color, 255,255,255), 0.12)",
-          emptyBg:
-            "rgba(var(--rgb-card-background-color, 255,255,255), 0.18)",
-          navBtnBg:
-            "rgba(var(--rgb-card-background-color, 255,255,255), 0.72)",
+          emptyBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.18)",
+          navBtnBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.72)",
           navBtnBorder:
             "rgba(var(--rgb-primary-text-color, 255,255,255), 0.18)",
         }
       : isDark
-      ? {
-          // Dark mode (non-Graphite)
-          cardBg: "rgba(20,20,22,0.86)",
-          previewBg: "rgba(20,20,22,0.86)",
+        ? {
+            cardBg: "rgba(20,20,22,0.86)",
+            previewBg: "rgba(20,20,22,0.86)",
 
-          uiBg: "rgba(255,255,255,0.10)",
-          uiStroke: "rgba(255,255,255,0.18)",
-          uiTxt: "rgba(255,255,255,0.92)",
-          uiTxt2: "rgba(255,255,255,0.78)",
-          uiDis: "rgba(255,255,255,0.35)",
+            uiBg: "rgba(255,255,255,0.10)",
+            uiStroke: "rgba(255,255,255,0.18)",
+            uiTxt: "rgba(255,255,255,0.92)",
+            uiTxt2: "rgba(255,255,255,0.78)",
+            uiDis: "rgba(255,255,255,0.35)",
 
-          divider: "rgba(255,255,255,0.10)",
+            divider: "rgba(255,255,255,0.10)",
 
-          tsRgb: "0,0,0",
-          pillBg: "rgba(255,255,255,0.12)",
-          thumbBg: "rgba(255,255,255,0.10)",
-          tbarBg: "rgba(0,0,0,0.26)",
-          selOvA: "rgba(0,0,0,0.18)",
-          selOvB: "rgba(0,0,0,0.28)",
-          bulkBg: "rgba(255,255,255,0.08)",
-          bulkBorder: "rgba(255,255,255,0.12)",
-          emptyBg: "rgba(255,255,255,0.08)",
-          navBtnBg: "rgba(0,0,0,0.38)",
-          navBtnBorder: "rgba(255,255,255,0.18)",
-        }
-      : {
-          // Light mode (non-Graphite) -> date pill + download knop donkerder
-          cardBg: "rgba(255,255,255,0.86)",
-          previewBg: "rgba(255,255,255,0.86)",
+            tsRgb: "0,0,0",
+            pillBg: "rgba(255,255,255,0.12)",
+            thumbBg: "rgba(255,255,255,0.10)",
+            tbarBg: "rgba(0,0,0,0.26)",
+            selOvA: "rgba(0,0,0,0.18)",
+            selOvB: "rgba(0,0,0,0.28)",
+            bulkBg: "rgba(255,255,255,0.08)",
+            bulkBorder: "rgba(255,255,255,0.12)",
+            emptyBg: "rgba(255,255,255,0.08)",
+            navBtnBg: "rgba(0,0,0,0.38)",
+            navBtnBorder: "rgba(255,255,255,0.18)",
+          }
+        : {
+            cardBg: "rgba(255,255,255,0.86)",
+            previewBg: "rgba(255,255,255,0.86)",
 
-          uiBg: "rgba(0,0,0,0.16)",
-          uiStroke: "rgba(0,0,0,0.18)",
-          uiTxt: "rgba(0,0,0,0.92)",
-          uiTxt2: "rgba(0,0,0,0.70)",
-          uiDis: "rgba(0,0,0,0.35)",
+            uiBg: "rgba(0,0,0,0.16)",
+            uiStroke: "rgba(0,0,0,0.18)",
+            uiTxt: "rgba(0,0,0,0.92)",
+            uiTxt2: "rgba(0,0,0,0.70)",
+            uiDis: "rgba(0,0,0,0.35)",
 
-          divider: "rgba(0,0,0,0.10)",
+            divider: "rgba(0,0,0,0.10)",
 
-          tsRgb: "0,0,0",
-          pillBg: "rgba(255,255,255,0.14)",
-          thumbBg: "rgba(0,0,0,0.06)",
-          tbarBg: "rgba(0,0,0,0.16)",
-          selOvA: "rgba(0,0,0,0.10)",
-          selOvB: "rgba(0,0,0,0.16)",
-          bulkBg: "rgba(0,0,0,0.06)",
-          bulkBorder: "rgba(0,0,0,0.10)",
-          emptyBg: "rgba(0,0,0,0.06)",
-          navBtnBg: "rgba(0,0,0,0.18)",
-          navBtnBorder: "rgba(0,0,0,0.18)",
-        };
+            tsRgb: "0,0,0",
+            pillBg: "rgba(255,255,255,0.14)",
+            thumbBg: "rgba(0,0,0,0.06)",
+            tbarBg: "rgba(0,0,0,0.16)",
+            selOvA: "rgba(0,0,0,0.10)",
+            selOvB: "rgba(0,0,0,0.16)",
+            bulkBg: "rgba(0,0,0,0.06)",
+            bulkBorder: "rgba(0,0,0,0.10)",
+            emptyBg: "rgba(0,0,0,0.06)",
+            navBtnBg: "rgba(0,0,0,0.18)",
+            navBtnBorder: "rgba(0,0,0,0.18)",
+          };
 
     const rootVars = `
       --gap:10px; --r:18px;
@@ -1581,15 +2246,15 @@ class CameraGalleryCard extends LitElement {
       this.config?.source_mode === "sensor" &&
       !!this.config?.allow_bulk_delete &&
       !!sp;
-    const showBulkToggle =
-      canDelete && canBulkDelete && (thumbs?.length ?? 0) > 0;
+    const showBulkToggle = canDelete && canBulkDelete;
+    const bulkToggleDisabled = (thumbs?.length ?? 0) === 0;
 
     const tsPosClass =
       this.config.bar_position === "bottom"
         ? "bottom"
         : this.config.bar_position === "hidden"
-        ? "hidden"
-        : "top";
+          ? "hidden"
+          : "top";
 
     const previewGated = !!this.config?.preview_click_to_open;
     const previewOpen = !previewGated || !!this._previewOpen;
@@ -1597,16 +2262,22 @@ class CameraGalleryCard extends LitElement {
     const showPreviewSection = previewOpen === true;
     const previewAtBottom = this.config?.preview_position === "bottom";
 
-    // ✅ guard: don't render broken <img src=""> while resolve pending
     const selectedNeedsResolve =
-      usingMediaSource && this._isMediaSourceId(selected);
-    const selectedHasUrl = !selectedNeedsResolve || !!selectedUrl;
+      !!selected && usingMediaSource && this._isMediaSourceId(selected);
+    const selectedHasUrl = !!selected && (!selectedNeedsResolve || !!selectedUrl);
+
+    const showLiveToggle =
+      !!this.config?.show_live_toggle && this._hasLiveConfig();
+
+    const isLive = this._isLiveActive();
 
     const previewBlock = showPreviewSection
       ? html`
           <div
             class="preview"
-            style="height:${this.config.preview_height}px; touch-action: pan-y;"
+            style="height:${this.config.preview_height}px; touch-action:${isLive
+              ? "auto"
+              : "pan-y"};"
             @pointerdown=${(e) => {
               if (e?.isPrimary === false) return;
 
@@ -1614,7 +2285,8 @@ class CameraGalleryCard extends LitElement {
               const isOnControls =
                 this._isInsideTsbar(e) ||
                 path.some((el) => el?.classList?.contains("pnavbtn")) ||
-                path.some((el) => el?.tagName === "VIDEO");
+                path.some((el) => el?.tagName === "VIDEO") ||
+                path.some((el) => el?.classList?.contains("live-el"));
 
               if (!isOnControls) {
                 e.preventDefault?.();
@@ -1631,20 +2303,31 @@ class CameraGalleryCard extends LitElement {
             @pointercancel=${() => (this._swiping = false)}
             @click=${(e) => this._closePreviewIfEnabled(e)}
           >
-            ${!selectedHasUrl
-              ? html`<div class="empty">Loading media…</div>`
-              : selectedIsVideo
-              ? html`<video
-                  class="pimg"
-                  src=${selectedUrl}
-                  controls
-                  playsinline
-                  preload="auto"
-                  poster=${this._posterCache.get(selectedUrl) || ""}
-                ></video>`
-              : html`<img class="pimg" src=${selectedUrl} alt="" />`}
+            ${isLive
+              ? this._renderLiveInner()
+              : noResultsForFilter
+                ? html`
+                    <div class="preview-empty">
+                      No ${this._filterLabelList(this._objectFilters)} media for this day.
+                    </div>
+                  `
+                : !selectedHasUrl
+                  ? html`<div class="empty inpreview">Loading media…</div>`
+                  : selectedIsVideo
+                    ? html`<video
+                        class="pimg"
+                        src=${selectedUrl}
+                        controls
+                        playsinline
+                        preload="auto"
+                        poster=${this._posterCache.get(selectedUrl) || ""}
+                      ></video>`
+                    : html`<img class="pimg" src=${selectedUrl} alt="" />`}
 
-            ${this._showNav && filtered.length > 1
+            ${!noResultsForFilter &&
+            !isLive &&
+            this._showNav &&
+            filtered.length > 1
               ? html`
                   <div class="pnav">
                     <button
@@ -1653,7 +2336,7 @@ class CameraGalleryCard extends LitElement {
                       @click=${(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        this._navPrev(filtered.length);
+                        this._navPrev();
                       }}
                       aria-label="Previous"
                       title="Previous"
@@ -1678,14 +2361,14 @@ class CameraGalleryCard extends LitElement {
                 `
               : html``}
 
-            ${tsPosClass !== "hidden"
+            ${tsPosClass !== "hidden" && !isLive
               ? html`
                   <div class="tsbar ${tsPosClass}">
-                    <div class="tsleft">${tsLabel || "—"}</div>
+                    <div class="tsleft">
+                      ${!noResultsForFilter ? tsLabel || "—" : "—"}
+                    </div>
                     <div class="tspill">
-                      <span class="tspill-val"
-                        >${idx + 1}/${filtered.length}</span
-                      >
+                      <span class="tspill-val">${idx + 1}/${filtered.length}</span>
                     </div>
                   </div>
                 `
@@ -1694,14 +2377,44 @@ class CameraGalleryCard extends LitElement {
         `
       : html``;
 
+    const objectFiltersBlock = visibleObjectFilters.length
+      ? html`
+          <div class="objfilters" role="group" aria-label="Object filters">
+            ${visibleObjectFilters.map((filterValue) => {
+              const objIcon = this._objectIcon(filterValue);
+              const label = this._filterLabel(filterValue);
+              return html`
+                <button
+                  class="objbtn ${this._isObjectFilterActive(filterValue)
+                    ? "on"
+                    : ""}"
+                  @click=${() => this._setObjectFilter(filterValue)}
+                  title="Filter ${label}"
+                >
+                  ${objIcon
+                    ? html`<ha-icon icon="${objIcon}"></ha-icon>`
+                    : html``}
+                  <span>${label.charAt(0).toUpperCase() + label.slice(1)}</span>
+                </button>
+              `;
+            })}
+          </div>
+        `
+      : html``;
+
+    const previewSection = showPreviewSection
+      ? html`
+          ${previewBlock}
+          ${objectFiltersBlock}
+        `
+      : html``;
+
     const thumbsBlock = html`
       <div class="timeline">
         ${this._selectMode && (this._selectedSet?.size ?? 0)
           ? html`
               <div class="bulkbar topbulk">
-                <span class="bulkcount"
-                  >${this._selectedSet.size} selected</span
-                >
+                <span class="bulkcount">${this._selectedSet.size} selected</span>
                 <div class="bulkactions">
                   <button
                     type="button"
@@ -1738,11 +2451,14 @@ class CameraGalleryCard extends LitElement {
 
         ${thumbs.length
           ? html`
-              <div class="tthumbs" style="--tgap:${THUMB_GAP}px;">
+              <div
+                class="tthumbs"
+                style="--tgap:${THUMB_GAP}px;"
+                @wheel=${this._onThumbWheel}
+              >
                 ${thumbs.map((it) => {
-                  const isOn = it.i === idx;
+                  const isOn = it.i === idx && !isLive;
                   const isSel = this._selectedSet?.has(it.src);
-
                   const isMs = usingMediaSource && this._isMediaSourceId(it.src);
 
                   let thumbUrl = it.src;
@@ -1765,15 +2481,12 @@ class CameraGalleryCard extends LitElement {
                   );
                   if (isVid && thumbUrl) this._ensurePoster(thumbUrl);
 
-                  const poster = isVid
-                    ? this._posterCache.get(thumbUrl)
-                    : thumbUrl;
+                  const poster = isVid ? this._posterCache.get(thumbUrl) : thumbUrl;
 
                   const needsResolve = isMs;
                   const hasUrl = !needsResolve || !!thumbUrl;
                   const showImg = hasUrl && !!poster;
 
-                  // ✅ per-thumb time + object
                   const tMs = this._dtMsFromSrc(it.src);
                   const tTime = this._formatTimeFromMs(tMs);
 
@@ -1781,15 +2494,23 @@ class CameraGalleryCard extends LitElement {
                   const objIcon = this._objectIcon(obj);
                   const objColor = this._objectColor(obj);
 
-                  // show bar if we have either time or icon
                   const barPos = this.config?.thumb_bar_position || "bottom";
                   const showBar = barPos !== "hidden" && (!!tTime || !!objIcon);
 
                   return html`
                     <button
-                      class="tthumb ${isOn ? "on" : ""} ${this._selectMode && isSel ? "sel" : ""}"
+                      class="tthumb ${isOn ? "on" : ""} ${this._selectMode &&
+                      isSel
+                        ? "sel"
+                        : ""}"
                       data-i="${it.i}"
                       style="width:${this.config.thumb_size}px;height:${this.config.thumb_size}px;border-radius:${THUMB_RADIUS}px;"
+                      @pointerdown=${(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation?.();
+                        e.currentTarget?.blur?.();
+                      }}
                       @click=${(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -1799,17 +2520,26 @@ class CameraGalleryCard extends LitElement {
                           return;
                         }
 
-                        if (this.config?.preview_click_to_open)
+                        if (this._isLiveActive()) {
+                          this._setViewMode("media");
+                        }
+
+                        if (this.config?.preview_click_to_open) {
                           this._previewOpen = true;
+                        }
 
                         this._selectedIndex = it.i;
-                        this._scrubMinute = NaN;
                         this._pendingScrollToI = it.i;
                         this.requestUpdate();
                       }}
                     >
                       ${showImg
-                        ? html`<img class="timg" src="${poster}" alt="" loading="lazy" />`
+                        ? html`<img
+                            class="timg"
+                            src="${poster}"
+                            alt=""
+                            loading="lazy"
+                          />`
                         : html`<div class="tph" aria-hidden="true"></div>`}
 
                       ${showBar
@@ -1841,7 +2571,13 @@ class CameraGalleryCard extends LitElement {
                 })}
               </div>
             `
-          : html``}
+          : noResultsForFilter
+            ? html`
+                <div class="empty filter-empty">
+                  No ${this._filterLabelList(this._objectFilters)} media for this day.
+                </div>
+              `
+            : html``}
       </div>
     `;
 
@@ -1849,7 +2585,7 @@ class CameraGalleryCard extends LitElement {
       <div class="root" style="${rootVars}">
         <div class="panel" style="width:${PREVIEW_WIDTH}; margin:0 auto;">
           ${!previewAtBottom && showPreviewSection
-            ? html`${previewBlock}<div class="divider"></div>`
+            ? html`${previewSection}<div class="divider"></div>`
             : html``}
 
           <div class="topbar">
@@ -1858,14 +2594,12 @@ class CameraGalleryCard extends LitElement {
                 class="segbtn ${isToday ? "on" : ""}"
                 @click=${() => {
                   this._selectedDay = newestDay;
-                  this._filterAll = false;
                   this._selectedIndex = 0;
-                  this._scrubMinute = NaN;
-                  this._pendingScrollToI = 0;
+                  this._pendingScrollToI = null;
+                  this._forceThumbReset = true;
                   this._exitSelectMode();
-                  this._resetThumbScrollToStart();
-                  if (this.config?.preview_click_to_open)
-                    this._previewOpen = false;
+                  if (this.config?.preview_click_to_open) this._previewOpen = false;
+                  if (this._isLiveActive()) this._setViewMode("media");
                   this.requestUpdate();
                 }}
                 title="Today"
@@ -1888,11 +2622,7 @@ class CameraGalleryCard extends LitElement {
               </button>
               <div class="dateinfo" title="Selected day">
                 <span class="txt"
-                  >${isAll
-                    ? "All"
-                    : currentForNav
-                    ? this._formatDay(currentForNav)
-                    : "—"}</span
+                  >${currentForNav ? this._formatDay(currentForNav) : "—"}</span
                 >
               </div>
               <button
@@ -1910,13 +2640,20 @@ class CameraGalleryCard extends LitElement {
               ? html`
                   <button
                     class="bulkbtn ${this._selectMode ? "on" : ""}"
-                    title=${this._selectMode ? "Stop selecting" : "Select"}
+                    ?disabled=${bulkToggleDisabled}
+                    title=${bulkToggleDisabled
+                      ? "No media available for selection"
+                      : this._selectMode
+                        ? "Stop selecting"
+                        : "Select"}
                     @pointerdown=${(e) => {
+                      if (bulkToggleDisabled) return;
                       e.preventDefault();
                       e.stopPropagation();
                       e.stopImmediatePropagation?.();
                     }}
                     @click=${(e) => {
+                      if (bulkToggleDisabled) return;
                       e.preventDefault();
                       e.stopPropagation();
                       e.stopImmediatePropagation?.();
@@ -1926,7 +2663,9 @@ class CameraGalleryCard extends LitElement {
                       this.requestUpdate();
                     }}
                   >
-                    <ha-icon icon="mdi:checkbox-multiple-marked-outline"></ha-icon>
+                    <ha-icon
+                      icon="mdi:checkbox-multiple-marked-outline"
+                    ></ha-icon>
                   </button>
                 `
               : html``}
@@ -1942,6 +2681,24 @@ class CameraGalleryCard extends LitElement {
             >
               <ha-icon icon="mdi:download"></ha-icon>
             </button>
+
+            ${showLiveToggle
+              ? html`
+                  <button
+                    class="bulkbtn live ${isLive ? "on" : ""}"
+                    title="Live camera"
+                    @click=${(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      this._setViewMode(isLive ? "media" : "live");
+                    }}
+                  >
+                    <ha-icon
+                      icon="${isLive ? "mdi:video" : "mdi:video-outline"}"
+                    ></ha-icon>
+                  </button>
+                `
+              : html``}
           </div>
 
           <div class="divider"></div>
@@ -1949,7 +2706,7 @@ class CameraGalleryCard extends LitElement {
           ${thumbsBlock}
 
           ${previewAtBottom && showPreviewSection
-            ? html`<div class="divider"></div>${previewBlock}`
+            ? html`<div class="divider"></div>${previewSection}`
             : html``}
         </div>
       </div>
@@ -1969,7 +2726,6 @@ class CameraGalleryCard extends LitElement {
         border-radius: 0;
         min-height: 0;
       }
-
       .panel {
         background: var(--cardBg);
         border-radius: var(--r);
@@ -1996,6 +2752,122 @@ class CameraGalleryCard extends LitElement {
         height: 100%;
         object-fit: cover;
         display: block;
+      }
+
+      .live-card-host {
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        overflow: hidden;
+      }
+
+      .live-card-host > * {
+        width: 100% !important;
+        height: 100% !important;
+        display: block !important;
+      }
+
+      .live-card-host ha-card {
+        width: 100% !important;
+        height: 100% !important;
+        margin: 0 !important;
+        box-shadow: none !important;
+        background: transparent !important;
+        border-radius: inherit !important;
+        overflow: hidden !important;
+      }
+
+      .live-card-host video {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: cover !important;
+      }
+
+      .live-stage {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      .live-stage::before {
+        content: "LIVE";
+        position: absolute;
+        top: 10px;
+        left: 16px;        /* iets verder naar rechts */
+
+        background: rgba(255,0,0,0.9);
+        color: white;
+
+        font-size: 9px;    /* kleiner */
+        font-weight: 800;
+        letter-spacing: 0.5px;
+
+        padding: 2px 6px;  /* compacter */
+        border-radius: 6px;
+
+        z-index: 20;
+      }
+
+      .live-el {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      .preview-empty {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 24px;
+        box-sizing: border-box;
+        color: var(--uiTxt);
+        font-size: 15px;
+        font-weight: 700;
+        background: var(--previewBg);
+      }
+
+      .objfilters {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        margin-top: 10px;
+        width: 100%;
+      }
+
+      .objbtn {
+        width: 100%;
+        min-width: 0;
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 12px;
+        background: var(--uiBg);
+        color: var(--uiTxt);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 800;
+        text-transform: capitalize;
+        -webkit-tap-highlight-color: transparent;
+        box-sizing: border-box;
+      }
+
+      .objbtn.on {
+        background: var(--primary-color, #ffffff);
+        color: var(--text-primary-color, #ffffff);
+        border-radius: 8px;
+      }
+      .objbtn ha-icon {
+        --ha-icon-size: 16px;
+        --mdc-icon-size: var(--ha-icon-size);
+        width: var(--ha-icon-size);
+        height: var(--ha-icon-size);
       }
 
       .pnav {
@@ -2040,7 +2912,10 @@ class CameraGalleryCard extends LitElement {
         right: 0;
         height: 40px;
         padding: 0 10px 0 12px;
-        background: rgba(var(--tsRgb, 0, 0, 0), calc(var(--barOpacity, 45) / 100));
+        background: rgba(
+          var(--tsRgb, 0, 0, 0),
+          calc(var(--barOpacity, 45) / 100)
+        );
         color: var(--uiTxt);
         font-size: 12px;
         font-weight: 700;
@@ -2193,6 +3068,10 @@ class CameraGalleryCard extends LitElement {
         background: var(--primary-color, #ffffff);
         color: var(--text-primary-color, #ffffff);
       }
+      .bulkbtn.live.on {
+        background: rgba(255, 59, 48, 0.18);
+        color: #ff6b60;
+      }
       .bulkbtn ha-icon {
         --ha-icon-size: calc(var(--bsize) * 0.55);
         --mdc-icon-size: var(--ha-icon-size);
@@ -2203,11 +3082,16 @@ class CameraGalleryCard extends LitElement {
         transform: translateY(-0.5px);
       }
 
+      .bulkbtn[disabled] {
+        opacity: 0.42;
+        cursor: default;
+        pointer-events: none;
+      }
+
       .timeline {
         padding: 0;
         margin: 0;
       }
-
       .tthumbs {
         display: flex;
         align-items: center;
@@ -2218,12 +3102,13 @@ class CameraGalleryCard extends LitElement {
         overflow-y: hidden;
         -webkit-overflow-scrolling: touch;
         padding-bottom: 2px;
+        overscroll-behavior-x: contain;
+        overscroll-behavior-y: none;
       }
 
       .tthumb:focus {
         outline: none;
       }
-
       .tthumb {
         border: 0;
         padding: 0;
@@ -2236,19 +3121,46 @@ class CameraGalleryCard extends LitElement {
         scroll-snap-align: start;
         box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
       }
+
+      .live-card-host {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+      }
+
+      .live-card-host > * {
+        width: 100% !important;
+        height: 100% !important;
+        display: block !important;
+      }
+
+      .live-card-host ha-card {
+        width: 100% !important;
+        height: 100% !important;
+        margin: 0 !important;
+        box-shadow: none !important;
+        background: transparent !important;
+        border-radius: 0 !important;
+        overflow: hidden !important;
+      }
+
       .tthumb::after {
         content: "";
         position: absolute;
         inset: 0;
         border-radius: inherit;
         pointer-events: none;
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+        box-sizing: border-box;
+        border: 1px solid
+          rgba(var(--rgb-primary-text-color, 255, 255, 255), 0.18);
       }
       .tthumb.on::after {
-        box-shadow: inset 0 0 0 2px var(--primary-color, rgba(64, 148, 255, 0.95));
+        border: 2px solid var(--primary-color, rgba(255, 165, 0, 0.95));
       }
       .tthumb.sel::after {
-        box-shadow: inset 0 0 0 2px rgba(255, 192, 203, 0.95);
+        border: 2px solid rgba(255, 192, 203, 0.95);
       }
 
       .timg {
@@ -2263,37 +3175,31 @@ class CameraGalleryCard extends LitElement {
         background: var(--thumbBg);
       }
 
-      /* ✅ NEW: thumb bottom bar (time left, object icon right) */
+
+
       .tbar {
         position: absolute;
         left: 0;
         right: 0;
-
         height: 26px;
         padding: 0 8px;
-
         display: flex;
         align-items: center;
         justify-content: space-between;
-
         background: var(--tbarBg);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
-
         font-size: 11px;
         font-weight: 800;
         color: var(--uiTxt);
-
         pointer-events: none;
         z-index: 2;
       }
-
       .tbar.bottom {
         bottom: 0;
         border-bottom-left-radius: 14px;
         border-bottom-right-radius: 14px;
       }
-
       .tbar.top {
         top: 0;
         border-top-left-radius: 14px;
@@ -2310,7 +3216,6 @@ class CameraGalleryCard extends LitElement {
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-
       .tbar-icon {
         --ha-icon-size: 16px;
         --mdc-icon-size: var(--ha-icon-size);
@@ -2420,6 +3325,17 @@ class CameraGalleryCard extends LitElement {
         color: var(--uiTxt);
       }
 
+      .empty.inpreview {
+        position: absolute;
+        inset: 50% auto auto 50%;
+        transform: translate(-50%, -50%);
+        z-index: 3;
+      }
+
+      .filter-empty {
+        text-align: center;
+      }
+
       @media (max-width: 420px) {
         .segbtn {
           padding: 9px 12px;
@@ -2430,6 +3346,12 @@ class CameraGalleryCard extends LitElement {
         }
         .dateinfo {
           padding: 9px 12px;
+        }
+        .objfilters {
+          gap: 6px;
+        }
+        .objbtn {
+          padding: 7px 10px;
         }
       }
     `;
@@ -2443,7 +3365,7 @@ window.customCards.push({
   type: "camera-gallery-card",
   name: "Camera Gallery Card",
   description:
-    "Media gallery for Home Assistant (sensor fileList OR media_source folder)",
+    "Media gallery for Home Assistant (sensor fileList OR media_source folder) with optional live preview",
 });
 
 console.info(`Camera Gallery Card v${CARD_VERSION}`);
