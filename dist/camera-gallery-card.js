@@ -1,15 +1,8 @@
 /**
  * Camera Gallery Card
- * Version: 1.1.9
- *
- * CHANGE (1.1.9):
- * - ✅ live_provider removed from YAML/config
- * - ✅ Live provider is now hardcoded to WebRTC
- * - ✅ Image fallback mode removed as configurable provider
- * - ✅ Live refresh timer logic simplified
  */
 
-const CARD_VERSION = "1.1.9";
+const CARD_VERSION = "1.3.0";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";

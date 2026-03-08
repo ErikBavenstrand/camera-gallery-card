@@ -1,36 +1,6 @@
 /* camera-gallery-card-editor.js
- * v1.4.8
- *
- * CHANGE:
- * - ✅ Removed Live provider option entirely
- * - ✅ Live provider is no longer editable in the editor
- * - ✅ Legacy live_provider config is stripped automatically
- * - ✅ Added dedicated Live tab
- * - ✅ Live settings moved out of Viewer tab
- * - ✅ Live preview toggle now lives in Live tab
- * - ✅ Live settings only visible when Live preview is enabled
- * - ✅ Added Camera entity selector
- * - ✅ Added Show live toggle switch
- * - ✅ Added Start in live mode switch
- * - ✅ Preview bar settings remain in Viewer tab
- * - ✅ Thumbnail size field restored
- * - ✅ Maximum thumbnails shown field restored
- * - ✅ Tabbed editor UI kept
- * - ✅ File sensors + Media folders still use real <textarea>
- * - ✅ Live validation for sensors / media folders
- * - ✅ Autocomplete dropdown for sensors / media folders
- * - ✅ Media folder autocomplete browses actual Home Assistant media-source folders
- * - ✅ Subfolders under clips / snapshots are suggested dynamically
- * - ✅ Suggestion dropdown no longer flickers as aggressively
- * - ✅ Long media-source paths are fully visible in suggestions
- * - ✅ Native <select> kept for delete service
- * - ✅ Stable typing (no config-changed during input)
- * - ✅ Number fields still commit on change / blur
  */
 
-console.warn(
-  "CAMERA GALLERY EDITOR LOADED v1.4.8-live-provider-removed"
-);
 
 const AVAILABLE_OBJECT_FILTERS = [
   "person",
@@ -2175,7 +2145,3 @@ class CameraGalleryCardEditor extends HTMLElement {
 if (!customElements.get("camera-gallery-card-editor")) {
   customElements.define("camera-gallery-card-editor", CameraGalleryCardEditor);
 }
-
-console.info(
-  "CAMERA GALLERY EDITOR: registered OK v1.4.8-live-provider-removed"
-);
