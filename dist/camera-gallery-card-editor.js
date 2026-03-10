@@ -20,6 +20,12 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._config = {};
     this.attachShadow({ mode: "open" });
 
+    this._scrollRestore = {
+      windowY: 0,
+      hostScrollTop: 0,
+      browserBodyTop: 0,
+    };
+
     this._activeTab = "general";
     this._focusState = null;
     this._lastSuggestFingerprint = {
@@ -30,6 +36,12 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._mediaSuggestReq = 0;
     this._mediaSuggestTimer = null;
     this._raf = null;
+
+    this._mediaBrowserOpen = false;
+    this._mediaBrowserLoading = false;
+    this._mediaBrowserPath = "";
+    this._mediaBrowserItems = [];
+    this._mediaBrowserHistory = [];
 
     this._suggestState = {
       entities: { open: false, items: [], index: -1 },
@@ -106,6 +118,117 @@ class CameraGalleryCardEditor extends HTMLElement {
       this._mediaBrowseCache.set(id, []);
       return [];
     }
+  }
+
+  async _browseMediaFolderNodes(mediaContentId) {
+    const id = this._normalizeMediaSourceValue(mediaContentId);
+    if (!id || !this._hass?.callWS) return [];
+
+    const cacheKey = `__nodes__:${id}`;
+    if (this._mediaBrowseCache.has(cacheKey)) {
+      return this._mediaBrowseCache.get(cacheKey);
+    }
+
+    try {
+      const result = await this._hass.callWS({
+        type: "media_source/browse_media",
+        media_content_id: id,
+      });
+
+      const children = Array.isArray(result?.children) ? result.children : [];
+
+      const folders = children
+        .filter((child) => this._isFolderNode(child))
+        .map((child) => {
+          const mediaId = String(child.media_content_id || "").trim();
+          const title = String(child.title || "").trim();
+          return {
+            id: mediaId,
+            title: title || this._lastPathSegment(mediaId),
+          };
+        })
+        .filter((v) => v.id.startsWith("media-source://"))
+        .sort((a, b) => a.title.localeCompare(b.title));
+
+      this._mediaBrowseCache.set(cacheKey, folders);
+      return folders;
+    } catch (_) {
+      this._mediaBrowseCache.set(cacheKey, []);
+      return [];
+    }
+  }
+
+  _getHostScroller() {
+    let el = this;
+    while (el) {
+      const root = el.getRootNode?.();
+      const parent = el.parentElement || (root && root.host ? root.host : null);
+
+      if (!parent) break;
+
+      try {
+        const style = getComputedStyle(parent);
+        const overflowY = style.overflowY;
+        const canScroll =
+          (overflowY === "auto" || overflowY === "scroll") &&
+          parent.scrollHeight > parent.clientHeight;
+
+        if (canScroll) return parent;
+      } catch (_) {}
+
+      el = parent;
+    }
+
+    return null;
+  }
+
+  _captureScrollState() {
+    try {
+      this._scrollRestore.windowY =
+        window.scrollY ||
+        window.pageYOffset ||
+        document.documentElement.scrollTop ||
+        0;
+    } catch (_) {
+      this._scrollRestore.windowY = 0;
+    }
+
+    try {
+      const scroller = this._getHostScroller();
+      this._scrollRestore.hostScrollTop = scroller ? scroller.scrollTop : 0;
+    } catch (_) {
+      this._scrollRestore.hostScrollTop = 0;
+    }
+
+    try {
+      const body = this.shadowRoot?.querySelector(".browser-body");
+      this._scrollRestore.browserBodyTop = body ? body.scrollTop : 0;
+    } catch (_) {
+      this._scrollRestore.browserBodyTop = 0;
+    }
+  }
+
+  _restoreScrollState() {
+    requestAnimationFrame(() => {
+      try {
+        const scroller = this._getHostScroller();
+        if (scroller) {
+          scroller.scrollTop = this._scrollRestore.hostScrollTop || 0;
+        } else {
+          window.scrollTo({
+            top: this._scrollRestore.windowY || 0,
+            behavior: "auto",
+          });
+        }
+      } catch (_) {}
+
+      try {
+        const body = this.shadowRoot?.querySelector(".browser-body");
+        if (body) {
+          body.scrollTop = this._scrollRestore.browserBodyTop || 0;
+        }
+      } catch (_) {}
+    });
   }
 
   _clampInt(n, min, max) {
@@ -245,8 +368,10 @@ class CameraGalleryCardEditor extends HTMLElement {
 
   _getDefaultMediaSuggestions() {
     const defaults = [
+      "media-source://frigate",
       "media-source://frigate/frigate/event-search/clips",
       "media-source://frigate/frigate/event-search/snapshots",
+      "media-source://media_source",
       "media-source://media_source/local",
       "media-source://media_source/local/mac_share",
     ];
@@ -260,6 +385,22 @@ class CameraGalleryCardEditor extends HTMLElement {
 
     const set = new Set([...defaults, ...cfg]);
     return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }
+
+  _getMediaBrowserRoots() {
+    const roots = [
+      "media-source://frigate",
+      "media-source://media_source",
+      "media-source://media_source/local",
+    ];
+
+    const configured = Array.isArray(this._config.media_sources)
+      ? this._config.media_sources
+          .map((x) => this._normalizeMediaSourceValue(x))
+          .filter(Boolean)
+      : [];
+
+    return this._sortUniqueStrings([...roots, ...configured]);
   }
 
   _getTextareaLineInfo(el) {
@@ -316,6 +457,13 @@ class CameraGalleryCardEditor extends HTMLElement {
     return /\.(jpg|jpeg|png|gif|webp|mp4|mov|mkv|avi|m4v|wav|mp3|aac|flac|pdf|txt|json)$/i.test(
       last
     );
+  }
+
+  _lastPathSegment(v) {
+    const s = String(v || "").replace(/\/+$/, "");
+    if (!s) return "";
+    const parts = s.split("/");
+    return parts[parts.length - 1] || s;
   }
 
   _luminance({ r, g, b }) {
@@ -441,6 +589,109 @@ class CameraGalleryCardEditor extends HTMLElement {
     };
 
     this._renderSuggestions(id);
+  }
+
+  async _openMediaBrowser(startPath = "") {
+    const roots = this._getMediaBrowserRoots();
+
+    const normalizedStart = this._normalizeMediaSourceValue(startPath);
+    const chosen =
+      normalizedStart ||
+      roots.find((r) => r === "media-source://frigate") ||
+      roots[0] ||
+      "media-source://frigate";
+
+    this._lockPageScroll();
+
+    this._mediaBrowserOpen = true;
+    this._mediaBrowserHistory = [];
+    this._mediaBrowserItems = [];
+    this._mediaBrowserPath = chosen;
+    this._mediaBrowserLoading = true;
+    this._scheduleRender();
+
+    await this._loadMediaBrowser(chosen, false);
+  }
+
+  async _loadMediaBrowser(path, pushHistory = true) {
+    const target = this._normalizeMediaSourceValue(path);
+    if (!target) return;
+
+    if (pushHistory && this._mediaBrowserPath && this._mediaBrowserPath !== target) {
+      this._mediaBrowserHistory.push(this._mediaBrowserPath);
+    }
+
+    this._mediaBrowserLoading = true;
+    this._mediaBrowserPath = target;
+    this._mediaBrowserItems = [];
+    this._scheduleRender();
+
+    const items = await this._browseMediaFolderNodes(target);
+
+    if (this._mediaBrowserPath !== target) return;
+
+    this._mediaBrowserItems = items;
+    this._mediaBrowserLoading = false;
+    this._scheduleRender();
+  }
+
+  _closeMediaBrowser() {
+    this._unlockPageScroll();
+
+    this._mediaBrowserOpen = false;
+    this._mediaBrowserLoading = false;
+    this._mediaBrowserPath = "";
+    this._mediaBrowserItems = [];
+    this._mediaBrowserHistory = [];
+    this._scheduleRender();
+  }
+
+  async _mediaBrowserGoBack() {
+    if (!this._mediaBrowserHistory.length) return;
+    const prev = this._mediaBrowserHistory.pop();
+    if (!prev) return;
+
+    this._mediaBrowserLoading = true;
+    this._mediaBrowserPath = prev;
+    this._mediaBrowserItems = [];
+    this._scheduleRender();
+
+    const items = await this._browseMediaFolderNodes(prev);
+    if (this._mediaBrowserPath !== prev) return;
+
+    this._mediaBrowserItems = items;
+    this._mediaBrowserLoading = false;
+    this._scheduleRender();
+  }
+
+  _appendMediaSourceValue(value) {
+    const nextValue = this._normalizeMediaSourceValue(value);
+    if (!nextValue) return;
+
+    const current = Array.isArray(this._config.media_sources)
+      ? this._config.media_sources.map((x) => String(x).trim()).filter(Boolean)
+      : [];
+
+    const set = new Set(current.map((x) => x.toLowerCase()));
+    if (!set.has(nextValue.toLowerCase())) {
+      current.push(nextValue);
+    }
+
+    const mediaEl = this.shadowRoot?.getElementById("mediasources");
+    if (mediaEl) {
+      mediaEl.value = current.join("\n");
+    }
+
+    this._config = this._stripAlwaysTrueKeys({
+      ...this._config,
+      media_sources: current,
+    });
+    delete this._config.media_source;
+
+    this._fire();
+    this._applyFieldValidation("mediasources");
+    this._closeSuggestions("mediasources");
+    this._scheduleRender();
   }
 
   _parseCssColorToRgb(v) {
@@ -609,7 +860,15 @@ class CameraGalleryCardEditor extends HTMLElement {
 
     const cameraEntities = Object.keys(this._hass?.states || {})
       .filter((id) => id.startsWith("camera."))
-      .sort((a, b) => a.localeCompare(b));
+      .sort((a, b) => {
+        const an = String(
+          this._hass?.states?.[a]?.attributes?.friendly_name || a
+        ).toLowerCase();
+        const bn = String(
+          this._hass?.states?.[b]?.attributes?.friendly_name || b
+        ).toLowerCase();
+        return an.localeCompare(bn);
+      });
 
     const isLight = this._isLightTheme();
 
@@ -792,6 +1051,89 @@ class CameraGalleryCardEditor extends HTMLElement {
         </div>
       </div>
     `;
+
+    const mediaBrowserHtml = this._mediaBrowserOpen
+      ? `
+        <div class="browser-backdrop" id="browser-backdrop"></div>
+        <div class="browser-modal" role="dialog" aria-modal="true" aria-label="Browse media folders">
+          <div class="browser-head">
+            <div class="browser-head-copy">
+              <div class="browser-title">Browse folders</div>
+              <div class="browser-path">${this._mediaBrowserPath || "—"}</div>
+            </div>
+            <button type="button" class="browser-iconbtn" id="browser-close" title="Close">
+              <ha-icon icon="mdi:close"></ha-icon>
+            </button>
+          </div>
+
+          <div class="browser-toolbar">
+            <button
+              type="button"
+              class="browser-btn ${this._mediaBrowserHistory.length ? "" : "disabled"}"
+              id="browser-back"
+              ${this._mediaBrowserHistory.length ? "" : "disabled"}
+            >
+              <ha-icon icon="mdi:arrow-left"></ha-icon>
+              <span>Back</span>
+            </button>
+
+            <button
+              type="button"
+              class="browser-btn primary"
+              id="browser-select-current"
+              ${this._mediaBrowserPath ? "" : "disabled"}
+            >
+              <ha-icon icon="mdi:check"></ha-icon>
+              <span>Use current folder</span>
+            </button>
+          </div>
+
+          <div class="browser-body">
+            ${
+              this._mediaBrowserLoading
+                ? `<div class="browser-empty">Loading folders…</div>`
+                : this._mediaBrowserItems.length
+                  ? `
+                    <div class="browser-list">
+                      ${this._mediaBrowserItems
+                        .map(
+                          (item) => `
+                            <div class="browser-item">
+                              <button
+                                type="button"
+                                class="browser-open"
+                                data-browser-open="${item.id.replace(/"/g, "&quot;")}"
+                                title="${item.id.replace(/"/g, "&quot;")}"
+                              >
+                                <span class="browser-open-icon">
+                                  <ha-icon icon="mdi:folder-outline"></ha-icon>
+                                </span>
+                                <span class="browser-open-copy">
+                                  <span class="browser-open-title">${item.title}</span>
+                                  <span class="browser-open-sub">${item.id}</span>
+                                </span>
+                              </button>
+
+                              <button
+                                type="button"
+                                class="browser-select"
+                                data-browser-select="${item.id.replace(/"/g, "&quot;")}"
+                                title="Select folder"
+                              >
+                                Select
+                              </button>
+                            </div>
+                          `
+                        )
+                        .join("")}
+                    </div>
+                  `
+                  : `<div class="browser-empty">No folders found here.</div>`
+            }
+          </div>
+        </div>
+      `
+      : ``;
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -1286,6 +1628,49 @@ class CameraGalleryCardEditor extends HTMLElement {
           text-decoration:underline;
         }
 
+        .row-actions{
+          display:flex;
+          gap:10px;
+        }
+
+        .row-actions .actionbtn{
+          flex:1;
+          justify-content:center;
+        }
+
+        .actionbtn{
+          appearance:none;
+          -webkit-appearance:none;
+          border:1px solid var(--ed-input-border);
+          background:var(--ed-input-bg);
+          color:var(--ed-text);
+          border-radius:12px;
+          min-height:40px;
+          padding:0 14px;
+          cursor:pointer;
+          display:inline-flex;
+          align-items:center;
+          gap:8px;
+          font-size:13px;
+          font-weight:900;
+          transition:
+            background 0.18s ease,
+            border-color 0.18s ease,
+            transform 0.18s ease,
+            box-shadow 0.18s ease;
+        }
+
+        .actionbtn:hover{
+          transform:translateY(-1px);
+          border-color:color-mix(in srgb, var(--ed-input-border) 65%, var(--ed-text2) 35%);
+        }
+
+        .actionbtn ha-icon{
+          --mdc-icon-size:18px;
+          width:18px;
+          height:18px;
+        }
+
         .chip-grid{
           display:grid;
           grid-template-columns:repeat(3, minmax(0, 1fr));
@@ -1411,6 +1796,232 @@ class CameraGalleryCardEditor extends HTMLElement {
           letter-spacing:0.02em;
         }
 
+        .browser-backdrop{
+          position:fixed;
+          inset:0;
+          background:rgba(0,0,0,0.68);
+          backdrop-filter:blur(10px) saturate(120%);
+          -webkit-backdrop-filter:blur(10px) saturate(120%);
+          z-index:9998;
+        }
+
+        .browser-modal{
+          position:fixed;
+          left:50%;
+          top:50%;
+          transform:translate(-50%, -50%);
+          width:min(92vw, 760px);
+          max-height:min(84vh, 760px);
+          background:rgba(24,24,28,0.98);
+          color:var(--ed-text);
+          border:1px solid rgba(255,255,255,0.10);
+          border-radius:20px;
+          box-shadow:0 24px 60px rgba(0,0,0,0.38);
+          z-index:9999;
+          display:grid;
+          grid-template-rows:auto auto minmax(0,1fr);
+          overflow:hidden;
+        }
+
+        .browser-head{
+          display:flex;
+          align-items:flex-start;
+          justify-content:space-between;
+          gap:14px;
+          padding:18px 18px 14px;
+          border-bottom:1px solid var(--ed-row-border);
+        }
+
+        .browser-head-copy{
+          min-width:0;
+          display:grid;
+          gap:6px;
+        }
+
+        .browser-title{
+          font-size:16px;
+          font-weight:1000;
+          line-height:1.2;
+        }
+
+        .browser-path{
+          font-size:12px;
+          color:var(--ed-text2);
+          line-height:1.45;
+          word-break:break-word;
+          overflow-wrap:anywhere;
+        }
+
+        .browser-iconbtn{
+          appearance:none;
+          -webkit-appearance:none;
+          width:38px;
+          height:38px;
+          min-width:38px;
+          border-radius:12px;
+          border:1px solid var(--ed-input-border);
+          background:var(--ed-input-bg);
+          color:var(--ed-text);
+          display:grid;
+          place-items:center;
+          cursor:pointer;
+        }
+
+        .browser-iconbtn ha-icon{
+          --mdc-icon-size:18px;
+          width:18px;
+          height:18px;
+        }
+
+        .browser-toolbar{
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:10px;
+          padding:14px 18px;
+          border-bottom:1px solid var(--ed-row-border);
+          flex-wrap:wrap;
+        }
+
+        .browser-btn{
+          appearance:none;
+          -webkit-appearance:none;
+          border:1px solid var(--ed-input-border);
+          background:var(--ed-input-bg);
+          color:var(--ed-text);
+          border-radius:12px;
+          min-height:40px;
+          padding:0 14px;
+          cursor:pointer;
+          display:inline-flex;
+          align-items:center;
+          gap:8px;
+          font-size:13px;
+          font-weight:900;
+        }
+
+        .browser-btn.primary{
+          background:var(--ed-seg-on-bg);
+          color:var(--ed-seg-on-txt);
+          border-color:transparent;
+        }
+
+        .browser-btn.disabled,
+        .browser-btn:disabled{
+          opacity:0.45;
+          cursor:default;
+        }
+
+        .browser-btn ha-icon{
+          --mdc-icon-size:18px;
+          width:18px;
+          height:18px;
+        }
+
+        .browser-body{
+          min-height:0;
+          overflow:auto;
+          padding:14px 18px 18px;
+          overscroll-behavior:contain;
+        }
+
+        .browser-list{
+          display:grid;
+          gap:10px;
+        }
+
+        .browser-item{
+          display:grid;
+          grid-template-columns:minmax(0,1fr) auto;
+          gap:10px;
+          align-items:center;
+          padding:10px;
+          border-radius:16px;
+          background:var(--ed-row-bg);
+          border:1px solid var(--ed-row-border);
+        }
+
+        .browser-open{
+          appearance:none;
+          -webkit-appearance:none;
+          border:0;
+          background:transparent;
+          color:var(--ed-text);
+          text-align:left;
+          min-width:0;
+          padding:0;
+          cursor:pointer;
+          display:grid;
+          grid-template-columns:40px minmax(0,1fr);
+          gap:12px;
+          align-items:center;
+        }
+
+        .browser-open-icon{
+          width:40px;
+          height:40px;
+          border-radius:12px;
+          display:grid;
+          place-items:center;
+          background:var(--ed-input-bg);
+          border:1px solid var(--ed-input-border);
+        }
+
+        .browser-open-icon ha-icon{
+          --mdc-icon-size:20px;
+          width:20px;
+          height:20px;
+        }
+
+        .browser-open-copy{
+          min-width:0;
+          display:grid;
+          gap:4px;
+        }
+
+        .browser-open-title{
+          font-size:13px;
+          font-weight:950;
+          color:var(--ed-text);
+          overflow:hidden;
+          text-overflow:ellipsis;
+          white-space:nowrap;
+        }
+
+        .browser-open-sub{
+          font-size:11px;
+          color:var(--ed-text2);
+          line-height:1.35;
+          word-break:break-word;
+          overflow-wrap:anywhere;
+        }
+
+        .browser-select{
+          appearance:none;
+          -webkit-appearance:none;
+          border:1px solid var(--ed-input-border);
+          background:var(--ed-input-bg);
+          color:var(--ed-text);
+          border-radius:12px;
+          min-height:38px;
+          padding:0 12px;
+          cursor:pointer;
+          font-size:12px;
+          font-weight:900;
+          white-space:nowrap;
+        }
+
+        .browser-empty{
+          display:grid;
+          place-items:center;
+          min-height:180px;
+          font-size:13px;
+          font-weight:800;
+          color:var(--ed-text2);
+          text-align:center;
+          padding:20px;
+        }
+
         @media (max-width:900px){
           .tabbar{
             grid-template-columns:repeat(2,minmax(0,1fr));
@@ -1436,6 +2047,23 @@ class CameraGalleryCardEditor extends HTMLElement {
             width:38px;
             height:38px;
             min-width:38px;
+          }
+
+          .browser-modal{
+            width:min(96vw, 760px);
+            max-height:min(88vh, 760px);
+          }
+
+          .browser-item{
+            grid-template-columns:1fr;
+          }
+
+          .browser-select{
+            width:100%;
+          }
+
+          .chip-grid{
+            grid-template-columns:repeat(2, minmax(0, 1fr));
           }
         }
       </style>
@@ -1491,7 +2119,7 @@ class CameraGalleryCardEditor extends HTMLElement {
 
               <div class="row ${mediaModeOn ? "" : "muted"}">
                 <div class="lbl">Media folders</div>
-                <div class="desc">Enter <strong>one</strong> folder per line</div>
+                <div class="desc">Enter <strong>one</strong> folder per line, or browse and select folders</div>
 
                 <div class="field" id="mediasources-field">
                   <textarea
@@ -1501,6 +2129,28 @@ class CameraGalleryCardEditor extends HTMLElement {
                     ${mediaModeOn ? "" : "disabled"}
                   ></textarea>
                   <div class="suggestions" id="mediasources-suggestions" hidden></div>
+                </div>
+
+                <div class="row-actions">
+                  <button
+                    type="button"
+                    class="actionbtn"
+                    id="browse-media-folders"
+                    ${mediaModeOn ? "" : "disabled"}
+                  >
+                    <ha-icon icon="mdi:folder-search-outline"></ha-icon>
+                    <span>Browse</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    class="actionbtn"
+                    id="clear-media-folders"
+                    ${mediaModeOn ? "" : "disabled"}
+                  >
+                    <ha-icon icon="mdi:delete-outline"></ha-icon>
+                    <span>Clear</span>
+                  </button>
                 </div>
 
                 ${
@@ -1645,7 +2295,7 @@ class CameraGalleryCardEditor extends HTMLElement {
                 </div>
 
                 <div class="desc">
-                  Enable live camera mode inside the gallery preview
+                  Enable live mode in the gallery preview. All available camera entities are detected automatically.
                 </div>
               </div>
 
@@ -1653,12 +2303,12 @@ class CameraGalleryCardEditor extends HTMLElement {
                 liveEnabled
                   ? `
                 <div class="row">
-                  <div class="lbl">Camera entity</div>
-                  <div class="desc">Select the camera entity used for live mode</div>
+                  <div class="lbl">Default live camera</div>
+                  <div class="desc">Optional. All camera entities are available automatically. This sets the default camera when live mode opens.</div>
 
                   <div class="selectwrap">
                     <select class="select" id="livecam">
-                      <option value=""></option>
+                      <option value="">Automatic (first available camera)</option>
                       ${cameraEntities
                         .map(
                           (id) =>
@@ -1776,6 +2426,8 @@ class CameraGalleryCardEditor extends HTMLElement {
           }
         </div>
       </div>
+
+      ${mediaBrowserHtml}
     `;
 
     const $ = (id) => this.shadowRoot.getElementById(id);
@@ -1813,6 +2465,26 @@ class CameraGalleryCardEditor extends HTMLElement {
       btn.addEventListener("click", () =>
         this._set("source_mode", btn.dataset.src)
       );
+    });
+
+    const browseBtn = $("browse-media-folders");
+    browseBtn?.addEventListener("click", async () => {
+      await this._openMediaBrowser("media-source://frigate");
+    });
+
+    const clearBtn = $("clear-media-folders");
+    clearBtn?.addEventListener("click", () => {
+      const mediaEl = $("mediasources");
+      if (mediaEl) mediaEl.value = "";
+
+      const next = { ...this._config };
+      delete next.media_sources;
+      delete next.media_source;
+
+      this._config = this._stripAlwaysTrueKeys(next);
+      this._fire();
+      this._applyFieldValidation("mediasources");
+      this._scheduleRender();
     });
 
     const bindTextarea = (id, commitFn) => {
@@ -2094,6 +2766,41 @@ class CameraGalleryCardEditor extends HTMLElement {
       this._set("bar_opacity", Number.isFinite(v) ? v : 45);
     });
 
+    $("browser-backdrop")?.addEventListener("click", () => {
+      this._closeMediaBrowser();
+    });
+
+    $("browser-close")?.addEventListener("click", () => {
+      this._closeMediaBrowser();
+    });
+
+    $("browser-back")?.addEventListener("click", async () => {
+      await this._mediaBrowserGoBack();
+    });
+
+    $("browser-select-current")?.addEventListener("click", () => {
+      if (!this._mediaBrowserPath) return;
+      this._appendMediaSourceValue(this._mediaBrowserPath);
+      this._closeMediaBrowser();
+    });
+
+    this.shadowRoot.querySelectorAll("[data-browser-open]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const nextPath = btn.dataset.browserOpen || "";
+        if (!nextPath) return;
+        await this._loadMediaBrowser(nextPath, true);
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("[data-browser-select]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const value = btn.dataset.browserSelect || "";
+        if (!value) return;
+        this._appendMediaSourceValue(value);
+        this._closeMediaBrowser();
+      });
+    });
+
     try {
       const fs = this._focusState;
       if (fs && fs.id) {
@@ -2168,6 +2875,18 @@ class CameraGalleryCardEditor extends HTMLElement {
     });
   }
 
+  _lockPageScroll() {
+    try {
+      document.body.style.overflow = "hidden";
+    } catch (_) {}
+  }
+
+  _unlockPageScroll() {
+    try {
+      document.body.style.overflow = "";
+    } catch (_) {}
+  }
+
   _replaceCurrentLine(el, newLine) {
     const info = this._getTextareaLineInfo(el);
     const before = info.value.slice(0, info.lineStart);
@@ -2184,8 +2903,13 @@ class CameraGalleryCardEditor extends HTMLElement {
   }
 
   _scheduleRender() {
+    this._captureScrollState();
+
     if (this._raf) cancelAnimationFrame(this._raf);
-    this._raf = requestAnimationFrame(() => this._render());
+    this._raf = requestAnimationFrame(() => {
+      this._render();
+      this._restoreScrollState();
+    });
   }
 
   _set(key, value) {
@@ -2332,18 +3056,32 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._hass = hass;
 
     const ae = this.shadowRoot?.activeElement;
+    const tag = String(ae?.tagName || "").toLowerCase();
+    const id = String(ae?.id || "");
+
     const interacting =
-      ae &&
-      (ae.id === "barop" ||
-        ae.id === "delservice" ||
-        ae.id === "entities" ||
-        ae.id === "filenamefmt" ||
-        ae.id === "height" ||
-        ae.id === "livecam" ||
-        ae.id === "maxmedia" ||
-        ae.id === "mediasources" ||
-        ae.id === "thumb") &&
-      ae.matches(":focus");
+      !!this._mediaBrowserOpen ||
+      !!(
+        ae &&
+        ae.matches?.(":focus") &&
+        (
+          tag === "textarea" ||
+          tag === "select" ||
+          tag === "button" ||
+          tag === "ha-textfield" ||
+          tag === "ha-slider" ||
+          tag === "ha-switch" ||
+          id === "barop" ||
+          id === "delservice" ||
+          id === "entities" ||
+          id === "filenamefmt" ||
+          id === "height" ||
+          id === "livecam" ||
+          id === "maxmedia" ||
+          id === "mediasources" ||
+          id === "thumb"
+        )
+      );
 
     if (interacting) return;
 
@@ -2388,6 +3126,8 @@ class CameraGalleryCardEditor extends HTMLElement {
     return String(media_content_id || "")
       .replace(/^media-source:\/\/media_source\//, "")
       .replace(/^media-source:\/\/media_source/, "")
+      .replace(/^media-source:\/\/frigate\//, "frigate/")
+      .replace(/^media-source:\/\/frigate/, "frigate")
       .replace(/^media-source:\/\//, "")
       .replace(/^\/+/, "")
       .trim();
