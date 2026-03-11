@@ -20,6 +20,8 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._config = {};
     this.attachShadow({ mode: "open" });
 
+
+
     this._scrollRestore = {
       windowY: 0,
       hostScrollTop: 0,
@@ -43,11 +45,14 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._mediaBrowserItems = [];
     this._mediaBrowserHistory = [];
 
+    this._webrtcAvailable = false;
+    this._webrtcCheckPending = false;
+
     this._suggestState = {
       entities: { open: false, items: [], index: -1 },
       mediasources: { open: false, items: [], index: -1 },
     };
-  }
+  } 
 
   _applyFieldValidation(id) {
     const el = this.shadowRoot?.getElementById(id);
@@ -450,6 +455,61 @@ class CameraGalleryCardEditor extends HTMLElement {
     }
   }
 
+  _isWebRTCAvailable() {
+    try {
+      const ctor = customElements.get("webrtc-camera");
+      if (!ctor) return false;
+
+      const el = document.createElement("webrtc-camera");
+      return typeof el.setConfig === "function";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async _checkWebRTCResource() {
+    if (!this._hass?.callWS) return false;
+
+    try {
+      const resources = await this._hass.callWS({ type: "lovelace/resources" });
+      return (resources || []).some((r) =>
+        String(r?.url || "").toLowerCase().includes("webrtc")
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async _refreshWebRTCState(force = false) {
+    if (this._webrtcCheckPending && !force) return;
+
+    this._webrtcCheckPending = true;
+
+    try {
+      const hasElement = this._isWebRTCAvailable();
+      const hasResource = await this._checkWebRTCResource();
+      const next = !!(hasElement && hasResource);
+
+      if (this._webrtcAvailable !== next) {
+        this._webrtcAvailable = next;
+        this._scheduleRender();
+        return;
+      }
+
+      this._webrtcAvailable = next;
+    } catch (_) {
+      if (this._webrtcAvailable !== false) {
+        this._webrtcAvailable = false;
+        this._scheduleRender();
+        return;
+      }
+
+      this._webrtcAvailable = false;
+    } finally {
+      this._webrtcCheckPending = false;
+    }
+  }
+
   _looksLikeFile(relPath) {
     const v = String(relPath || "");
     if (v.startsWith("media-source://")) return false;
@@ -617,7 +677,11 @@ class CameraGalleryCardEditor extends HTMLElement {
     const target = this._normalizeMediaSourceValue(path);
     if (!target) return;
 
-    if (pushHistory && this._mediaBrowserPath && this._mediaBrowserPath !== target) {
+    if (
+      pushHistory &&
+      this._mediaBrowserPath &&
+      this._mediaBrowserPath !== target
+    ) {
       this._mediaBrowserHistory.push(this._mediaBrowserPath);
     }
 
@@ -803,7 +867,9 @@ class CameraGalleryCardEditor extends HTMLElement {
       c.filename_datetime_format || ""
     ).trim();
 
-    const objectFiltersArr = this._normalizeObjectFilters(c.object_filters || []);
+    const objectFiltersArr = this._normalizeObjectFilters(
+      c.object_filters || []
+    );
     const selectedCount = objectFiltersArr.length;
 
     const height = Number(c.preview_height) || 320;
@@ -817,7 +883,9 @@ class CameraGalleryCardEditor extends HTMLElement {
     const previewPos = String(c.preview_position || "top");
 
     const thumbBarPos = (() => {
-      const v = String(c.thumb_bar_position || "bottom").toLowerCase().trim();
+      const v = String(c.thumb_bar_position || "bottom")
+        .toLowerCase()
+        .trim();
       if (v === "hidden") return "hidden";
       if (v === "top") return "top";
       return "bottom";
@@ -835,7 +903,9 @@ class CameraGalleryCardEditor extends HTMLElement {
       .map((svc) => `shell_command.${svc}`)
       .sort((a, b) => a.localeCompare(b));
 
-    const deleteService = String(c.delete_service || c.shell_command || "").trim();
+    const deleteService = String(
+      c.delete_service || c.shell_command || ""
+    ).trim();
     const deleteOk =
       !deleteService || /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(deleteService);
 
@@ -857,6 +927,8 @@ class CameraGalleryCardEditor extends HTMLElement {
     const liveEnabled = c.live_enabled === true;
     const liveCameraEntity = String(c.live_camera_entity || "").trim();
     const liveDefault = c.live_default === true;
+    const webrtcAvailable = this._webrtcAvailable;
+    const liveControlsDisabled = !webrtcAvailable;
 
     const cameraEntities = Object.keys(this._hass?.states || {})
       .filter((id) => id.startsWith("camera."))
@@ -1137,412 +1209,450 @@ class CameraGalleryCardEditor extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host{
-          display:block;
-          padding:8px 0;
-          color:var(--ed-text);
-          box-sizing:border-box;
-          min-width:0;
+        :host {
+          display: block;
+          padding: 8px 0;
+          color: var(--ed-text);
+          box-sizing: border-box;
+          min-width: 0;
         }
 
-        .wrap{
-          display:grid;
-          gap:var(--ed-space-3);
-          min-width:0;
+        .wrap {
+          display: grid;
+          gap: var(--ed-space-3);
+          min-width: 0;
         }
 
         .desc,
-        code{
-          overflow-wrap:anywhere;
-          word-break:break-word;
+        code {
+          overflow-wrap: anywhere;
+          word-break: break-word;
         }
 
-        .tabs{
-          display:grid;
-          gap:var(--ed-space-3);
+        .tabs {
+          display: grid;
+          gap: var(--ed-space-3);
         }
 
-        .tabbar{
-          display:grid;
-          grid-template-columns:repeat(4,minmax(0,1fr));
-          gap:10px;
-          padding:10px;
-          border-radius:var(--ed-radius-panel);
-          background:var(--ed-section-bg);
-          border:1px solid var(--ed-section-border);
-          box-shadow:var(--ed-section-glow);
+        .tabbar {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 10px;
+          padding: 10px;
+          border-radius: var(--ed-radius-panel);
+          background: var(--ed-section-bg);
+          border: 1px solid var(--ed-section-border);
+          box-shadow: var(--ed-section-glow);
         }
 
-        .tabbtn{
-          appearance:none;
-          -webkit-appearance:none;
-          border:1px solid var(--ed-tab-border);
-          background:var(--ed-tab-bg);
-          color:var(--ed-tab-txt);
-          border-radius:14px;
-          min-height:46px;
-          padding:10px 14px;
-          cursor:pointer;
-          font-size:13px;
-          font-weight:900;
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          gap:8px;
-          text-align:center;
+        .tabbtn {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 1px solid var(--ed-tab-border);
+          background: var(--ed-tab-bg);
+          color: var(--ed-tab-txt);
+          border-radius: 14px;
+          min-height: 46px;
+          padding: 10px 14px;
+          cursor: pointer;
+          font-size: 13px;
+          font-weight: 900;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          text-align: center;
           transition:
             background 0.18s ease,
             border-color 0.18s ease,
             color 0.18s ease,
             transform 0.18s ease,
             box-shadow 0.18s ease;
-          min-width:0;
-          box-shadow:0 1px 0 rgba(255,255,255,0.03) inset;
+          min-width: 0;
+          box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .tabbtn:hover{
-          transform:translateY(-1px);
+        .tabbtn:hover {
+          transform: translateY(-1px);
         }
 
-        .tabbtn ha-icon{
-          --mdc-icon-size:16px;
-          width:16px;
-          height:16px;
-          flex:0 0 auto;
+        .tabbtn ha-icon {
+          --mdc-icon-size: 16px;
+          width: 16px;
+          height: 16px;
+          flex: 0 0 auto;
         }
 
-        .tabbtn.on{
-          background:var(--ed-tab-on-bg);
-          border-color:var(--ed-tab-on-border);
-          color:var(--ed-tab-on-txt);
+        .tabbtn.on {
+          background: var(--ed-tab-on-bg);
+          border-color: var(--ed-tab-on-border);
+          color: var(--ed-tab-on-txt);
           box-shadow:
-            0 1px 0 rgba(255,255,255,0.04) inset,
-            0 6px 16px rgba(0,0,0,0.10);
+            0 1px 0 rgba(255, 255, 255, 0.04) inset,
+            0 6px 16px rgba(0, 0, 0, 0.1);
         }
 
-        .tabpanel{
-          padding:16px;
-          border-radius:var(--ed-radius-panel);
-          background:var(--ed-section-bg);
-          border:1px solid var(--ed-section-border);
-          display:grid;
-          gap:14px;
-          box-shadow:var(--ed-section-glow);
+        .tabpanel {
+          padding: 16px;
+          border-radius: var(--ed-radius-panel);
+          background: var(--ed-section-bg);
+          border: 1px solid var(--ed-section-border);
+          display: grid;
+          gap: 14px;
+          box-shadow: var(--ed-section-glow);
         }
 
-        .panelhead{
-          display:flex;
-          align-items:center;
-          gap:14px;
-          padding-bottom:14px;
-          border-bottom:1px solid var(--ed-row-border);
-          min-width:0;
+        .panelhead {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          padding-bottom: 14px;
+          border-bottom: 1px solid var(--ed-row-border);
+          min-width: 0;
         }
 
-        .panelicon{
-          width:40px;
-          height:40px;
-          min-width:40px;
-          border-radius:14px;
-          display:grid;
-          place-items:center;
-          background:var(--ed-input-bg);
-          border:1px solid var(--ed-input-border);
-          box-shadow:0 1px 0 rgba(255,255,255,0.03) inset;
+        .panelicon {
+          width: 40px;
+          height: 40px;
+          min-width: 40px;
+          border-radius: 14px;
+          display: grid;
+          place-items: center;
+          background: var(--ed-input-bg);
+          border: 1px solid var(--ed-input-border);
+          box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .panelicon ha-icon{
-          --mdc-icon-size:20px;
-          width:20px;
-          height:20px;
-          color:var(--ed-text);
+        .panelicon ha-icon {
+          --mdc-icon-size: 20px;
+          width: 20px;
+          height: 20px;
+          color: var(--ed-text);
         }
 
-        .panelhead-copy{
-          min-width:0;
-          display:grid;
-          gap:4px;
+        .panelhead-copy {
+          min-width: 0;
+          display: grid;
+          gap: 4px;
         }
 
-        .paneltitle{
-          font-size:16px;
-          font-weight:1000;
-          color:var(--ed-text);
-          line-height:1.2;
+        .paneltitle {
+          font-size: 16px;
+          font-weight: 1000;
+          color: var(--ed-text);
+          line-height: 1.2;
         }
 
-        .panelsubtitle{
-          font-size:12px;
-          color:var(--ed-text2);
-          line-height:1.45;
+        .panelsubtitle {
+          font-size: 12px;
+          color: var(--ed-text2);
+          line-height: 1.45;
         }
 
-        .row{
-          display:grid;
-          gap:12px;
-          padding:16px;
-          border-radius:var(--ed-radius-row);
-          background:var(--ed-row-bg);
-          border:1px solid var(--ed-row-border);
-          color:var(--ed-text);
-          min-width:0;
+        .row {
+          display: grid;
+          gap: 12px;
+          padding: 16px;
+          border-radius: var(--ed-radius-row);
+          background: var(--ed-row-bg);
+          border: 1px solid var(--ed-row-border);
+          color: var(--ed-text);
+          min-width: 0;
           transition:
             background 0.18s ease,
             border-color 0.18s ease,
             box-shadow 0.18s ease;
         }
 
-        .row:hover{
-          border-color:color-mix(in srgb, var(--ed-row-border) 70%, var(--ed-text2) 30%);
+        .row:hover {
+          border-color: color-mix(
+            in srgb,
+            var(--ed-row-border) 70%,
+            var(--ed-text2) 30%
+          );
         }
 
-        .row-head{
-          display:flex;
-          align-items:flex-start;
-          justify-content:space-between;
-          gap:12px;
-          min-width:0;
+        .row-head {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 12px;
+          min-width: 0;
         }
 
-        .row-head > :first-child{
-          min-width:0;
-          flex:1 1 auto;
-          display:grid;
-          gap:6px;
+        .row-head > :first-child {
+          min-width: 0;
+          flex: 1 1 auto;
+          display: grid;
+          gap: 6px;
         }
 
-        .lbl{
-          font-size:13px;
-          font-weight:950;
-          color:var(--ed-text);
-          line-height:1.2;
-          letter-spacing:0.01em;
+        .lbl {
+          font-size: 13px;
+          font-weight: 950;
+          color: var(--ed-text);
+          line-height: 1.2;
+          letter-spacing: 0.01em;
         }
 
-        .desc{
-          font-size:12px;
-          opacity:0.88;
-          color:var(--ed-text2);
-          line-height:1.45;
+        .desc {
+          font-size: 12px;
+          opacity: 0.88;
+          color: var(--ed-text2);
+          line-height: 1.45;
         }
 
-        code{
-          opacity:0.95;
+        code {
+          opacity: 0.95;
         }
 
         ha-textfield,
-        ha-slider{
-          width:100%;
+        ha-slider {
+          width: 100%;
         }
 
-        .field{
-          position:relative;
-          min-width:0;
+        .field {
+          position: relative;
+          min-width: 0;
         }
 
-        .field textarea{
-          width:100%;
-          box-sizing:border-box;
-          border-radius:var(--ed-radius-input);
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color:var(--ed-text);
-          padding:13px 14px;
-          font-size:13px;
-          font-weight:800;
-          outline:none;
-          resize:vertical;
-          min-height:112px;
-          line-height:1.45;
-          white-space:pre-wrap;
-          font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        .field textarea {
+          width: 100%;
+          box-sizing: border-box;
+          border-radius: var(--ed-radius-input);
+          border: 1px solid var(--ed-input-border);
+          background: var(--ed-input-bg);
+          color: var(--ed-text);
+          padding: 13px 14px;
+          font-size: 13px;
+          font-weight: 800;
+          outline: none;
+          resize: vertical;
+          min-height: 112px;
+          line-height: 1.45;
+          white-space: pre-wrap;
+          font-family:
+            ui-monospace,
+            SFMono-Regular,
+            Menlo,
+            Monaco,
+            Consolas,
+            "Liberation Mono",
+            "Courier New",
+            monospace;
           transition:
             border-color 0.16s ease,
             box-shadow 0.16s ease,
             background 0.16s ease;
-          box-shadow:0 1px 0 rgba(255,255,255,0.03) inset;
+          box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .field textarea::placeholder{
-          color:color-mix(in srgb, var(--ed-text2) 82%, transparent);
+        .field textarea::placeholder {
+          color: color-mix(in srgb, var(--ed-text2) 82%, transparent);
         }
 
-        .field textarea:hover{
-          border-color:color-mix(in srgb, var(--ed-input-border) 70%, var(--ed-text2) 30%);
+        .field textarea:hover {
+          border-color: color-mix(
+            in srgb,
+            var(--ed-input-border) 70%,
+            var(--ed-text2) 30%
+          );
         }
 
-        .field textarea:focus{
-          border-color:color-mix(in srgb, var(--ed-input-border) 25%, var(--primary-color, #03a9f4) 75%);
+        .field textarea:focus {
+          border-color: color-mix(
+            in srgb,
+            var(--ed-input-border) 25%,
+            var(--primary-color, #03a9f4) 75%
+          );
           box-shadow:
             0 0 0 3px var(--ed-focus-ring),
-            0 1px 0 rgba(255,255,255,0.03) inset;
+            0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .field textarea:disabled{
-          opacity:0.65;
-          cursor:not-allowed;
+        .field textarea:disabled {
+          opacity: 0.65;
+          cursor: not-allowed;
         }
 
-        .field.valid textarea{
-          border-color:var(--ed-valid);
-          box-shadow:0 0 0 3px var(--ed-valid-glow);
+        .field.valid textarea {
+          border-color: var(--ed-valid);
+          box-shadow: 0 0 0 3px var(--ed-valid-glow);
         }
 
-        .field.invalid textarea{
-          border-color:var(--ed-invalid);
-          box-shadow:0 0 0 3px var(--ed-invalid-glow);
+        .field.invalid textarea {
+          border-color: var(--ed-invalid);
+          box-shadow: 0 0 0 3px var(--ed-invalid-glow);
         }
 
-        .suggestions{
-          position:absolute;
-          left:0;
-          right:0;
-          top:calc(100% + 8px);
-          background:var(--ed-sugg-bg);
-          border:1px solid var(--ed-sugg-border);
-          border-radius:14px;
-          box-shadow:var(--ed-shadow-float);
-          padding:8px;
-          display:grid;
-          gap:4px;
-          z-index:999;
-          max-height:280px;
-          overflow:auto;
-          backdrop-filter:blur(10px);
-          -webkit-backdrop-filter:blur(10px);
+        .suggestions {
+          position: absolute;
+          left: 0;
+          right: 0;
+          top: calc(100% + 8px);
+          background: var(--ed-sugg-bg);
+          border: 1px solid var(--ed-sugg-border);
+          border-radius: 14px;
+          box-shadow: var(--ed-shadow-float);
+          padding: 8px;
+          display: grid;
+          gap: 4px;
+          z-index: 999;
+          max-height: 280px;
+          overflow: auto;
+          backdrop-filter: blur(10px);
+          -webkit-backdrop-filter: blur(10px);
         }
 
-        .suggestions[hidden]{
-          display:none;
+        .suggestions[hidden] {
+          display: none;
         }
 
-        .sugg-label{
-          padding:6px 10px 8px;
-          font-size:11px;
-          font-weight:900;
-          letter-spacing:0.04em;
-          text-transform:uppercase;
-          color:var(--ed-text2);
+        .sugg-label {
+          padding: 6px 10px 8px;
+          font-size: 11px;
+          font-weight: 900;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--ed-text2);
         }
 
-        .sugg-item{
-          appearance:none;
-          -webkit-appearance:none;
-          border:0;
-          background:transparent;
-          color:var(--ed-text);
-          text-align:left;
-          padding:11px 12px;
-          border-radius:10px;
-          cursor:pointer;
-          font-size:12px;
-          font-weight:800;
-          font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-          white-space:normal;
-          overflow:visible;
-          text-overflow:clip;
-          word-break:break-word;
-          overflow-wrap:anywhere;
-          line-height:1.35;
-          transition:background 0.14s ease, transform 0.14s ease;
+        .sugg-item {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 0;
+          background: transparent;
+          color: var(--ed-text);
+          text-align: left;
+          padding: 11px 12px;
+          border-radius: 10px;
+          cursor: pointer;
+          font-size: 12px;
+          font-weight: 800;
+          font-family:
+            ui-monospace,
+            SFMono-Regular,
+            Menlo,
+            Monaco,
+            Consolas,
+            "Liberation Mono",
+            "Courier New",
+            monospace;
+          white-space: normal;
+          overflow: visible;
+          text-overflow: clip;
+          word-break: break-word;
+          overflow-wrap: anywhere;
+          line-height: 1.35;
+          transition:
+            background 0.14s ease,
+            transform 0.14s ease;
         }
 
-        .sugg-item:hover{
-          background:var(--ed-sugg-hover);
+        .sugg-item:hover {
+          background: var(--ed-sugg-hover);
         }
 
-        .sugg-item.active{
-          background:var(--ed-sugg-active);
+        .sugg-item.active {
+          background: var(--ed-sugg-active);
         }
 
-        .sugg-active-path{
-          padding:9px 10px 4px;
-          font-size:11px;
-          opacity:0.75;
-          word-break:break-word;
-          overflow-wrap:anywhere;
-          border-top:1px solid var(--ed-sugg-border);
-          margin-top:4px;
-          color:var(--ed-text2);
+        .sugg-active-path {
+          padding: 9px 10px 4px;
+          font-size: 11px;
+          opacity: 0.75;
+          word-break: break-word;
+          overflow-wrap: anywhere;
+          border-top: 1px solid var(--ed-sugg-border);
+          margin-top: 4px;
+          color: var(--ed-text2);
         }
 
-        .selectwrap{
-          position:relative;
-          min-width:0;
+        .selectwrap {
+          position: relative;
+          min-width: 0;
         }
 
-        .select{
-          width:100%;
-          box-sizing:border-box;
-          border-radius:var(--ed-radius-input);
-          border:1px solid var(--ed-select-border);
-          background:var(--ed-select-bg);
-          color:var(--ed-text);
-          padding:12px 42px 12px 14px;
-          font-size:13px;
-          font-weight:800;
-          outline:none;
-          min-width:0;
-          appearance:none;
-          -webkit-appearance:none;
-          cursor:pointer;
+        .select {
+          width: 100%;
+          box-sizing: border-box;
+          border-radius: var(--ed-radius-input);
+          border: 1px solid var(--ed-select-border);
+          background: var(--ed-select-bg);
+          color: var(--ed-text);
+          padding: 12px 42px 12px 14px;
+          font-size: 13px;
+          font-weight: 800;
+          outline: none;
+          min-width: 0;
+          appearance: none;
+          -webkit-appearance: none;
+          cursor: pointer;
           transition:
             border-color 0.16s ease,
             box-shadow 0.16s ease,
             background 0.16s ease;
-          box-shadow:0 1px 0 rgba(255,255,255,0.03) inset;
+          box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .select:hover{
-          border-color:color-mix(in srgb, var(--ed-select-border) 70%, var(--ed-text2) 30%);
+        .select:hover {
+          border-color: color-mix(
+            in srgb,
+            var(--ed-select-border) 70%,
+            var(--ed-text2) 30%
+          );
         }
 
-        .select:focus{
-          border-color:color-mix(in srgb, var(--ed-select-border) 25%, var(--primary-color, #03a9f4) 75%);
+        .select:focus {
+          border-color: color-mix(
+            in srgb,
+            var(--ed-select-border) 25%,
+            var(--primary-color, #03a9f4) 75%
+          );
           box-shadow:
             0 0 0 3px var(--ed-focus-ring),
-            0 1px 0 rgba(255,255,255,0.03) inset;
+            0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .select:disabled{
-          opacity:0.65;
-          cursor:not-allowed;
+        .select:disabled {
+          opacity: 0.65;
+          cursor: not-allowed;
         }
 
-        .selarrow{
-          position:absolute;
-          top:50%;
-          right:16px;
-          width:10px;
-          height:10px;
-          transform:translateY(-60%) rotate(45deg);
-          border-right:2px solid var(--ed-arrow);
-          border-bottom:2px solid var(--ed-arrow);
-          pointer-events:none;
-          opacity:0.9;
+        .selarrow {
+          position: absolute;
+          top: 50%;
+          right: 16px;
+          width: 10px;
+          height: 10px;
+          transform: translateY(-60%) rotate(45deg);
+          border-right: 2px solid var(--ed-arrow);
+          border-bottom: 2px solid var(--ed-arrow);
+          pointer-events: none;
+          opacity: 0.9;
         }
 
-        .select.invalid{
-          border-color:var(--ed-invalid);
-          box-shadow:0 0 0 3px var(--ed-invalid-glow);
+        .select.invalid {
+          border-color: var(--ed-invalid);
+          box-shadow: 0 0 0 3px var(--ed-invalid-glow);
         }
 
-        .segwrap{
-          display:flex;
-          gap:8px;
+        .segwrap {
+          display: flex;
+          gap: 8px;
         }
 
-        .seg{
-          flex:1;
-          border:1px solid var(--ed-seg-border);
-          background:var(--ed-seg-bg);
-          color:var(--ed-seg-txt);
-          border-radius:12px;
-          padding:11px 0;
-          font-size:13px;
-          font-weight:850;
-          cursor:pointer;
-          min-width:0;
+        .seg {
+          flex: 1;
+          border: 1px solid var(--ed-seg-border);
+          background: var(--ed-seg-bg);
+          color: var(--ed-seg-txt);
+          border-radius: 12px;
+          padding: 11px 0;
+          font-size: 13px;
+          font-weight: 850;
+          cursor: pointer;
+          min-width: 0;
           transition:
             background 0.16s ease,
             border-color 0.16s ease,
@@ -1551,108 +1661,108 @@ class CameraGalleryCardEditor extends HTMLElement {
             box-shadow 0.16s ease;
         }
 
-        .seg:hover{
-          transform:translateY(-1px);
+        .seg:hover {
+          transform: translateY(-1px);
         }
 
-        .seg.on{
-          background:var(--ed-seg-on-bg);
-          color:var(--ed-seg-on-txt);
-          border-color:transparent;
-          box-shadow:0 6px 16px rgba(0,0,0,0.10);
+        .seg.on {
+          background: var(--ed-seg-on-bg);
+          color: var(--ed-seg-on-txt);
+          border-color: transparent;
+          box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
         }
 
-        .togrow{
-          display:flex;
-          align-items:center;
-          justify-content:flex-end;
-          gap:12px;
-          min-width:0;
-          flex:0 0 auto;
-          white-space:nowrap;
+        .togrow {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 12px;
+          min-width: 0;
+          flex: 0 0 auto;
+          white-space: nowrap;
         }
 
-        .barrow{
-          display:grid;
-          gap:10px;
-          min-width:0;
+        .barrow {
+          display: grid;
+          gap: 10px;
+          min-width: 0;
         }
 
-        .barrow-top{
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          gap:12px;
+        .barrow-top {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
         }
 
-        .pillval{
-          min-width:56px;
-          text-align:center;
-          padding:6px 10px;
-          border-radius:var(--ed-radius-pill);
-          background:var(--ed-pill-bg);
-          border:1px solid var(--ed-pill-border);
-          font-size:12px;
-          font-weight:1000;
-          color:var(--ed-pill-txt);
-          box-shadow:0 1px 0 rgba(255,255,255,0.03) inset;
+        .pillval {
+          min-width: 56px;
+          text-align: center;
+          padding: 6px 10px;
+          border-radius: var(--ed-radius-pill);
+          background: var(--ed-pill-bg);
+          border: 1px solid var(--ed-pill-border);
+          font-size: 12px;
+          font-weight: 1000;
+          color: var(--ed-pill-txt);
+          box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .muted{
-          opacity:var(--ed-muted);
+        .muted {
+          opacity: var(--ed-muted);
         }
 
-        .hint{
-          margin:2px 0 0 0;
-          font-size:12px;
-          opacity:0.92;
-          color:var(--ed-text2);
-          display:flex;
-          align-items:center;
-          gap:8px;
-          flex-wrap:wrap;
+        .hint {
+          margin: 2px 0 0 0;
+          font-size: 12px;
+          opacity: 0.92;
+          color: var(--ed-text2);
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
         }
 
-        .hint ha-icon{
-          --mdc-icon-size:14px;
-          color:var(--ed-text2);
+        .hint ha-icon {
+          --mdc-icon-size: 14px;
+          color: var(--ed-text2);
         }
 
-        .hint a{
-          color:var(--primary-color);
-          text-decoration:none;
-          font-weight:700;
+        .hint a {
+          color: var(--primary-color);
+          text-decoration: none;
+          font-weight: 700;
         }
 
-        .hint a:hover{
-          text-decoration:underline;
+        .hint a:hover {
+          text-decoration: underline;
         }
 
-        .row-actions{
-          display:flex;
-          gap:10px;
+        .row-actions {
+          display: flex;
+          gap: 10px;
         }
 
-        .row-actions .actionbtn{
-          flex:1;
-          justify-content:center;
+        .row-actions .actionbtn {
+          flex: 1;
+          justify-content: center;
         }
 
-        .actionbtn{
-          appearance:none;
-          -webkit-appearance:none;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color:var(--ed-text);
-          border-radius:12px;
-          min-height:40px;
-          padding:0 14px;
-          cursor:pointer;
-          display:inline-flex;
-          align-items:center;
-          gap:8px;
-          font-size:13px;
-          font-weight:900;
+        .actionbtn {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 1px solid var(--ed-input-border);
+          background: var(--ed-input-bg);
+          color: var(--ed-text);
+          border-radius: 12px;
+          min-height: 40px;
+          padding: 0 14px;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+          font-weight: 900;
           transition:
             background 0.18s ease,
             border-color 0.18s ease,
@@ -1660,410 +1770,487 @@ class CameraGalleryCardEditor extends HTMLElement {
             box-shadow 0.18s ease;
         }
 
-        .actionbtn:hover{
-          transform:translateY(-1px);
-          border-color:color-mix(in srgb, var(--ed-input-border) 65%, var(--ed-text2) 35%);
+        .actionbtn:hover {
+          transform: translateY(-1px);
+          border-color: color-mix(
+            in srgb,
+            var(--ed-input-border) 65%,
+            var(--ed-text2) 35%
+          );
         }
 
-        .actionbtn ha-icon{
-          --mdc-icon-size:18px;
-          width:18px;
-          height:18px;
+        .actionbtn:disabled {
+          opacity: 0.65;
+          cursor: not-allowed;
+          transform: none;
         }
 
-        .chip-grid{
-          display:grid;
-          grid-template-columns:repeat(3, minmax(0, 1fr));
-          gap:10px;
-          margin-top:4px;
+        .actionbtn ha-icon {
+          --mdc-icon-size: 18px;
+          width: 18px;
+          height: 18px;
         }
 
-        .objchip{
-          display:grid;
-          grid-template-columns:36px 1fr auto;
-          align-items:center;
-          column-gap:10px;
-          width:100%;
-          min-height:44px;
-          padding:0 10px;
-          border-radius:12px;
-          border:1px solid var(--ed-chip-border);
-          background:var(--ed-chip-bg);
-          color:var(--ed-chip-txt);
-          cursor:pointer;
+        .chip-grid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+          margin-top: 4px;
+        }
+
+        .objchip {
+          display: grid;
+          grid-template-columns: 36px 1fr auto;
+          align-items: center;
+          column-gap: 10px;
+          width: 100%;
+          min-height: 44px;
+          padding: 0 10px;
+          border-radius: 12px;
+          border: 1px solid var(--ed-chip-border);
+          background: var(--ed-chip-bg);
+          color: var(--ed-chip-txt);
+          cursor: pointer;
           transition:
             background 0.18s ease,
             border-color 0.18s ease,
             color 0.18s ease,
             transform 0.18s ease,
             box-shadow 0.18s ease;
-          box-sizing:border-box;
-          font-size:13px;
-          font-weight:900;
-          text-align:left;
-          box-shadow:0 1px 0 rgba(255,255,255,0.03) inset;
+          box-sizing: border-box;
+          font-size: 13px;
+          font-weight: 900;
+          text-align: left;
+          box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
         }
 
-        .objchip:hover{
-          transform:translateY(-1px);
+        .objchip:hover {
+          transform: translateY(-1px);
         }
 
-        .objchip.on{
-          background:var(--ed-chip-on-bg);
-          border-color:var(--ed-chip-on-border);
-          color:var(--ed-chip-on-txt);
-          box-shadow:0 8px 18px rgba(0,0,0,0.08);
+        .objchip.on {
+          background: var(--ed-chip-on-bg);
+          border-color: var(--ed-chip-on-border);
+          color: var(--ed-chip-on-txt);
+          box-shadow: 0 8px 18px rgba(0, 0, 0, 0.08);
         }
 
-        .objchip.disabled{
-          opacity:var(--ed-chip-disabled);
-          cursor:not-allowed;
-          transform:none;
+        .objchip.disabled {
+          opacity: var(--ed-chip-disabled);
+          cursor: not-allowed;
+          transform: none;
         }
 
-        .objchip-icon{
-          width:36px;
-          height:36px;
-          min-width:36px;
-          border-radius:999px;
-          display:grid;
-          place-items:center;
-          background:var(--ed-chip-icon-bg);
-          transition:background 0.18s ease;
+        .objchip-icon {
+          width: 36px;
+          height: 36px;
+          min-width: 36px;
+          border-radius: 999px;
+          display: grid;
+          place-items: center;
+          background: var(--ed-chip-icon-bg);
+          transition: background 0.18s ease;
         }
 
-        .objchip.on .objchip-icon{
-          background:var(--ed-chip-on-icon-bg);
-          color:inherit;
+        .objchip.on .objchip-icon {
+          background: var(--ed-chip-on-icon-bg);
+          color: inherit;
         }
 
-        .objchip-icon ha-icon{
-          --mdc-icon-size:18px;
-          color:inherit;
-          width:18px;
-          height:18px;
-          display:block;
+        .objchip-icon ha-icon {
+          --mdc-icon-size: 18px;
+          color: inherit;
+          width: 18px;
+          height: 18px;
+          display: block;
         }
 
-        .objchip-label{
-          min-width:0;
-          overflow:hidden;
-          text-overflow:ellipsis;
-          white-space:nowrap;
-          color:inherit;
+        .objchip-label {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          color: inherit;
         }
 
-        .objchip-check{
-          width:18px;
-          height:18px;
-          opacity:0;
-          transform:scale(0.8);
-          transition:opacity 0.16s ease, transform 0.16s ease;
-          color:inherit;
+        .objchip-check {
+          width: 18px;
+          height: 18px;
+          opacity: 0;
+          transform: scale(0.8);
+          transition:
+            opacity 0.16s ease,
+            transform 0.16s ease;
+          color: inherit;
         }
 
-        .objchip.on .objchip-check{
-          opacity:1;
-          transform:scale(1);
+        .objchip.on .objchip-check {
+          opacity: 1;
+          transform: scale(1);
         }
 
-        .objchip-check ha-icon{
-          --mdc-icon-size:18px;
-          width:18px;
-          height:18px;
+        .objchip-check ha-icon {
+          --mdc-icon-size: 18px;
+          width: 18px;
+          height: 18px;
         }
 
-        .objmeta{
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          gap:10px;
-          flex-wrap:wrap;
-          margin-top:2px;
+        .objmeta {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          flex-wrap: wrap;
+          margin-top: 2px;
         }
 
-        .countpill{
-          display:inline-flex;
-          align-items:center;
-          gap:6px;
-          padding:6px 10px;
-          border-radius:var(--ed-radius-pill);
-          background:var(--ed-input-bg);
-          border:1px solid var(--ed-input-border);
-          color:var(--ed-text);
-          font-size:11px;
-          font-weight:950;
-          letter-spacing:0.02em;
+        .countpill {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 6px 10px;
+          border-radius: var(--ed-radius-pill);
+          background: var(--ed-input-bg);
+          border: 1px solid var(--ed-input-border);
+          color: var(--ed-text);
+          font-size: 11px;
+          font-weight: 950;
+          letter-spacing: 0.02em;
         }
 
-        .browser-backdrop{
-          position:fixed;
-          inset:0;
-          background:rgba(0,0,0,0.68);
-          backdrop-filter:blur(10px) saturate(120%);
-          -webkit-backdrop-filter:blur(10px) saturate(120%);
-          z-index:9998;
+        .live-status {
+          display: grid;
+          grid-template-columns: 36px minmax(0, 1fr);
+          gap: 12px;
+          align-items: flex-start;
+          padding: 14px 16px;
+          border-radius: 14px;
+          border: 1px solid transparent;
+          min-width: 0;
         }
 
-        .browser-modal{
-          position:fixed;
-          left:50%;
-          top:50%;
-          transform:translate(-50%, -50%);
-          width:min(92vw, 760px);
-          max-height:min(84vh, 760px);
-          background:rgba(24,24,28,0.98);
-          color:var(--ed-text);
-          border:1px solid rgba(255,255,255,0.10);
-          border-radius:20px;
-          box-shadow:0 24px 60px rgba(0,0,0,0.38);
-          z-index:9999;
-          display:grid;
-          grid-template-rows:auto auto minmax(0,1fr);
-          overflow:hidden;
+        .live-status-icon {
+          width: 36px;
+          height: 36px;
+          min-width: 36px;
+          border-radius: 12px;
+          display: grid;
+          place-items: center;
         }
 
-        .browser-head{
-          display:flex;
-          align-items:flex-start;
-          justify-content:space-between;
-          gap:14px;
-          padding:18px 18px 14px;
-          border-bottom:1px solid var(--ed-row-border);
+        .live-status-icon ha-icon {
+          --mdc-icon-size: 18px;
+          width: 18px;
+          height: 18px;
         }
 
-        .browser-head-copy{
-          min-width:0;
-          display:grid;
-          gap:6px;
+        .live-status-copy {
+          min-width: 0;
+          display: grid;
+          gap: 4px;
         }
 
-        .browser-title{
-          font-size:16px;
-          font-weight:1000;
-          line-height:1.2;
+        .live-status-title {
+          font-size: 13px;
+          font-weight: 950;
+          line-height: 1.2;
+          color: var(--ed-text);
         }
 
-        .browser-path{
-          font-size:12px;
-          color:var(--ed-text2);
-          line-height:1.45;
-          word-break:break-word;
-          overflow-wrap:anywhere;
+        .live-status-text {
+          font-size: 12px;
+          line-height: 1.45;
+          color: var(--ed-text2);
         }
 
-        .browser-iconbtn{
-          appearance:none;
-          -webkit-appearance:none;
-          width:38px;
-          height:38px;
-          min-width:38px;
-          border-radius:12px;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color:var(--ed-text);
-          display:grid;
-          place-items:center;
-          cursor:pointer;
+        .live-status--ok {
+          background: rgba(46, 160, 67, 0.1);
+          border-color: rgba(46, 160, 67, 0.24);
         }
 
-        .browser-iconbtn ha-icon{
-          --mdc-icon-size:18px;
-          width:18px;
-          height:18px;
+        .live-status--ok .live-status-icon {
+          background: rgba(46, 160, 67, 0.14);
+          color: rgba(46, 160, 67, 0.95);
         }
 
-        .browser-toolbar{
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          gap:10px;
-          padding:14px 18px;
-          border-bottom:1px solid var(--ed-row-border);
-          flex-wrap:wrap;
+        .live-status--warn {
+          background: rgba(245, 158, 11, 0.1);
+          border-color: rgba(245, 158, 11, 0.24);
         }
 
-        .browser-btn{
-          appearance:none;
-          -webkit-appearance:none;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color:var(--ed-text);
-          border-radius:12px;
-          min-height:40px;
-          padding:0 14px;
-          cursor:pointer;
-          display:inline-flex;
-          align-items:center;
-          gap:8px;
-          font-size:13px;
-          font-weight:900;
+        .live-status--warn .live-status-icon {
+          background: rgba(245, 158, 11, 0.14);
+          color: rgba(245, 158, 11, 0.95);
         }
 
-        .browser-btn.primary{
-          background:var(--ed-seg-on-bg);
-          color:var(--ed-seg-on-txt);
-          border-color:transparent;
+        .browser-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.68);
+          backdrop-filter: blur(10px) saturate(120%);
+          -webkit-backdrop-filter: blur(10px) saturate(120%);
+          z-index: 9998;
+        }
+
+        .browser-modal {
+          position: fixed;
+          left: 50%;
+          top: 50%;
+          transform: translate(-50%, -50%);
+          width: min(92vw, 760px);
+          max-height: min(84vh, 760px);
+          background: rgba(24, 24, 28, 0.98);
+          color: var(--ed-text);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 20px;
+          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.38);
+          z-index: 9999;
+          display: grid;
+          grid-template-rows: auto auto minmax(0, 1fr);
+          overflow: hidden;
+        }
+
+        .browser-head {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 14px;
+          padding: 18px 18px 14px;
+          border-bottom: 1px solid var(--ed-row-border);
+        }
+
+        .browser-head-copy {
+          min-width: 0;
+          display: grid;
+          gap: 6px;
+        }
+
+        .browser-title {
+          font-size: 16px;
+          font-weight: 1000;
+          line-height: 1.2;
+        }
+
+        .browser-path {
+          font-size: 12px;
+          color: var(--ed-text2);
+          line-height: 1.45;
+          word-break: break-word;
+          overflow-wrap: anywhere;
+        }
+
+        .browser-iconbtn {
+          appearance: none;
+          -webkit-appearance: none;
+          width: 38px;
+          height: 38px;
+          min-width: 38px;
+          border-radius: 12px;
+          border: 1px solid var(--ed-input-border);
+          background: var(--ed-input-bg);
+          color: var(--ed-text);
+          display: grid;
+          place-items: center;
+          cursor: pointer;
+        }
+
+        .browser-iconbtn ha-icon {
+          --mdc-icon-size: 18px;
+          width: 18px;
+          height: 18px;
+        }
+
+        .browser-toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          padding: 14px 18px;
+          border-bottom: 1px solid var(--ed-row-border);
+          flex-wrap: wrap;
+        }
+
+        .browser-btn {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 1px solid var(--ed-input-border);
+          background: var(--ed-input-bg);
+          color: var(--ed-text);
+          border-radius: 12px;
+          min-height: 40px;
+          padding: 0 14px;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+          font-weight: 900;
+        }
+
+        .browser-btn.primary {
+          background: var(--ed-seg-on-bg);
+          color: var(--ed-seg-on-txt);
+          border-color: transparent;
         }
 
         .browser-btn.disabled,
-        .browser-btn:disabled{
-          opacity:0.45;
-          cursor:default;
+        .browser-btn:disabled {
+          opacity: 0.45;
+          cursor: default;
         }
 
-        .browser-btn ha-icon{
-          --mdc-icon-size:18px;
-          width:18px;
-          height:18px;
+        .browser-btn ha-icon {
+          --mdc-icon-size: 18px;
+          width: 18px;
+          height: 18px;
         }
 
-        .browser-body{
-          min-height:0;
-          overflow:auto;
-          padding:14px 18px 18px;
-          overscroll-behavior:contain;
+        .browser-body {
+          min-height: 0;
+          overflow: auto;
+          padding: 14px 18px 18px;
+          overscroll-behavior: contain;
         }
 
-        .browser-list{
-          display:grid;
-          gap:10px;
+        .browser-list {
+          display: grid;
+          gap: 10px;
         }
 
-        .browser-item{
-          display:grid;
-          grid-template-columns:minmax(0,1fr) auto;
-          gap:10px;
-          align-items:center;
-          padding:10px;
-          border-radius:16px;
-          background:var(--ed-row-bg);
-          border:1px solid var(--ed-row-border);
+        .browser-item {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 10px;
+          align-items: center;
+          padding: 10px;
+          border-radius: 16px;
+          background: var(--ed-row-bg);
+          border: 1px solid var(--ed-row-border);
         }
 
-        .browser-open{
-          appearance:none;
-          -webkit-appearance:none;
-          border:0;
-          background:transparent;
-          color:var(--ed-text);
-          text-align:left;
-          min-width:0;
-          padding:0;
-          cursor:pointer;
-          display:grid;
-          grid-template-columns:40px minmax(0,1fr);
-          gap:12px;
-          align-items:center;
+        .browser-open {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 0;
+          background: transparent;
+          color: var(--ed-text);
+          text-align: left;
+          min-width: 0;
+          padding: 0;
+          cursor: pointer;
+          display: grid;
+          grid-template-columns: 40px minmax(0, 1fr);
+          gap: 12px;
+          align-items: center;
         }
 
-        .browser-open-icon{
-          width:40px;
-          height:40px;
-          border-radius:12px;
-          display:grid;
-          place-items:center;
-          background:var(--ed-input-bg);
-          border:1px solid var(--ed-input-border);
+        .browser-open-icon {
+          width: 40px;
+          height: 40px;
+          border-radius: 12px;
+          display: grid;
+          place-items: center;
+          background: var(--ed-input-bg);
+          border: 1px solid var(--ed-input-border);
         }
 
-        .browser-open-icon ha-icon{
-          --mdc-icon-size:20px;
-          width:20px;
-          height:20px;
+        .browser-open-icon ha-icon {
+          --mdc-icon-size: 20px;
+          width: 20px;
+          height: 20px;
         }
 
-        .browser-open-copy{
-          min-width:0;
-          display:grid;
-          gap:4px;
+        .browser-open-copy {
+          min-width: 0;
+          display: grid;
+          gap: 4px;
         }
 
-        .browser-open-title{
-          font-size:13px;
-          font-weight:950;
-          color:var(--ed-text);
-          overflow:hidden;
-          text-overflow:ellipsis;
-          white-space:nowrap;
+        .browser-open-title {
+          font-size: 13px;
+          font-weight: 950;
+          color: var(--ed-text);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
 
-        .browser-open-sub{
-          font-size:11px;
-          color:var(--ed-text2);
-          line-height:1.35;
-          word-break:break-word;
-          overflow-wrap:anywhere;
+        .browser-open-sub {
+          font-size: 11px;
+          color: var(--ed-text2);
+          line-height: 1.35;
+          word-break: break-word;
+          overflow-wrap: anywhere;
         }
 
-        .browser-select{
-          appearance:none;
-          -webkit-appearance:none;
-          border:1px solid var(--ed-input-border);
-          background:var(--ed-input-bg);
-          color:var(--ed-text);
-          border-radius:12px;
-          min-height:38px;
-          padding:0 12px;
-          cursor:pointer;
-          font-size:12px;
-          font-weight:900;
-          white-space:nowrap;
+        .browser-select {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 1px solid var(--ed-input-border);
+          background: var(--ed-input-bg);
+          color: var(--ed-text);
+          border-radius: 12px;
+          min-height: 38px;
+          padding: 0 12px;
+          cursor: pointer;
+          font-size: 12px;
+          font-weight: 900;
+          white-space: nowrap;
         }
 
-        .browser-empty{
-          display:grid;
-          place-items:center;
-          min-height:180px;
-          font-size:13px;
-          font-weight:800;
-          color:var(--ed-text2);
-          text-align:center;
-          padding:20px;
+        .browser-empty {
+          display: grid;
+          place-items: center;
+          min-height: 180px;
+          font-size: 13px;
+          font-weight: 800;
+          color: var(--ed-text2);
+          text-align: center;
+          padding: 20px;
         }
 
-        @media (max-width:900px){
-          .tabbar{
-            grid-template-columns:repeat(2,minmax(0,1fr));
+        @media (max-width: 900px) {
+          .tabbar {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
           }
         }
 
-        @media (max-width:640px){
-          .row-head{
-            align-items:stretch;
-            flex-direction:column;
+        @media (max-width: 640px) {
+          .row-head {
+            align-items: stretch;
+            flex-direction: column;
           }
 
-          .togrow{
-            justify-content:space-between;
-            width:100%;
+          .togrow {
+            justify-content: space-between;
+            width: 100%;
           }
 
-          .panelhead{
-            gap:12px;
+          .panelhead {
+            gap: 12px;
           }
 
-          .panelicon{
-            width:38px;
-            height:38px;
-            min-width:38px;
+          .panelicon {
+            width: 38px;
+            height: 38px;
+            min-width: 38px;
           }
 
-          .browser-modal{
-            width:min(96vw, 760px);
-            max-height:min(88vh, 760px);
+          .browser-modal {
+            width: min(96vw, 760px);
+            max-height: min(88vh, 760px);
           }
 
-          .browser-item{
-            grid-template-columns:1fr;
+          .browser-item {
+            grid-template-columns: 1fr;
           }
 
-          .browser-select{
-            width:100%;
+          .browser-select {
+            width: 100%;
           }
 
-          .chip-grid{
-            grid-template-columns:repeat(2, minmax(0, 1fr));
+          .chip-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
           }
         }
       </style>
@@ -2081,10 +2268,7 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "general"
               ? `
             <div class="tabpanel" data-panel="general">
-              ${panelHead(
-                "mdi:cog-outline",
-                "General"
-              )}
+              ${panelHead("mdi:cog-outline", "General")}
 
               <div class="row">
                 <div class="lbl">Source mode</div>
@@ -2202,7 +2386,9 @@ class CameraGalleryCardEditor extends HTMLElement {
                           deleteChoices
                             .map(
                               (id) =>
-                                `<option value="${id}" ${id === deleteService ? "selected" : ""}>${id}</option>`
+                                `<option value="${id}" ${
+                                  id === deleteService ? "selected" : ""
+                                }>${id}</option>`
                             )
                             .join("")
                         : `<option value="" selected>(no shell_command services found)</option>`
@@ -2220,10 +2406,7 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "viewer"
               ? `
             <div class="tabpanel" data-panel="viewer">
-              ${panelHead(
-                "mdi:image-outline",
-                "Viewer"
-              )}
+              ${panelHead("mdi:image-outline", "Viewer")}
 
               <div class="row">
                 <div class="lbl">Height</div>
@@ -2280,17 +2463,44 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "live"
               ? `
             <div class="tabpanel" data-panel="live">
-              ${panelHead(
-                "mdi:video-outline",
-                "Live"
-              )}
+              ${panelHead("mdi:video-outline", "Live")}
 
-              <div class="row">
+              <div class="live-status ${webrtcAvailable ? "live-status--ok" : "live-status--warn"}">
+                <div class="live-status-icon">
+                  <ha-icon icon="${
+                    webrtcAvailable
+                      ? "mdi:check-circle-outline"
+                      : "mdi:alert-circle-outline"
+                  }"></ha-icon>
+                </div>
+                <div class="live-status-copy">
+                  <div class="live-status-title">
+                    ${
+                      webrtcAvailable
+                        ? "WebRTC detected"
+                        : "WebRTC not detected"
+                    }
+                  </div>
+                  <div class="live-status-text">
+                    ${
+                      webrtcAvailable
+                        ? `<code>custom:webrtc-camera</code> is available. Live streams can be used.`
+                        : `Live streams require <code>custom:webrtc-camera</code>. Install/load WebRTC in Home Assistant first.`
+                    }
+                  </div>
+                </div>
+              </div>
+
+              <div class="row ${liveControlsDisabled ? "muted" : ""}">
                 <div class="row-head">
                   <div class="lbl">Live preview</div>
 
                   <div class="togrow">
-                    <ha-switch id="liveenabled" ${liveEnabled ? "checked" : ""}></ha-switch>
+                    <ha-switch
+                      id="liveenabled"
+                      ${liveEnabled ? "checked" : ""}
+                      ${liveControlsDisabled ? "disabled" : ""}
+                    ></ha-switch>
                   </div>
                 </div>
 
@@ -2302,12 +2512,12 @@ class CameraGalleryCardEditor extends HTMLElement {
               ${
                 liveEnabled
                   ? `
-                <div class="row">
+                <div class="row ${liveControlsDisabled ? "muted" : ""}">
                   <div class="lbl">Default live camera</div>
                   <div class="desc">Optional. All camera entities are available automatically. This sets the default camera when live mode opens.</div>
 
                   <div class="selectwrap">
-                    <select class="select" id="livecam">
+                    <select class="select" id="livecam" ${liveControlsDisabled ? "disabled" : ""}>
                       <option value="">Automatic (first available camera)</option>
                       ${cameraEntities
                         .map(
@@ -2322,7 +2532,7 @@ class CameraGalleryCardEditor extends HTMLElement {
                   </div>
                 </div>
 
-                <div class="row">
+                <div class="row ${liveControlsDisabled ? "muted" : ""}">
                   <div class="row-head">
                     <div>
                       <div class="lbl">Start in live mode</div>
@@ -2330,7 +2540,11 @@ class CameraGalleryCardEditor extends HTMLElement {
                     </div>
 
                     <div class="togrow">
-                      <ha-switch id="livedefault" ${liveDefault ? "checked" : ""}></ha-switch>
+                      <ha-switch
+                        id="livedefault"
+                        ${liveDefault ? "checked" : ""}
+                        ${liveControlsDisabled ? "disabled" : ""}
+                      ></ha-switch>
                     </div>
                   </div>
                 </div>
@@ -2399,9 +2613,10 @@ class CameraGalleryCardEditor extends HTMLElement {
                 </div>
 
                 <div class="chip-grid">
-                  ${AVAILABLE_OBJECT_FILTERS.map((obj) => {
-                    const isOn = objectFiltersArr.includes(obj);
-                    return `
+                  ${AVAILABLE_OBJECT_FILTERS
+                    .map((obj) => {
+                      const isOn = objectFiltersArr.includes(obj);
+                      return `
                       <button
                         type="button"
                         class="objchip ${isOn ? "on" : ""}"
@@ -2417,7 +2632,8 @@ class CameraGalleryCardEditor extends HTMLElement {
                         </span>
                       </button>
                     `;
-                  }).join("")}
+                    })
+                    .join("")}
                 </div>
               </div>
             </div>
@@ -2474,8 +2690,8 @@ class CameraGalleryCardEditor extends HTMLElement {
 
     const clearBtn = $("clear-media-folders");
     clearBtn?.addEventListener("click", () => {
-      const mediaEl = $("mediasources");
-      if (mediaEl) mediaEl.value = "";
+      const mediaElInner = $("mediasources");
+      if (mediaElInner) mediaElInner.value = "";
 
       const next = { ...this._config };
       delete next.media_sources;
@@ -2710,6 +2926,11 @@ class CameraGalleryCardEditor extends HTMLElement {
     });
 
     $("liveenabled")?.addEventListener("change", (e) => {
+      if (!this._isWebRTCAvailable()) {
+        e.target.checked = false;
+        return;
+      }
+
       const enabled = !!e.target.checked;
 
       if (enabled) {
@@ -2729,6 +2950,8 @@ class CameraGalleryCardEditor extends HTMLElement {
     });
 
     livecamEl?.addEventListener("change", (e) => {
+      if (!this._isWebRTCAvailable()) return;
+
       const v = String(e.target.value || "").trim();
       if (!v) {
         const next = { ...this._config };
@@ -2742,6 +2965,11 @@ class CameraGalleryCardEditor extends HTMLElement {
     });
 
     $("livedefault")?.addEventListener("change", (e) => {
+      if (!this._isWebRTCAvailable()) {
+        e.target.checked = false;
+        return;
+      }
+
       this._set("live_default", !!e.target.checked);
     });
 
@@ -2806,7 +3034,11 @@ class CameraGalleryCardEditor extends HTMLElement {
       if (fs && fs.id) {
         const el = $(fs.id);
         if (el && typeof el.focus === "function") {
-          if (fs.value != null && typeof el.value === "string" && el.value !== fs.value) {
+          if (
+            fs.value != null &&
+            typeof el.value === "string" &&
+            el.value !== fs.value
+          ) {
             el.value = fs.value;
           }
 
@@ -2831,7 +3063,11 @@ class CameraGalleryCardEditor extends HTMLElement {
     const box = this.shadowRoot?.getElementById(`${id}-suggestions`);
     if (!box) return;
 
-    const state = this._suggestState[id] || { open: false, items: [], index: -1 };
+    const state = this._suggestState[id] || {
+      open: false,
+      items: [],
+      index: -1,
+    };
 
     if (!state.open || !state.items.length) {
       box.innerHTML = "";
@@ -2931,6 +3167,11 @@ class CameraGalleryCardEditor extends HTMLElement {
 
   _setActiveTab(tab) {
     this._activeTab = String(tab || "general");
+
+    if (this._activeTab === "live") {
+      this._refreshWebRTCState(true);
+    }
+
     this._scheduleRender();
   }
 
@@ -3055,6 +3296,10 @@ class CameraGalleryCardEditor extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
 
+    if (!this._webrtcCheckPending) {
+      this._refreshWebRTCState();
+    }
+
     const ae = this.shadowRoot?.activeElement;
     const tag = String(ae?.tagName || "").toLowerCase();
     const id = String(ae?.id || "");
@@ -3064,8 +3309,7 @@ class CameraGalleryCardEditor extends HTMLElement {
       !!(
         ae &&
         ae.matches?.(":focus") &&
-        (
-          tag === "textarea" ||
+        (tag === "textarea" ||
           tag === "select" ||
           tag === "button" ||
           tag === "ha-textfield" ||
@@ -3079,8 +3323,7 @@ class CameraGalleryCardEditor extends HTMLElement {
           id === "livecam" ||
           id === "maxmedia" ||
           id === "mediasources" ||
-          id === "thumb"
-        )
+          id === "thumb")
       );
 
     if (interacting) return;
@@ -3251,5 +3494,8 @@ class CameraGalleryCardEditor extends HTMLElement {
 }
 
 if (!customElements.get("camera-gallery-card-editor")) {
-  customElements.define("camera-gallery-card-editor", CameraGalleryCardEditor);
+  customElements.define(
+    "camera-gallery-card-editor",
+    CameraGalleryCardEditor
+  );
 }
