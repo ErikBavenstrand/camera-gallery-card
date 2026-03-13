@@ -2,7 +2,7 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "1.7.0";
+const CARD_VERSION = "1.7.1";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
@@ -3246,8 +3246,8 @@ class CameraGalleryCard extends LitElement {
         );
       }
     } else if (!mediaRaw && !mediaSourcesClean.length) {
-      throw new Error(
-        "camera-gallery-card: 'media_source' OR 'media_sources' is required in source_mode: media"
+        throw new Error(
+          "camera-gallery-card: 'media_source' OR 'media_sources' is required in source_mode: media"
       );
     }
 
@@ -4109,17 +4109,17 @@ class CameraGalleryCard extends LitElement {
   static get styles() {
     return css`
       /*
-       * ──────────────────────────────────────────────────────────────
-       * Theme tokens
-       *
-       * Every colour is derived from Home Assistant's own CSS custom
-       * properties, so any active theme (Default, Dark, Graphite, or
-       * any HACS theme) is reflected automatically.
-       *
-       * We expose a small set of internal tokens that map HA variables
-       * to semantic roles used throughout this card.
-       * ──────────────────────────────────────────────────────────────
-       */
+      * ──────────────────────────────────────────────────────────────
+      * Theme tokens
+      *
+      * Every colour is derived from Home Assistant's own CSS custom
+      * properties, so any active theme (Default, Dark, Graphite, or
+      * any HACS theme) is reflected automatically.
+      *
+      * We expose a small set of internal tokens that map HA variables
+      * to semantic roles used throughout this card.
+      * ──────────────────────────────────────────────────────────────
+      */
       :host {
         display: block;
 
@@ -4160,10 +4160,10 @@ class CameraGalleryCard extends LitElement {
       }
 
       /*
-       * Dark mode: HA sets --card-background-color, --primary-text-color
-       * etc. to dark-mode values automatically.  We only need to tweak
-       * things that are NOT already driven by HA variables.
-       */
+      * Dark mode: HA sets --card-background-color, --primary-text-color
+      * etc. to dark-mode values automatically.  We only need to tweak
+      * things that are NOT already driven by HA variables.
+      */
       @media (prefers-color-scheme: dark) {
         :host {
           --cgc-nav-bg:     rgba(0,0,0,0.45);
