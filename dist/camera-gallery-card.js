@@ -2,11 +2,14 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "1.6.1";
+const CARD_VERSION = "1.5.0";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
 const PREVIEW_WIDTH = "100%";
+
+const SENSOR_POSTER_CONCURRENCY = 1;
+const SENSOR_POSTER_QUEUE_LIMIT = 10;
 
 const THUMBS_ENABLED = true;
 
@@ -22,14 +25,13 @@ const DEFAULT_DELETE_CONFIRM = true;
 const DEFAULT_DELETE_PREFIX = "/config/www/";
 const DEFAULT_DELETE_SERVICE = "";
 const DEFAULT_FILENAME_DATETIME_FORMAT = "";
-const DEFAULT_LIVE_DEFAULT = false;
 const DEFAULT_LIVE_ENABLED = false;
 const DEFAULT_MAX_MEDIA = 20;
 const DEFAULT_PER_ROOT_MIN_LIMIT = 40;
 const DEFAULT_PREVIEW_CLICK_TO_OPEN = false;
 const DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED = true;
 const DEFAULT_PREVIEW_POSITION = "top"; // "top" | "bottom"
-const DEFAULT_RESOLVE_BATCH = 10;
+const DEFAULT_RESOLVE_BATCH = 4;
 const DEFAULT_SOURCE_MODE = "sensor"; // "sensor" | "media"
 const DEFAULT_THUMB_BAR_POSITION = "bottom"; // "bottom" | "top" | "hidden"
 const DEFAULT_THUMB_LAYOUT = "horizontal"; // "horizontal" | "vertical"
@@ -51,6 +53,7 @@ const AVAILABLE_OBJECT_FILTERS = [
   "motorcycle",
   "person",
   "truck",
+  "visitor",
 ];
 
 const STYLE = {
@@ -139,9 +142,9 @@ class CameraGalleryCard extends LitElement {
       delete_service: "",
       entities: [],
       entity: "",
+      entity_filter_map: {},
       filename_datetime_format: DEFAULT_FILENAME_DATETIME_FORMAT,
       live_camera_entity: "",
-      live_default: DEFAULT_LIVE_DEFAULT,
       live_enabled: DEFAULT_LIVE_ENABLED,
       max_media: DEFAULT_MAX_MEDIA,
       media_source: "",
@@ -151,6 +154,7 @@ class CameraGalleryCard extends LitElement {
       preview_close_on_tap: DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED,
       preview_height: 320,
       preview_position: DEFAULT_PREVIEW_POSITION,
+      style_variables: "",
       source_mode: DEFAULT_SOURCE_MODE,
       thumb_bar_position: DEFAULT_THUMB_BAR_POSITION,
       thumb_layout: DEFAULT_THUMB_LAYOUT,
@@ -161,6 +165,10 @@ class CameraGalleryCard extends LitElement {
   constructor() {
     super();
 
+    this._previewMediaKey = "";
+    this._previewVideoEl = null;
+    this._prefetchKey = "";
+    this._selectedPreviewSrc = "";
     this._deleted = new Set();
     this._forceThumbReset = false;
     this._liveCard = null;
@@ -171,6 +179,9 @@ class CameraGalleryCard extends LitElement {
     this._pendingScrollToI = null;
     this._posterCache = new Map();
     this._posterPending = new Set();
+    this._snapshotCache = new Map();
+    this._frigateSnapshots = [];
+    this._objectCache = new Map();
     this._previewOpen = false;
     this._selectMode = false;
     this._selectedSet = new Set();
@@ -179,6 +190,7 @@ class CameraGalleryCard extends LitElement {
     this._showLivePicker = false;
     this._showLiveQuickSwitch = false;
     this._showNav = false;
+    this._srcEntityMap = new Map();
     this._suppressNextThumbClick = false;
     this._swipeStartX = 0;
     this._swipeStartY = 0;
@@ -203,6 +215,10 @@ class CameraGalleryCard extends LitElement {
 
     this._msResolveInFlight = false;
     this._msResolveQueued = new Set();
+
+    this._posterQueue = [];
+    this._posterQueued = new Set();
+    this._posterInFlight = new Set();
   }
 
   disconnectedCallback() {
@@ -215,6 +231,8 @@ class CameraGalleryCard extends LitElement {
     this._liveQuickSwitchTimer = null;
     this._navHideT = null;
     this._bulkHintTimer = null;
+
+    this._clearPreviewVideoHostPlayback();
 
     this._clearThumbLongPress();
   }
@@ -229,6 +247,241 @@ class CameraGalleryCard extends LitElement {
   }
 
   // ─── Generic helpers ───────────────────────────────────────────────
+
+  _syncPreviewPlaybackFromState() {
+    if (!this._hass || !this.config) return;
+
+    const usingMediaSource = this.config?.source_mode === "media";
+    const rawItems = this._items();
+
+    if (!rawItems.length) {
+      this._clearPreviewVideoHostPlayback();
+      return;
+    }
+
+    const withDt = rawItems.map((src, idx) => {
+      const dtMs = this._dtMsFromSrc(src);
+      const dayKey = this._extractDayKey(src);
+      return { dayKey, dtMs, idx, src };
+    });
+
+    withDt.sort((a, b) => {
+      const aOk = Number.isFinite(a.dtMs);
+      const bOk = Number.isFinite(b.dtMs);
+      if (aOk && bOk && b.dtMs !== a.dtMs) return b.dtMs - a.dtMs;
+      if (aOk && !bOk) return -1;
+      if (!aOk && bOk) return 1;
+      return b.idx - a.idx;
+    });
+
+    const allWithDay = withDt.map((x) => ({ dayKey: x.dayKey, src: x.src }));
+    const days = this._uniqueDays(allWithDay);
+    const newestDay = days[0] ?? null;
+    const activeDay = this._selectedDay ?? newestDay;
+
+    const dayFiltered = !activeDay
+      ? allWithDay
+      : allWithDay.filter((x) => x.dayKey === activeDay);
+
+    const filteredAll = dayFiltered.filter((x) =>
+      this._matchesObjectFilter(x.src)
+    );
+
+    const cap = this._normMaxMedia(this.config?.max_media);
+    const filtered = filteredAll.slice(0, Math.min(cap, filteredAll.length));
+
+    if (!filtered.length) {
+      this._clearPreviewVideoHostPlayback();
+      return;
+    }
+
+    const idx = Math.min(
+      Math.max(this._selectedIndex ?? 0, 0),
+      Math.max(0, filtered.length - 1)
+    );
+
+    const selected = filtered[idx]?.src || "";
+    if (!selected) {
+      this._clearPreviewVideoHostPlayback();
+      return;
+    }
+
+    let selectedUrl = selected;
+    if (this._isMediaSourceId(selected)) {
+      selectedUrl = this._ms?.urlCache?.get(selected) || "";
+    }
+
+    let selectedMime = "";
+    let selectedCls = "";
+    let selectedTitle = "";
+
+    if (usingMediaSource && this._isMediaSourceId(selected)) {
+      const meta = this._msMetaById(selected);
+      selectedMime = meta.mime;
+      selectedCls = meta.cls;
+      selectedTitle = meta.title;
+    }
+
+    const selectedIsVideo =
+      !!selected &&
+      this._isVideoSmart(selectedUrl || selectedTitle, selectedMime, selectedCls);
+
+    const previewGated = !!this.config?.preview_click_to_open;
+    const previewOpen = !previewGated || !!this._previewOpen;
+    const selectedNeedsResolve =
+      !!selected && usingMediaSource && this._isMediaSourceId(selected);
+    const selectedHasUrl = !!selected && (!selectedNeedsResolve || !!selectedUrl);
+
+    const mediaKey = JSON.stringify({
+      selected,
+      selectedUrl,
+      selectedIsVideo,
+      previewOpen,
+      selectedHasUrl,
+      isLive: this._isLiveActive(),
+    });
+
+    if (this._previewMediaKey === mediaKey) return;
+    this._previewMediaKey = mediaKey;
+
+    if (!previewOpen || this._isLiveActive() || !selectedHasUrl || !selectedIsVideo) {
+      this._clearPreviewVideoHostPlayback();
+      return;
+    }
+
+    this._ensurePreviewVideoHostPlayback(selectedUrl);
+  }
+
+  _enqueuePoster(src) {
+    const key = String(src || "").trim();
+    if (!key) return;
+    if (this.config?.source_mode !== "sensor") return;
+    if (this._posterCache.has(key)) return;
+    if (this._posterPending.has(key)) return;
+    if (this._posterQueued.has(key)) return;
+    if (this._posterInFlight.has(key)) return;
+
+    this._posterQueued.add(key);
+    this._posterQueue.push(key);
+
+    if (this._posterQueue.length > SENSOR_POSTER_QUEUE_LIMIT) {
+      const overflow = this._posterQueue.splice(
+        0,
+        this._posterQueue.length - SENSOR_POSTER_QUEUE_LIMIT
+      );
+      for (const oldSrc of overflow) {
+        this._posterQueued.delete(oldSrc);
+      }
+    }
+
+    this._drainPosterQueue();
+  }
+
+  _drainPosterQueue() {
+    while (
+      this._posterInFlight.size < SENSOR_POSTER_CONCURRENCY &&
+      this._posterQueue.length
+    ) {
+      const src = this._posterQueue.shift();
+      this._posterQueued.delete(src);
+
+      if (!src) continue;
+      if (this._posterCache.has(src)) continue;
+      if (this._posterPending.has(src)) continue;
+      if (this._posterInFlight.has(src)) continue;
+
+      this._posterInFlight.add(src);
+
+      this._ensurePoster(src)
+        .catch(() => {})
+        .finally(() => {
+          this._posterInFlight.delete(src);
+          this._drainPosterQueue();
+        });
+    }
+  }
+
+  _resetPosterQueue() {
+    this._posterQueue = [];
+    this._posterQueued.clear();
+    this._posterInFlight.clear();
+  }
+
+  _queueSensorPosterWork(items) {
+    if (!Array.isArray(items) || !items.length) return;
+    if (this.config?.source_mode !== "sensor") return;
+
+    for (const it of items) {
+      const src = String(it?.src || "");
+      if (!src) continue;
+      if (!this._isVideo(src)) continue;
+      this._enqueuePoster(src);
+    }
+  }
+
+  _ensurePreviewVideoHostPlayback(selectedUrl) {
+    const host = this.renderRoot?.querySelector("#preview-video-host");
+    if (!host || !selectedUrl) return;
+
+    let video = this._previewVideoEl;
+
+    if (!video || video.parentElement !== host) {
+      host.innerHTML = "";
+
+      video = document.createElement("video");
+      video.className = "pimg";
+      video.controls = true;
+      video.playsInline = true;
+      video.preload = "metadata";
+
+      host.appendChild(video);
+      this._previewVideoEl = video;
+    }
+
+    if (video.src !== selectedUrl) {
+      video.src = selectedUrl;
+
+      const poster = this._posterCache.get(selectedUrl) || "";
+      if (poster) {
+        video.poster = poster;
+      } else {
+        video.removeAttribute("poster");
+      }
+
+      try {
+        video.load();
+      } catch (_) {}
+    } else {
+      const poster = this._posterCache.get(selectedUrl) || "";
+      if (poster && video.poster !== poster) {
+        video.poster = poster;
+      }
+    }
+  }
+
+  _clearPreviewVideoHostPlayback() {
+    const host = this.renderRoot?.querySelector("#preview-video-host");
+
+    if (this._previewVideoEl) {
+      try {
+        this._previewVideoEl.pause();
+      } catch (_) {}
+
+      this._previewVideoEl.removeAttribute("src");
+      this._previewVideoEl.removeAttribute("poster");
+
+      try {
+        this._previewVideoEl.load();
+      } catch (_) {}
+    }
+
+    this._previewVideoEl = null;
+    this._previewMediaKey = "";
+
+    if (host) {
+      host.innerHTML = "";
+    }
+  }
 
   _buildFilenameDateRegex(format) {
     const fmt = String(format || "").trim();
@@ -288,6 +541,71 @@ class CameraGalleryCard extends LitElement {
       regex: new RegExp(regexStr),
       fields,
     };
+  }
+
+  _scheduleVisibleMediaWork(selected, filtered, idx, usingMediaSource) {
+    const selectedSrc = String(selected || "");
+    const cap = this._normMaxMedia(this.config?.max_media);
+    const thumbRenderLimit = this._getThumbRenderLimit(cap, usingMediaSource);
+
+    const visibleThumbIds = usingMediaSource
+      ? filtered
+          .slice(0, thumbRenderLimit)
+          .map((x) => String(x?.src || ""))
+          .filter((src) => src && this._isMediaSourceId(src))
+      : [];
+
+    const key = JSON.stringify({
+      selectedSrc,
+      visibleThumbIds,
+      usingMediaSource: !!usingMediaSource,
+    });
+
+    if (this._prefetchKey === key) return;
+    this._prefetchKey = key;
+
+    queueMicrotask(() => {
+      if (!this.isConnected) return;
+
+      if (usingMediaSource) {
+        const want = [];
+
+        if (selectedSrc && this._isMediaSourceId(selectedSrc)) {
+          want.push(selectedSrc);
+        }
+
+        for (const src of visibleThumbIds) {
+          if (src !== selectedSrc) want.push(src);
+        }
+
+        if (want.length) {
+          this._msQueueResolve(want);
+        }
+      }
+
+      this._selectedPreviewSrc = selectedSrc;
+    });
+  }
+
+  _normalizeEntityFilterMap(mapObj) {
+    const out = {};
+    const allowed = new Set(
+      AVAILABLE_OBJECT_FILTERS.map((x) => String(x).toLowerCase())
+    );
+
+    if (!mapObj || typeof mapObj !== "object" || Array.isArray(mapObj)) {
+      return out;
+    }
+
+    for (const [entityId, rawFilter] of Object.entries(mapObj)) {
+      const e = String(entityId || "").trim();
+      const f = String(rawFilter || "").toLowerCase().trim();
+
+      if (!e || !f || !allowed.has(f)) continue;
+      out[e] = f;
+    }
+
+    return out;
   }
 
   _parseDateFromFilename(src, format) {
@@ -417,15 +735,6 @@ class CameraGalleryCard extends LitElement {
     }
   }
 
-  _isGraphiteTheme() {
-    const name =
-      this._hass?.themes?.theme ||
-      this._hass?.selectedTheme ||
-      this._hass?.themes?.selectedTheme ||
-      "";
-    return String(name).toLowerCase().includes("graphite");
-  }
-
   _isThumbLayoutVertical() {
     return this.config?.thumb_layout === "vertical";
   }
@@ -542,7 +851,6 @@ class CameraGalleryCard extends LitElement {
       "bar_position",
       "live_camera_entity",
       "live_cameras",
-      "live_default",
       "live_default_camera",
       "live_enabled",
       "object_filters",
@@ -1268,6 +1576,25 @@ class CameraGalleryCard extends LitElement {
     return String(v || "").startsWith("media-source://");
   }
 
+  _isFrigateRoot(root) {
+    return String(root || "").includes("media-source://frigate/");
+  }
+
+  _hasFrigateSource() {
+    const roots =
+      Array.isArray(this.config?.media_sources) && this.config.media_sources.length
+        ? this.config.media_sources
+        : this.config?.media_source
+          ? [this.config.media_source]
+          : [];
+
+    return roots.some((root) => this._isFrigateRoot(root));
+  }
+
+  _getFrigateSnapshotsRoot() {
+    return "media-source://frigate/snapshots";
+  }
+
   _isVideo(src) {
     return /\.(mp4|webm|mov|m4v)$/i.test(String(src || ""));
   }
@@ -1289,6 +1616,131 @@ class CameraGalleryCard extends LitElement {
     }
     if (clean.startsWith("/config/www/")) return clean;
     return "";
+  }
+
+  _getFilterAliases(filter) {
+    const f = String(filter || "").toLowerCase().trim();
+    if (!f) return [];
+
+    const map = {
+      person: ["person", "persoon", "personen"],
+      visitor: ["visitor", "visitors", "bezoeker", "bezoekers", "bezoek"],
+      dog: ["dog", "hond", "honden"],
+      cat: ["cat", "kat", "katten"],
+      car: ["car", "auto", "autos", "voertuig", "vehicle"],
+      truck: ["truck", "vrachtwagen"],
+      bicycle: ["bicycle", "fiets", "fietser", "bike"],
+      motorcycle: ["motorcycle", "motor", "motorbike"],
+      bird: ["bird", "vogel", "vogels"],
+      bus: ["bus"],
+    };
+
+    return map[f] || [f];
+  }
+
+  _itemFilenameForFilter(itemOrSrc) {
+    if (!itemOrSrc) return "";
+
+    if (typeof itemOrSrc === "string") {
+      return String(itemOrSrc).toLowerCase();
+    }
+
+    return String(
+      itemOrSrc.filename ||
+      itemOrSrc.name ||
+      itemOrSrc.basename ||
+      itemOrSrc.path ||
+      itemOrSrc.file ||
+      itemOrSrc.fullpath ||
+      itemOrSrc.src ||
+      ""
+    ).toLowerCase();
+  }
+
+  _sensorTextForFilter(sensorEntityId, sensorStateObj = null) {
+    const entityId = String(sensorEntityId || "").toLowerCase();
+    const friendly = String(
+      sensorStateObj?.attributes?.friendly_name ||
+      sensorStateObj?.attributes?.name ||
+      ""
+    ).toLowerCase();
+
+    return `${entityId} ${friendly}`.trim();
+  }
+
+  _matchesObjectFilterForFileSensor(
+    srcOrItem,
+    filter,
+    sensorEntityId,
+    sensorStateObj = null
+  ) {
+    const aliases = this._getFilterAliases(filter);
+    if (!aliases.length) return true;
+
+    const sensorText = this._sensorTextForFilter(
+      sensorEntityId,
+      sensorStateObj
+    );
+    const fileText = this._itemFilenameForFilter(srcOrItem);
+
+    return aliases.some((alias) => {
+      const a = String(alias || "").toLowerCase().trim();
+      if (!a) return false;
+
+      return sensorText.includes(a) || fileText.includes(a);
+    });
+  }
+
+  _findMatchingSnapshotMediaId(videoId) {
+    const src = String(videoId || "").trim();
+    if (!src) return "";
+
+    if (this._snapshotCache.has(src)) {
+      return this._snapshotCache.get(src);
+    }
+
+    if (!src.includes("/clips/")) {
+      this._snapshotCache.set(src, "");
+      return "";
+    }
+
+    const snapshotId = src.replace("/clips/", "/snapshots/");
+
+    this._snapshotCache.set(src, snapshotId);
+    return snapshotId;
+  }
+
+  async _getSnapshotUrlForVideo(videoId) {
+    const snapshotId = this._findMatchingSnapshotMediaId(videoId);
+    if (!snapshotId) return "";
+
+    const cached = this._ms?.urlCache?.get(snapshotId);
+    if (cached) return cached;
+
+    try {
+      return await this._msResolve(snapshotId);
+    } catch (_) {
+      return "";
+    }
+  }
+
+  _queueSnapshotResolveForVisibleThumbs(items) {
+    if (!Array.isArray(items) || !items.length) return;
+    if (!this._hasFrigateSource()) return;
+
+    const snapshotIds = [];
+
+    for (const it of items) {
+      const src = String(it?.src || "");
+      if (!src || !this._isMediaSourceId(src)) continue;
+
+      const snapshotId = this._findMatchingSnapshotMediaId(src);
+      if (snapshotId) snapshotIds.push(snapshotId);
+    }
+
+    if (snapshotIds.length) {
+      this._msQueueResolve(snapshotIds);
+    }
   }
 
   _toWebPath(p) {
@@ -1331,12 +1783,20 @@ class CameraGalleryCard extends LitElement {
           const w = v.videoWidth || 0;
           const h = v.videoHeight || 0;
           if (!w || !h) return fail(new Error("no video dimensions"));
+          const maxW = 320;
+          const scale = Math.min(1, maxW / w);
+          const tw = Math.max(1, Math.round(w * scale));
+          const th = Math.max(1, Math.round(h * scale));
+
           const c = document.createElement("canvas");
-          c.width = w;
-          c.height = h;
-          c.getContext("2d").drawImage(v, 0, 0, w, h);
+          c.width = tw;
+          c.height = th;
+
+          const ctx = c.getContext("2d");
+          ctx.drawImage(v, 0, 0, tw, th);
+
           cleanup();
-          resolve(c.toDataURL("image/jpeg", 0.72));
+          resolve(c.toDataURL("image/jpeg", 0.6));
         } catch (e) {
           fail(e);
         }
@@ -1403,7 +1863,7 @@ class CameraGalleryCard extends LitElement {
     const now = Date.now();
     const key = this._msKeyFromRoots(roots);
     const sameKey = this._ms.key === key;
-    const fresh = sameKey && now - (this._ms.loadedAt || 0) < 10_000;
+    const fresh = sameKey && now - (this._ms.loadedAt || 0) < 60_000;
 
     if (this._ms.loading || fresh) return;
 
@@ -1418,12 +1878,17 @@ class CameraGalleryCard extends LitElement {
 
     try {
       const visibleCap = this._normMaxMedia(this.config?.max_media);
-      const internalCap = Math.min(2000, Math.max(visibleCap * 10, 300));
-
-      const walkLimitTotal = Math.min(
-        4000,
-        Math.max(internalCap * 4, internalCap + 100)
+      const isFrigateRoot = roots.some((r) =>
+        String(r).includes("media-source://frigate/")
       );
+
+      const internalCap = isFrigateRoot
+        ? Math.min(120, Math.max(visibleCap * 2, 40))
+        : Math.min(300, Math.max(visibleCap * 4, 80));
+
+      const walkLimitTotal = isFrigateRoot
+        ? Math.min(240, Math.max(internalCap * 2, internalCap + 20))
+        : Math.min(600, Math.max(internalCap * 3, internalCap + 40));
       const perRootLimit = Math.max(
         DEFAULT_PER_ROOT_MIN_LIMIT,
         Math.ceil(walkLimitTotal / roots.length)
@@ -1433,15 +1898,49 @@ class CameraGalleryCard extends LitElement {
 
       for (const root of roots) {
         try {
-          const depthLimit = String(root).includes("media_source/local/")
-            ? Math.min(6, DEFAULT_WALK_DEPTH)
-            : DEFAULT_WALK_DEPTH;
+          const rootStr = String(root);
+          const isLocalRoot = rootStr.includes("media_source/local/");
+          const isFrigateRoot = rootStr.includes("media-source://frigate/");
+
+          const depthLimit = isFrigateRoot
+            ? 3
+            : isLocalRoot
+              ? Math.min(6, DEFAULT_WALK_DEPTH)
+              : DEFAULT_WALK_DEPTH;
 
           const tmp = await this._msWalkIter(root, perRootLimit, depthLimit);
           flat.push(...tmp);
         } catch (e) {
           console.warn("MS root failed:", root, e);
         }
+      }
+
+      if (roots.some((r) => this._isFrigateRoot(r))) {
+        try {
+          const snapshotRoot = this._getFrigateSnapshotsRoot();
+          const snapshotItems = await this._msWalkIter(
+            snapshotRoot,
+            Math.min(400, Math.max(visibleCap * 6, 120)),
+            3
+          );
+
+          this._frigateSnapshots = snapshotItems
+            .filter((x) => !!x?.media_content_id)
+            .map((x) => ({
+              id: String(x.media_content_id || ""),
+              title: String(x.title || ""),
+              mime: String(x.mime_type || ""),
+              cls: String(x.media_class || ""),
+              dtMs: this._dtMsFromSrc(String(x.title || x.media_content_id || "")),
+              dayKey: this._extractDayKey(String(x.title || x.media_content_id || "")),
+            }))
+            .filter((x) => !!x.id);
+        } catch (e) {
+          console.warn("Frigate snapshots load failed:", e);
+          this._frigateSnapshots = [];
+        }
+      } else {
+        this._frigateSnapshots = [];
       }
 
       let items = flat
@@ -1910,8 +2409,6 @@ class CameraGalleryCard extends LitElement {
     const usingMediaSource = this.config?.source_mode === "media";
 
     if (usingMediaSource) {
-      this._msEnsureLoaded();
-
       let ids = this._msIds();
       ids = this._dedupeByRelPath(ids);
 
@@ -1925,6 +2422,7 @@ class CameraGalleryCard extends LitElement {
     if (!entities.length) return [];
 
     let list = [];
+    this._srcEntityMap = new Map();
 
     for (const entityId of entities) {
       const st = this._hass?.states?.[entityId];
@@ -1945,6 +2443,12 @@ class CameraGalleryCard extends LitElement {
           }
         } catch (_) {
           part = [this._toWebPath(raw)].filter(Boolean);
+        }
+      }
+
+      for (const src of part) {
+        if (!this._srcEntityMap.has(src)) {
+          this._srcEntityMap.set(src, entityId);
         }
       }
 
@@ -2130,15 +2634,29 @@ class CameraGalleryCard extends LitElement {
     const hasWord = (word) =>
       new RegExp(`(^|\\s)${word}(?=\\s|$)`, "i").test(s);
 
-    if (hasWord("person")) return "person";
-    if (hasWord("cat")) return "cat";
-    if (hasWord("dog")) return "dog";
-    if (hasWord("car")) return "car";
+    if (hasWord("person") || hasWord("persoon") || hasWord("personen")) {
+      return "person";
+    }
+
+    if (hasWord("visitor") || hasWord("bezoeker") || hasWord("bezoek")) {
+      return "visitor";
+    }
+
+    if (hasWord("cat") || hasWord("kat")) return "cat";
+    if (hasWord("dog") || hasWord("hond")) return "dog";
+    if (hasWord("car") || hasWord("auto")) return "car";
     if (hasWord("truck")) return "truck";
     if (hasWord("bus")) return "bus";
-    if (hasWord("bicycle") || hasWord("bike")) return "bicycle";
-    if (hasWord("motorcycle") || hasWord("motorbike")) return "motorcycle";
-    if (hasWord("bird")) return "bird";
+
+    if (hasWord("bicycle") || hasWord("bike") || hasWord("fiets")) {
+      return "bicycle";
+    }
+
+    if (hasWord("motorcycle") || hasWord("motorbike") || hasWord("motor")) {
+      return "motorcycle";
+    }
+
+    if (hasWord("bird") || hasWord("vogel")) return "bird";
 
     return null;
   }
@@ -2154,6 +2672,7 @@ class CameraGalleryCard extends LitElement {
     if (s === "motorcycle") return "motorcycle";
     if (s === "person") return "person";
     if (s === "truck") return "truck";
+    if (s === "visitor") return "visitor";
     return "selected";
   }
 
@@ -2186,6 +2705,22 @@ class CameraGalleryCard extends LitElement {
 
     if (!active.length) return true;
 
+    if (this.config?.source_mode === "sensor") {
+      const sourceEntity = this._srcEntityMap?.get(src) || "";
+      const sensorStateObj = sourceEntity
+        ? this._hass?.states?.[sourceEntity]
+        : null;
+
+      return active.some((filter) =>
+        this._matchesObjectFilterForFileSensor(
+          src,
+          filter,
+          sourceEntity,
+          sensorStateObj
+        )
+      );
+    }
+
     const obj = this._objectForSrc(src);
     return !!obj && active.includes(obj);
   }
@@ -2195,13 +2730,116 @@ class CameraGalleryCard extends LitElement {
   }
 
   _objectForSrc(src) {
-    if (this.config?.source_mode === "media" && this._isMediaSourceId(src)) {
-      const meta = this._msMetaById(src);
-      const hit = this._detectObjectFromText(meta?.title || "");
-      if (hit) return hit;
-      return this._detectObjectFromText(src);
+    const key = String(src || "").trim();
+    if (!key) return null;
+
+    if (this._objectCache.has(key)) {
+      return this._objectCache.get(key);
     }
-    return this._detectObjectFromText(src);
+
+    let detected = null;
+
+    if (this.config?.source_mode === "sensor") {
+      const sourceEntity = this._srcEntityMap?.get(src) || "";
+      const sensorStateObj = sourceEntity
+        ? this._hass?.states?.[sourceEntity]
+        : null;
+
+      const sourceText = [
+        this._itemFilenameForFilter(src),
+        this._sensorTextForFilter(sourceEntity, sensorStateObj),
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      const objects = [
+        "person",
+        "visitor",
+        "dog",
+        "cat",
+        "car",
+        "truck",
+        "bicycle",
+        "motorcycle",
+        "bird",
+        "bus",
+      ];
+
+      for (const obj of objects) {
+        const aliases = this._getFilterAliases(obj);
+        if (
+          aliases.some((alias) =>
+            sourceText.includes(String(alias || "").toLowerCase().trim())
+          )
+        ) {
+          detected = obj;
+          break;
+        }
+      }
+    } else if (this.config?.source_mode === "media" && this._isMediaSourceId(src)) {
+      const meta = this._msMetaById(src);
+      const sourceText = [
+        String(meta?.title || "").toLowerCase(),
+        String(src || "").toLowerCase(),
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      const objects = [
+        "person",
+        "visitor",
+        "dog",
+        "cat",
+        "car",
+        "truck",
+        "bicycle",
+        "motorcycle",
+        "bird",
+        "bus",
+      ];
+
+      for (const obj of objects) {
+        const aliases = this._getFilterAliases(obj);
+        if (
+          aliases.some((alias) =>
+            sourceText.includes(String(alias || "").toLowerCase().trim())
+          )
+        ) {
+          detected = obj;
+          break;
+        }
+      }
+    } else {
+      const sourceText = String(src || "").toLowerCase();
+
+      const objects = [
+        "person",
+        "visitor",
+        "dog",
+        "cat",
+        "car",
+        "truck",
+        "bicycle",
+        "motorcycle",
+        "bird",
+        "bus",
+      ];
+
+      for (const obj of objects) {
+        const aliases = this._getFilterAliases(obj);
+        if (
+          aliases.some((alias) =>
+            sourceText.includes(String(alias || "").toLowerCase().trim())
+          )
+        ) {
+          detected = obj;
+          break;
+        }
+      }
+    }
+
+    this._objectCache.set(key, detected);
+    return detected;
   }
 
   _objectIcon(obj) {
@@ -2215,6 +2853,7 @@ class CameraGalleryCard extends LitElement {
     if (obj === "motorcycle") return "mdi:motorbike";
     if (obj === "person") return "mdi:account";
     if (obj === "truck") return "mdi:truck";
+    if (obj === "visitor") return "mdi:doorbell-video";
     return "";
   }
 
@@ -2441,6 +3080,10 @@ class CameraGalleryCard extends LitElement {
     } catch (_) {}
   }
 
+  _getThumbRenderLimit(cap, usingMediaSource) {
+    return cap;
+  }
+
   _onPreviewPointerUp(e, listLen) {
     if (!this._swiping) {
       if (this.config?.preview_click_to_open && !this._previewOpen) return;
@@ -2580,6 +3223,10 @@ class CameraGalleryCard extends LitElement {
       config.object_filters ?? DEFAULT_VISIBLE_OBJECT_FILTERS
     );
 
+    const entity_filter_map = this._normalizeEntityFilterMap(
+      config.entity_filter_map || {}
+    );
+
     if (
       config.source_mode === undefined ||
       config.source_mode === null ||
@@ -2665,10 +3312,8 @@ class CameraGalleryCard extends LitElement {
         : DEFAULT_LIVE_ENABLED;
 
     const live_camera_entity = String(config.live_camera_entity || "").trim();
-    const live_default =
-      config.live_default !== undefined
-        ? !!config.live_default
-        : DEFAULT_LIVE_DEFAULT;
+
+    const style_variables = String(config.style_variables || "").trim();
 
     const nextConfig = {
       allow_bulk_delete: effectiveAllowBulkDelete,
@@ -2679,9 +3324,9 @@ class CameraGalleryCard extends LitElement {
       delete_service: delete_service || "",
       entities: source_mode === "sensor" ? sensorEntitiesClean : [],
       entity: source_mode === "sensor" ? sensorEntitiesClean[0] || "" : "",
+      entity_filter_map,
       filename_datetime_format,
       live_camera_entity,
-      live_default,
       live_enabled,
       max_media,
       media_source: source_mode === "media" ? mediaRaw : "",
@@ -2692,6 +3337,7 @@ class CameraGalleryCard extends LitElement {
       preview_height: Number(config.preview_height) || 320,
       preview_position,
       source_mode,
+      style_variables,
       thumb_bar_position,
       thumb_layout,
       thumb_size,
@@ -2732,8 +3378,7 @@ class CameraGalleryCard extends LitElement {
       this._previewOpen = this.config.preview_click_to_open ? false : true;
       this._showLivePicker = false;
       this._showLiveQuickSwitch = false;
-      this._viewMode =
-        this._hasLiveConfig() && this.config.live_default ? "live" : "media";
+      this._viewMode = "media";
     } else if (
       prevConfig.preview_click_to_open !== this.config.preview_click_to_open
     ) {
@@ -2749,6 +3394,10 @@ class CameraGalleryCard extends LitElement {
       this._selectedIndex = 0;
       this._selectedSet.clear();
       this._hideBulkDeleteHint();
+      this._resetPosterQueue();
+      this._posterCache.clear();
+      this._posterPending.clear();
+      this._objectCache.clear();
     }
 
     const liveCameraConfigChanged = changedKeys.some((k) =>
@@ -2786,6 +3435,9 @@ class CameraGalleryCard extends LitElement {
         this._ms.loading = false;
         this._ms.roots = [];
         this._ms.urlCache = new Map();
+        this._frigateSnapshots = [];
+        this._snapshotCache = new Map();
+        this._objectCache.clear();
       }
     }
 
@@ -2802,17 +3454,71 @@ class CameraGalleryCard extends LitElement {
       this._forceThumbReset = false;
       this._pendingScrollToI = null;
       this._resetThumbScrollToStart();
-      return;
-    }
-
-    if (this._pendingScrollToI != null) {
+    } else if (this._pendingScrollToI != null) {
       const i = this._pendingScrollToI;
       this._pendingScrollToI = null;
       this._scrollThumbIntoView(i);
     }
 
+    if (this.config?.source_mode === "media") {
+      this._msEnsureLoaded();
+    }
+
+    const usingMediaSource = this.config?.source_mode === "media";
+    const rawItems = this._items();
+
+    if (rawItems.length) {
+      const withDt = rawItems.map((src, idx) => {
+        const dtMs = this._dtMsFromSrc(src);
+        const dayKey = this._extractDayKey(src);
+        return { dayKey, dtMs, idx, src };
+      });
+
+      withDt.sort((a, b) => {
+        const aOk = Number.isFinite(a.dtMs);
+        const bOk = Number.isFinite(b.dtMs);
+        if (aOk && bOk && b.dtMs !== a.dtMs) return b.dtMs - a.dtMs;
+        if (aOk && !bOk) return -1;
+        if (!aOk && bOk) return 1;
+        return b.idx - a.idx;
+      });
+
+      const allWithDay = withDt.map((x) => ({ dayKey: x.dayKey, src: x.src }));
+      const days = this._uniqueDays(allWithDay);
+      const newestDay = days[0] ?? null;
+      const activeDay = this._selectedDay ?? newestDay;
+
+      const dayFiltered = !activeDay
+        ? allWithDay
+        : allWithDay.filter((x) => x.dayKey === activeDay);
+
+      const filteredAll = dayFiltered.filter((x) =>
+        this._matchesObjectFilter(x.src)
+      );
+
+      const cap = this._normMaxMedia(this.config?.max_media);
+      const filtered = filteredAll.slice(0, Math.min(cap, filteredAll.length));
+      const thumbRenderLimit = this._getThumbRenderLimit(cap, usingMediaSource);
+
+      const idx = filtered.length
+        ? Math.min(Math.max(this._selectedIndex ?? 0, 0), filtered.length - 1)
+        : 0;
+
+      const selected = filtered.length ? filtered[idx]?.src : "";
+
+      this._scheduleVisibleMediaWork(selected, filtered, idx, usingMediaSource);
+
+      const visibleThumbSlice = filtered.slice(0, thumbRenderLimit);
+      const posterWorkSlice = filtered.slice(0, 6);
+
+      this._queueSnapshotResolveForVisibleThumbs(visibleThumbSlice);
+      this._queueSensorPosterWork(posterWorkSlice);
+    }
+
     if (this._isLiveActive()) {
       this._mountLiveCard();
+    } else {
+      this._syncPreviewPlaybackFromState();
     }
   }
 
@@ -2822,6 +3528,7 @@ class CameraGalleryCard extends LitElement {
     if (!this._hass || !this.config) return html``;
 
     const usingMediaSource = this.config?.source_mode === "media";
+    const thumbRatio = "1 / 1";
     const rawItems = this._items();
     const visibleObjectFilters = this._getVisibleObjectFilters();
 
@@ -2877,19 +3584,12 @@ class CameraGalleryCard extends LitElement {
 
     const selected = filtered.length ? filtered[idx]?.src : "";
 
+    const thumbRenderLimit = this._getThumbRenderLimit(cap, usingMediaSource);
+
     const thumbs =
       THUMBS_ENABLED && filtered.length
-        ? filtered.map((it, i) => ({ ...it, i }))
+        ? filtered.slice(0, thumbRenderLimit).map((it, i) => ({ ...it, i }))
         : [];
-
-    if (usingMediaSource) {
-      const want = new Set();
-      if (selected && this._isMediaSourceId(selected)) want.add(selected);
-      for (const t of thumbs) {
-        if (t?.src && this._isMediaSourceId(t.src)) want.add(t.src);
-      }
-      this._msQueueResolve(Array.from(want));
-    }
 
     let selectedUrl = selected;
     if (this._isMediaSourceId(selected)) {
@@ -2910,8 +3610,6 @@ class CameraGalleryCard extends LitElement {
       !!selected &&
       this._isVideoSmart(selectedUrl || selectedTitle, selectedMime, selectedCls);
 
-    if (selectedIsVideo && selectedUrl) this._ensurePoster(selectedUrl);
-
     const tsKey = selected ? this._extractDateTimeKey(selected) : "";
     const tsText = tsKey ? this._formatDateTime(tsKey) : "";
     const tsLabel = selected ? tsText || this._tsLabelFromFilename(selected) : "";
@@ -2921,116 +3619,6 @@ class CameraGalleryCard extends LitElement {
     const canPrev = dayIdx >= 0 && dayIdx < days.length - 1;
     const canNext = dayIdx > 0;
     const isToday = currentForNav === newestDay;
-
-    const isGraphite = this._isGraphiteTheme();
-    const isDark = this._isDarkMode();
-
-    const PAL = isGraphite
-      ? {
-          bulkBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.18)",
-          bulkBorder:
-            "rgba(var(--rgb-primary-text-color, 255,255,255), 0.12)",
-          cardBg: STYLE.card_background,
-          divider: "var(--divider-color, rgba(255,255,255,0.10))",
-          emptyBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.18)",
-          navBtnBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.72)",
-          navBtnBorder:
-            "rgba(var(--rgb-primary-text-color, 255,255,255), 0.18)",
-          pillBg: "rgba(255,255,255,0.12)",
-          previewBg: STYLE.preview_background,
-          selOvA: "rgba(0,0,0,0.18)",
-          selOvB: "rgba(0,0,0,0.28)",
-          tbarBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.72)",
-          thumbBg: "rgba(var(--rgb-card-background-color, 255,255,255), 0.22)",
-          tsRgb: "0,0,0",
-          uiBg: "rgba(255,255,255,0.10)",
-          uiDis: "rgba(var(--rgb-disabled-text-color, 120,120,120), 0.65)",
-          uiStroke: "rgba(255,255,255,0.18)",
-          uiTxt: "var(--primary-text-color, rgba(255,255,255,0.92))",
-          uiTxt2: "var(--secondary-text-color, rgba(255,255,255,0.78))",
-        }
-      : isDark
-        ? {
-            bulkBg: "rgba(255,255,255,0.08)",
-            bulkBorder: "rgba(255,255,255,0.12)",
-            cardBg: "rgba(20,20,22,0.86)",
-            divider: "rgba(255,255,255,0.10)",
-            emptyBg: "rgba(255,255,255,0.08)",
-            navBtnBg: "rgba(0,0,0,0.38)",
-            navBtnBorder: "rgba(255,255,255,0.18)",
-            pillBg: "rgba(255,255,255,0.12)",
-            previewBg: "rgba(20,20,22,0.86)",
-            selOvA: "rgba(0,0,0,0.18)",
-            selOvB: "rgba(0,0,0,0.28)",
-            tbarBg: "rgba(0,0,0,0.26)",
-            thumbBg: "rgba(255,255,255,0.10)",
-            tsRgb: "0,0,0",
-            uiBg: "rgba(255,255,255,0.10)",
-            uiDis: "rgba(255,255,255,0.35)",
-            uiStroke: "rgba(255,255,255,0.18)",
-            uiTxt: "rgba(255,255,255,0.92)",
-            uiTxt2: "rgba(255,255,255,0.78)",
-          }
-        : {
-            bulkBg: "rgba(0,0,0,0.06)",
-            bulkBorder: "rgba(0,0,0,0.10)",
-            cardBg: "rgba(255,255,255,0.86)",
-            divider: "rgba(0,0,0,0.10)",
-            emptyBg: "rgba(0,0,0,0.06)",
-            navBtnBg: "rgba(0,0,0,0.18)",
-            navBtnBorder: "rgba(0,0,0,0.18)",
-            pillBg: "rgba(255,255,255,0.14)",
-            previewBg: "rgba(255,255,255,0.86)",
-            selOvA: "rgba(0,0,0,0.10)",
-            selOvB: "rgba(0,0,0,0.16)",
-            tbarBg: "rgba(0,0,0,0.16)",
-            thumbBg: "rgba(0,0,0,0.06)",
-            tsRgb: "0,0,0",
-            uiBg: "rgba(0,0,0,0.16)",
-            uiDis: "rgba(0,0,0,0.35)",
-            uiStroke: "rgba(0,0,0,0.18)",
-            uiTxt: "rgba(0,0,0,0.92)",
-            uiTxt2: "rgba(0,0,0,0.70)",
-          };
-
-    const rootVars = `
-      --gap:10px; --r:18px;
-
-      --barOpacity:${this.config.bar_opacity};
-
-      --bulkBg:${PAL.bulkBg};
-      --bulkBorder:${PAL.bulkBorder};
-
-      --cardBg:${PAL.cardBg};
-      --cardPad:${STYLE.card_padding};
-
-      --divider:${PAL.divider};
-      --emptyBg:${PAL.emptyBg};
-
-      --navBtnBg:${PAL.navBtnBg};
-      --navBtnBorder:${PAL.navBtnBorder};
-
-      --pillBg:${PAL.pillBg};
-      --previewBg:${PAL.previewBg};
-
-      --selOvA:${PAL.selOvA};
-      --selOvB:${PAL.selOvB};
-
-      --tbarBg:${PAL.tbarBg};
-      --thumbBg:${PAL.thumbBg};
-      --topbarMar:${STYLE.topbar_margin};
-      --topbarPad:${STYLE.topbar_padding};
-
-      --tsRgb:${PAL.tsRgb};
-
-      --uiBg:${PAL.uiBg};
-      --uiDis:${PAL.uiDis};
-      --uiStroke:${PAL.uiStroke};
-      --uiTxt:${PAL.uiTxt};
-      --uiTxt2:${PAL.uiTxt2};
-
-      --thumbsMaxHeight:${Math.max(160, Number(this.config.preview_height) || 320)}px;
-    `;
 
     const sp = this._serviceParts();
 
@@ -3063,6 +3651,21 @@ class CameraGalleryCard extends LitElement {
     const showLiveToggle = this._hasLiveConfig();
     const isLive = this._isLiveActive();
     const isVerticalThumbs = this._isThumbLayoutVertical();
+
+    // ─── Theme-aware CSS custom properties ─────────────────────────
+    // All colours are derived from HA's own CSS variables, so any theme
+    // (default light, default dark, Graphite, custom HACS themes, etc.)
+    // will automatically be reflected. We do not hard-code any palette.
+    const rootVars = `
+      --gap:10px; --r:18px;
+      --barOpacity:${this.config.bar_opacity};
+      --thumbRowH:${this.config.thumb_size}px;
+      --thumbEmptyH:${this.config.thumb_size}px;
+      --topbarMar:${STYLE.topbar_margin};
+      --topbarPad:${STYLE.topbar_padding};
+      --thumbsMaxHeight:${Math.max(160, Number(this.config.preview_height) || 320)}px;
+      ${this.config.style_variables || ""}
+    `;
 
     const previewBlock = showPreviewSection
       ? html`
@@ -3109,14 +3712,7 @@ class CameraGalleryCard extends LitElement {
                 : !selectedHasUrl
                   ? html`<div class="empty inpreview">Loading media…</div>`
                   : selectedIsVideo
-                    ? html`<video
-                        class="pimg"
-                        src=${selectedUrl}
-                        controls
-                        playsinline
-                        preload="auto"
-                        poster=${this._posterCache.get(selectedUrl) || ""}
-                      ></video>`
+                    ? html`<div id="preview-video-host" class="preview-video-host"></div>`
                     : html`<img class="pimg" src=${selectedUrl} alt="" />`}
 
             ${!noResultsForFilter &&
@@ -3198,7 +3794,7 @@ class CameraGalleryCard extends LitElement {
       : html``;
 
     const thumbsBlock = html`
-      <div class="timeline">
+      <div class="timeline ${noResultsForFilter ? "timeline-empty" : ""}">
         ${this._selectMode && (this._selectedSet?.size ?? 0)
           ? html`
               <div class="bulkbar topbulk">
@@ -3244,148 +3840,168 @@ class CameraGalleryCard extends LitElement {
             `
           : html``}
 
-        ${thumbs.length
-          ? html`
-              <div
-                class="tthumbs ${isVerticalThumbs ? "vertical" : "horizontal"}"
-                style="--tgap:${THUMB_GAP}px;"
-                @wheel=${isVerticalThumbs ? null : this._onThumbWheel}
-              >
-                ${thumbs.map((it) => {
-                  const isOn = it.i === idx && !isLive;
-                  const isSel = this._selectedSet?.has(it.src);
-                  const isMs = usingMediaSource && this._isMediaSourceId(it.src);
-
-                  let thumbUrl = it.src;
-                  if (isMs) thumbUrl = this._ms.urlCache.get(it.src) || "";
-
-                  let tMime = "";
-                  let tCls = "";
-                  let tTitle = "";
-                  if (isMs) {
-                    const meta = this._msMetaById(it.src);
-                    tMime = meta.mime;
-                    tCls = meta.cls;
-                    tTitle = meta.title;
-                  }
-
-                  const isVid = this._isVideoSmart(
-                    thumbUrl || tTitle,
-                    tMime,
-                    tCls
-                  );
-                  if (isVid && thumbUrl) this._ensurePoster(thumbUrl);
-
-                  const poster = isVid ? this._posterCache.get(thumbUrl) : thumbUrl;
-
-                  const needsResolve = isMs;
-                  const hasUrl = !needsResolve || !!thumbUrl;
-                  const showImg = hasUrl && !!poster;
-
-                  const tMs = this._dtMsFromSrc(it.src);
-                  const tTime = this._formatTimeFromMs(tMs);
-
-                  const obj = this._objectForSrc(it.src);
-                  const objIcon = this._objectIcon(obj);
-                  const objColor = this._objectColor(obj);
-
-                  const barPos = this.config?.thumb_bar_position || "bottom";
-                  const showBar = barPos !== "hidden" && (!!tTime || !!objIcon);
-
-                  return html`
-                    <button
-                      class="tthumb ${isOn ? "on" : ""} ${this._selectMode &&
-                      isSel
-                        ? "sel"
-                        : ""}"
-                      data-i="${it.i}"
-                      style="${isVerticalThumbs
-                        ? `aspect-ratio:1 / 1;border-radius:${THUMB_RADIUS}px;`
-                        : `width:${this.config.thumb_size}px;height:${this.config.thumb_size}px;border-radius:${THUMB_RADIUS}px;`}"
-                      @pointerdown=${(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        e.stopImmediatePropagation?.();
-                        e.currentTarget?.blur?.();
-                        this._onThumbPointerDown(e, it);
-                      }}
-                      @pointermove=${(e) => this._onThumbPointerMove(e)}
-                      @pointerup=${() => this._onThumbPointerUp()}
-                      @pointercancel=${() => this._onThumbPointerCancel()}
-                      @pointerleave=${() => this._onThumbPointerCancel()}
-                      @contextmenu=${(e) => this._onThumbContextMenu(e, it)}
-                      @click=${(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-
-                        if (this._suppressNextThumbClick) {
-                          this._suppressNextThumbClick = false;
-                          return;
-                        }
-
-                        if (this._selectMode) {
-                          this._toggleSelected(it.src);
-                          return;
-                        }
-
-                        if (this._isLiveActive()) {
-                          this._setViewMode("media");
-                        }
-
-                        if (this.config?.preview_click_to_open) {
-                          this._previewOpen = true;
-                        }
-
-                        this._pendingScrollToI = it.i;
-                        this._selectedIndex = it.i;
-                        this.requestUpdate();
-                      }}
-                    >
-                      ${showImg
-                        ? html`<img
-                            class="timg"
-                            src="${poster}"
-                            alt=""
-                            loading="lazy"
-                          />`
-                        : html`<div class="tph" aria-hidden="true"></div>`}
-
-                      ${showBar
-                        ? html`
-                            <div class="tbar ${barPos}">
-                              <div class="tbar-left">${tTime || "—"}</div>
-                              ${objIcon
-                                ? html`
-                                    <ha-icon
-                                      class="tbar-icon"
-                                      icon="${objIcon}"
-                                      style="color:${objColor}"
-                                    ></ha-icon>
-                                  `
-                                : html``}
-                            </div>
-                          `
-                        : html``}
-
-                      ${this._selectMode
-                        ? html`
-                            <div class="selOverlay ${isSel ? "on" : ""}">
-                              <ha-icon icon="mdi:check"></ha-icon>
-                            </div>
-                          `
-                        : html``}
-                    </button>
-                  `;
-                })}
-              </div>
-            `
-          : noResultsForFilter
+        <div
+          class="tthumbs-wrap ${isVerticalThumbs ? "vertical" : "horizontal"} ${noResultsForFilter ? "empty" : ""}"
+        >
+          ${thumbs.length
             ? html`
-                <div class="empty filter-empty">
-                  No ${this._filterLabelList(this._objectFilters)} media for this day.
+                <div
+                  class="tthumbs ${isVerticalThumbs ? "vertical" : "horizontal"}"
+                  style="--tgap:${THUMB_GAP}px;"
+                  @wheel=${isVerticalThumbs ? null : this._onThumbWheel}
+                >
+                  ${thumbs.map((it) => {
+                    const isOn = it.i === idx && !isLive;
+                    const isSel = this._selectedSet?.has(it.src);
+                    const isMs = usingMediaSource && this._isMediaSourceId(it.src);
+
+                    let thumbUrl = it.src;
+                    if (isMs) thumbUrl = this._ms.urlCache.get(it.src) || "";
+
+                    let tMime = "";
+                    let tCls = "";
+                    let tTitle = "";
+                    if (isMs) {
+                      const meta = this._msMetaById(it.src);
+                      tMime = meta.mime;
+                      tCls = meta.cls;
+                      tTitle = meta.title;
+                    }
+
+                    const isVid = this._isVideoSmart(
+                      thumbUrl || tTitle,
+                      tMime,
+                      tCls
+                    );
+
+                    let poster = "";
+
+                    if (isVid) {
+                      if (isMs) {
+                        let snapshotUrl = "";
+
+                        if (this._hasFrigateSource()) {
+                          const snapshotId = this._findMatchingSnapshotMediaId(it.src);
+                          snapshotUrl = snapshotId
+                            ? this._ms?.urlCache?.get(snapshotId) || ""
+                            : "";
+                        }
+
+                        poster = snapshotUrl || "";
+                      } else {
+                        poster = this._posterCache.get(it.src) || "";
+                      }
+                    } else {
+                      poster = thumbUrl;
+                    }
+
+                    const needsResolve = isMs;
+                    const hasUrl = !needsResolve || !!thumbUrl;
+                    const showImg = hasUrl && !!poster;
+
+                    const tMs = this._dtMsFromSrc(it.src);
+                    const tTime = this._formatTimeFromMs(tMs);
+
+                    const obj = this._objectForSrc(it.src);
+                    const objIcon = this._objectIcon(obj);
+                    const objColor = this._objectColor(obj);
+
+                    const barPos = this.config?.thumb_bar_position || "bottom";
+                    const showBar = barPos !== "hidden" && (!!tTime || !!objIcon);
+                    const thumbStyle = isVerticalThumbs
+                      ? `aspect-ratio:${thumbRatio};border-radius:${THUMB_RADIUS}px;`
+                      : `width:${this.config.thumb_size}px;aspect-ratio:${thumbRatio};border-radius:${THUMB_RADIUS}px;`;
+
+                    return html`
+                      <button
+                        class="tthumb ${isOn ? "on" : ""} ${this._selectMode && isSel ? "sel" : ""}"
+                        data-i="${it.i}"
+                        style="${thumbStyle}"
+                        @pointerdown=${(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          e.stopImmediatePropagation?.();
+                          e.currentTarget?.blur?.();
+                          this._onThumbPointerDown(e, it);
+                        }}
+                        @pointermove=${(e) => this._onThumbPointerMove(e)}
+                        @pointerup=${() => this._onThumbPointerUp()}
+                        @pointercancel=${() => this._onThumbPointerCancel()}
+                        @pointerleave=${() => this._onThumbPointerCancel()}
+                        @contextmenu=${(e) => this._onThumbContextMenu(e, it)}
+                        @click=${(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+
+                          if (this._suppressNextThumbClick) {
+                            this._suppressNextThumbClick = false;
+                            return;
+                          }
+
+                          if (this._selectMode) {
+                            this._toggleSelected(it.src);
+                            return;
+                          }
+
+                          if (this._isLiveActive()) {
+                            this._setViewMode("media");
+                          }
+
+                          if (this.config?.preview_click_to_open) {
+                            this._previewOpen = true;
+                          }
+
+                          this._pendingScrollToI = it.i;
+                          this._selectedIndex = it.i;
+                          this.requestUpdate();
+                        }}
+                      >
+                        ${showImg
+                          ? html`<img
+                              class="timg"
+                              src="${poster}"
+                              alt=""
+                              loading="lazy"
+                            />`
+                          : html`<div class="tph" aria-hidden="true"></div>`}
+
+                        ${showBar
+                          ? html`
+                              <div class="tbar ${barPos}">
+                                <div class="tbar-left">${tTime || "—"}</div>
+                                ${objIcon
+                                  ? html`
+                                      <ha-icon
+                                        class="tbar-icon"
+                                        icon="${objIcon}"
+                                        style="color:${objColor}"
+                                      ></ha-icon>
+                                    `
+                                  : html``}
+                              </div>
+                            `
+                          : html``}
+
+                        ${this._selectMode
+                          ? html`
+                              <div class="selOverlay ${isSel ? "on" : ""}">
+                                <ha-icon icon="mdi:check"></ha-icon>
+                              </div>
+                            `
+                          : html``}
+                      </button>
+                    `;
+                  })}
                 </div>
               `
-            : html``}
+            : noResultsForFilter
+              ? html`
+                  <div class="thumbs-empty-state">
+                    No ${this._filterLabelList(this._objectFilters)} media for this day.
+                  </div>
+                `
+              : html``}
+        </div>
       </div>
     `;
 
@@ -3492,9 +4108,80 @@ class CameraGalleryCard extends LitElement {
 
   static get styles() {
     return css`
+      /*
+       * ──────────────────────────────────────────────────────────────
+       * Theme tokens
+       *
+       * Every colour is derived from Home Assistant's own CSS custom
+       * properties, so any active theme (Default, Dark, Graphite, or
+       * any HACS theme) is reflected automatically.
+       *
+       * We expose a small set of internal tokens that map HA variables
+       * to semantic roles used throughout this card.
+       * ──────────────────────────────────────────────────────────────
+       */
       :host {
         display: block;
+
+        /* ── text ── */
+        --cgc-txt:          var(--primary-text-color,   rgba(0,0,0,0.87));
+        --cgc-txt2:         var(--secondary-text-color, rgba(0,0,0,0.60));
+        --cgc-txt-dis:      var(--disabled-text-color,  rgba(0,0,0,0.38));
+
+        /* ── surfaces ── */
+        --cgc-card-bg:      var(--card-background-color, #fff);
+        --cgc-preview-bg:   var(--card-background-color, #fff);
+
+        /* ── controls / chrome ── */
+        --cgc-ui-bg:        var(--secondary-background-color, rgba(0,0,0,0.08));
+        --cgc-ui-stroke:    var(--divider-color,              rgba(0,0,0,0.12));
+        --cgc-divider:      var(--divider-color,              rgba(0,0,0,0.10));
+        --cgc-thumb-bg:     var(--secondary-background-color, rgba(0,0,0,0.06));
+        --cgc-tbar-bg:      var(--secondary-background-color, rgba(0,0,0,0.16));
+        --cgc-pill-bg:      var(--secondary-background-color, rgba(0,0,0,0.10));
+
+        /* ── nav overlay buttons ── */
+        --cgc-nav-bg:       rgba(0,0,0,0.18);
+        --cgc-nav-border:   rgba(0,0,0,0.18);
+
+        /* ── selection overlay ── */
+        --cgc-sel-ov-a:     rgba(0,0,0,0.10);
+        --cgc-sel-ov-b:     rgba(0,0,0,0.22);
+
+        /* ── bulk bar ── */
+        --cgc-bulk-bg:      var(--secondary-background-color, rgba(0,0,0,0.06));
+        --cgc-bulk-border:  var(--divider-color,              rgba(0,0,0,0.10));
+
+        /* ── timestamp bar overlay (uses rgba so opacity var works) ── */
+        /* We read bar opacity from JS via --barOpacity */
+        --cgc-ts-r: 0;
+        --cgc-ts-g: 0;
+        --cgc-ts-b: 0;
       }
+
+      /*
+       * Dark mode: HA sets --card-background-color, --primary-text-color
+       * etc. to dark-mode values automatically.  We only need to tweak
+       * things that are NOT already driven by HA variables.
+       */
+      @media (prefers-color-scheme: dark) {
+        :host {
+          --cgc-nav-bg:     rgba(0,0,0,0.45);
+          --cgc-nav-border: rgba(255,255,255,0.18);
+          --cgc-sel-ov-a:   rgba(0,0,0,0.18);
+          --cgc-sel-ov-b:   rgba(0,0,0,0.32);
+        }
+      }
+
+      /* HA also exposes a class-based dark-mode flag on <body> */
+      :host-context(.dark-mode) {
+        --cgc-nav-bg:     rgba(0,0,0,0.45);
+        --cgc-nav-border: rgba(255,255,255,0.18);
+        --cgc-sel-ov-a:   rgba(0,0,0,0.18);
+        --cgc-sel-ov-b:   rgba(0,0,0,0.32);
+      }
+
+      /* ──────────────────────────────────────────────────────────── */
 
       .root {
         display: block;
@@ -3506,27 +4193,22 @@ class CameraGalleryCard extends LitElement {
       }
 
       .panel {
-        background: var(--cardBg);
+        background: var(--cgc-card-bg, var(--card-background-color, #fff));
         border-radius: var(--r);
         box-sizing: border-box;
-        padding: var(--cardPad);
+        padding: var(--cardPad, 10px 12px);
       }
 
       .divider {
         height: 1px;
-        background: linear-gradient(
-          to right,
-          transparent,
-          rgba(255,255,255,0.08),
-          transparent
-        );
+        background: var(--cgc-divider);
         margin: 12px 0;
       }
 
       .preview {
         position: relative;
         -webkit-mask-image: -webkit-radial-gradient(white, black);
-        background: var(--previewBg);
+        background: var(--cgc-preview-bg);
         border-radius: var(--r);
         overflow: hidden;
         transform: translateZ(0);
@@ -3607,6 +4289,18 @@ class CameraGalleryCard extends LitElement {
         color: #ffffff;
       }
 
+      .preview-video-host {
+        width: 100%;
+        height: 100%;
+      }
+
+      .preview-video-host > video {
+        width: 100%;
+        height: 100%;
+        display: block;
+        object-fit: cover;
+      }
+
       .live-dot {
         width: 7px;
         height: 7px;
@@ -3678,10 +4372,10 @@ class CameraGalleryCard extends LitElement {
         overflow: hidden;
         border-radius: 18px;
         z-index: 24;
-        background: rgba(24, 24, 28, 0.94);
-        border: 1px solid rgba(255, 255, 255, 0.10);
+        background: var(--card-background-color, rgba(24,24,28,0.94));
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.10));
         box-shadow: 0 18px 40px rgba(0, 0, 0, 0.34);
-        color: #fff;
+        color: var(--primary-text-color);
 
         display: grid;
         grid-template-rows: auto minmax(0, 1fr);
@@ -3693,13 +4387,60 @@ class CameraGalleryCard extends LitElement {
         justify-content: space-between;
         gap: 12px;
         padding: 16px 18px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        border-bottom: 1px solid var(--divider-color, rgba(255,255,255,0.08));
+      }
+
+      .tthumbs-wrap {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 10px;
+      }
+
+      .tthumbs-wrap.horizontal {
+        min-height: var(--thumbRowH, 86px);
+      }
+
+      .tthumbs-wrap.vertical {
+        min-height: var(--thumbsMaxHeight, 320px);
+      }
+
+      .tthumbs-wrap.empty.horizontal {
+        height: var(--thumbEmptyH, 86px);
+        min-height: var(--thumbEmptyH, 86px);
+        max-height: var(--thumbEmptyH, 86px);
+        display: flex;
+        align-items: stretch;
+        background: transparent;
+      }
+
+      .tthumbs-wrap.empty.vertical {
+        min-height: var(--thumbsMaxHeight, 320px);
+        display: flex;
+        align-items: stretch;
+        background: transparent;
+      }
+
+      .thumbs-empty-state {
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 0 16px;
+        box-sizing: border-box;
+        border-radius: 14px;
+        background: transparent;
+        color: var(--cgc-txt);
+        font-size: 14px;
+        font-weight: 700;
       }
 
       .live-picker-title {
         font-size: 16px;
         font-weight: 900;
-        color: rgba(255, 255, 255, 0.96);
+        color: var(--primary-text-color);
       }
 
       .live-picker-close {
@@ -3707,8 +4448,8 @@ class CameraGalleryCard extends LitElement {
         height: 36px;
         border-radius: 999px;
         border: 0;
-        background: rgba(255, 255, 255, 0.08);
-        color: rgba(255, 255, 255, 0.92);
+        background: var(--cgc-ui-bg);
+        color: var(--primary-text-color);
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -3734,7 +4475,7 @@ class CameraGalleryCard extends LitElement {
         width: 100%;
         border: 0;
         background: transparent;
-        color: rgba(255, 255, 255, 0.92);
+        color: var(--primary-text-color);
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -3742,7 +4483,7 @@ class CameraGalleryCard extends LitElement {
         padding: 16px 18px;
         cursor: pointer;
         text-align: left;
-        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        border-top: 1px solid var(--divider-color, rgba(255,255,255,0.05));
       }
 
       .live-picker-item:first-child {
@@ -3750,11 +4491,11 @@ class CameraGalleryCard extends LitElement {
       }
 
       .live-picker-item:hover {
-        background: rgba(255, 255, 255, 0.05);
+        background: var(--cgc-ui-bg);
       }
 
       .live-picker-item.on {
-        background: rgba(33, 150, 243, 0.16);
+        background: rgba(var(--rgb-primary-color, 33,150,243), 0.16);
       }
 
       .live-picker-item-left {
@@ -3770,7 +4511,7 @@ class CameraGalleryCard extends LitElement {
         --mdc-icon-size: var(--ha-icon-size);
         width: var(--ha-icon-size);
         height: var(--ha-icon-size);
-        color: #4da3ff;
+        color: var(--primary-color, #4da3ff);
         flex: 0 0 auto;
       }
 
@@ -3788,7 +4529,7 @@ class CameraGalleryCard extends LitElement {
         --mdc-icon-size: var(--ha-icon-size);
         width: var(--ha-icon-size);
         height: var(--ha-icon-size);
-        color: #4da3ff;
+        color: var(--primary-color, #4da3ff);
         flex: 0 0 auto;
       }
 
@@ -3801,10 +4542,10 @@ class CameraGalleryCard extends LitElement {
         text-align: center;
         padding: 24px;
         box-sizing: border-box;
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         font-size: 15px;
         font-weight: 700;
-        background: var(--previewBg);
+        background: var(--cgc-preview-bg);
       }
 
       .objfilters {
@@ -3820,16 +4561,16 @@ class CameraGalleryCard extends LitElement {
         border: 0;
         border-radius: 6px;
         padding: 0;
-        background: var(--uiBg);
-        color: var(--uiTxt);
+        background: var(--cgc-obj-btn-bg, var(--cgc-ui-bg));
+        color: var(--cgc-obj-icon-color, var(--cgc-txt));
         display: grid;
         place-items: center;
         cursor: pointer;
       }
 
       .objbtn.on {
-        background: var(--primary-color, #ffffff);
-        color: var(--text-primary-color, #ffffff);
+        background: var(--cgc-obj-btn-active-bg, var(--primary-color, #2196f3));
+        color: var(--cgc-obj-icon-active-color, var(--text-primary-color, #fff));
       }
 
       .objbtn ha-icon {
@@ -3855,11 +4596,11 @@ class CameraGalleryCard extends LitElement {
         width: 44px;
         height: 44px;
         border-radius: 999px;
-        border: 1px solid var(--navBtnBorder);
-        background: var(--navBtnBg);
+        border: 1px solid var(--cgc-nav-border);
+        background: var(--cgc-nav-bg);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -3884,11 +4625,14 @@ class CameraGalleryCard extends LitElement {
         right: 0;
         height: 40px;
         padding: 0 10px 0 12px;
+        /* Use RGB channels of black (default) so opacity interpolation works. */
         background: rgba(
-          var(--tsRgb, 0, 0, 0),
+          var(--cgc-ts-r, 0),
+          var(--cgc-ts-g, 0),
+          var(--cgc-ts-b, 0),
           calc(var(--barOpacity, 45) / 100)
         );
-        color: var(--uiTxt);
+        color: #fff;
         font-size: 12px;
         font-weight: 700;
         display: flex;
@@ -3924,9 +4668,9 @@ class CameraGalleryCard extends LitElement {
         gap: 4px;
         padding: 4px 12px;
         border-radius: 999px;
-        background: var(--pillBg);
+        background: var(--cgc-pill-bg);
         backdrop-filter: blur(6px);
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         font-size: 11px;
         font-weight: 800;
         white-space: nowrap;
@@ -3939,8 +4683,8 @@ class CameraGalleryCard extends LitElement {
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        padding: var(--topbarPad);
-        margin: var(--topbarMar);
+        padding: var(--topbarPad, 0px);
+        margin: var(--topbarMar, 0px);
         overflow: hidden;
         min-width: 0;
       }
@@ -3949,7 +4693,7 @@ class CameraGalleryCard extends LitElement {
         display: inline-flex;
         align-items: center;
         height: 30px;
-        background: var(--uiBg);
+        background: var(--cgc-ui-bg);
         border-radius: 10px;
         overflow: hidden;
         flex: 0 0 auto;
@@ -3963,7 +4707,7 @@ class CameraGalleryCard extends LitElement {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        color: var(--uiTxt2);
+        color: var(--cgc-txt2);
         background: transparent;
         font-size: 13px;
         font-weight: 700;
@@ -3973,8 +4717,8 @@ class CameraGalleryCard extends LitElement {
       }
 
       .segbtn.on {
-        background: var(--primary-color, #ffffff);
-        color: var(--text-primary-color, #ffffff);
+        background: var(--primary-color, #2196f3);
+        color: var(--text-primary-color, #fff);
         border-radius: 8px;
       }
 
@@ -3982,7 +4726,7 @@ class CameraGalleryCard extends LitElement {
         display: flex;
         align-items: center;
         height: 30px;
-        background: var(--uiBg);
+        background: var(--cgc-ui-bg);
         border-radius: 10px;
         overflow: hidden;
         flex: 1 1 auto;
@@ -3994,7 +4738,7 @@ class CameraGalleryCard extends LitElement {
         height: 44px;
         border: 0;
         background: transparent;
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -4003,7 +4747,7 @@ class CameraGalleryCard extends LitElement {
       }
 
       .iconbtn[disabled] {
-        color: var(--uiDis);
+        color: var(--cgc-txt-dis);
         cursor: default;
       }
 
@@ -4014,7 +4758,7 @@ class CameraGalleryCard extends LitElement {
         align-items: center;
         justify-content: center;
         padding: 10px 14px;
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         font-size: 13px;
         font-weight: 800;
       }
@@ -4086,7 +4830,7 @@ class CameraGalleryCard extends LitElement {
         border: 0;
         padding: 0;
         overflow: hidden;
-        background: var(--thumbBg);
+        background: var(--cgc-thumb-bg);
         outline: none;
         cursor: pointer;
         position: relative;
@@ -4124,8 +4868,7 @@ class CameraGalleryCard extends LitElement {
         border-radius: inherit;
         pointer-events: none;
         box-sizing: border-box;
-        border: 1px solid
-          rgba(var(--rgb-primary-text-color, 255, 255, 255), 0.18);
+        border: 1px solid var(--cgc-ui-stroke);
       }
 
       .tthumb.sel::after {
@@ -4142,7 +4885,7 @@ class CameraGalleryCard extends LitElement {
       .tph {
         width: 100%;
         height: 100%;
-        background: var(--thumbBg);
+        background: var(--cgc-thumb-bg);
       }
 
       .tbar {
@@ -4154,12 +4897,12 @@ class CameraGalleryCard extends LitElement {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        background: var(--tbarBg);
+        background: var(--cgc-tbar-bg);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
         font-size: 11px;
         font-weight: 800;
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         pointer-events: none;
         z-index: 2;
       }
@@ -4198,7 +4941,7 @@ class CameraGalleryCard extends LitElement {
       .selOverlay {
         position: absolute;
         inset: 0;
-        background: var(--selOvA);
+        background: var(--cgc-sel-ov-a);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -4209,11 +4952,11 @@ class CameraGalleryCard extends LitElement {
 
       .selOverlay.on {
         opacity: 1;
-        background: var(--selOvB);
+        background: var(--cgc-sel-ov-b);
       }
 
       .selOverlay ha-icon {
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         --mdc-icon-size: 22px;
         --ha-icon-size: 22px;
         width: 22px;
@@ -4231,8 +4974,8 @@ class CameraGalleryCard extends LitElement {
         justify-content: space-between;
         gap: 12px;
 
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
+        background: var(--cgc-bulk-bg);
+        border: 1px solid var(--cgc-bulk-border);
 
         backdrop-filter: blur(12px);
         -webkit-backdrop-filter: blur(12px);
@@ -4251,7 +4994,7 @@ class CameraGalleryCard extends LitElement {
       .bulkbar-text {
         font-size: 14px;
         font-weight: 700;
-        color: var(--uiTxt);
+        color: var(--cgc-txt);
         white-space: nowrap;
       }
 
@@ -4266,7 +5009,7 @@ class CameraGalleryCard extends LitElement {
         padding: 0 12px;
 
         border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.08);
+        border: 1px solid var(--cgc-ui-stroke);
 
         display: inline-flex;
         align-items: center;
@@ -4277,8 +5020,8 @@ class CameraGalleryCard extends LitElement {
 
         cursor: pointer;
 
-        background: rgba(255,255,255,0.05);
-        color: var(--uiTxt);
+        background: var(--cgc-ui-bg);
+        color: var(--cgc-txt);
       }
 
       .bulkaction ha-icon {
@@ -4292,12 +5035,12 @@ class CameraGalleryCard extends LitElement {
       }
 
       .bulkcancel {
-        background: rgba(255,255,255,0.05);
+        background: var(--cgc-ui-bg);
       }
 
       .bulkdelete {
-        background: rgba(255,0,0,0.18);
-        border: 1px solid rgba(255,0,0,0.35);
+        background: rgba(255, 0, 0, 0.18);
+        border: 1px solid rgba(255, 0, 0, 0.35);
       }
 
       @media (max-width: 700px) {
@@ -4381,8 +5124,8 @@ class CameraGalleryCard extends LitElement {
       .empty {
         padding: 12px;
         border-radius: 14px;
-        background: var(--emptyBg);
-        color: var(--uiTxt);
+        background: var(--cgc-ui-bg);
+        color: var(--cgc-txt);
       }
 
       .empty.inpreview {
@@ -4414,9 +5157,9 @@ class CameraGalleryCard extends LitElement {
         border-radius: 24px;
         overflow: hidden;
         z-index: 9999;
-        background: rgba(24, 24, 28, 0.96);
-        color: rgba(255, 255, 255, 0.96);
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: var(--card-background-color, rgba(24,24,28,0.96));
+        color: var(--primary-text-color);
+        border: 1px solid var(--divider-color, rgba(255,255,255,0.1));
         box-shadow: 0 22px 48px rgba(0, 0, 0, 0.34);
       }
 
@@ -4424,7 +5167,7 @@ class CameraGalleryCard extends LitElement {
         width: 42px;
         height: 5px;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.2);
+        background: var(--cgc-ui-stroke);
         margin: 10px auto 6px;
       }
 
@@ -4437,7 +5180,7 @@ class CameraGalleryCard extends LitElement {
         margin-top: 6px;
         font-size: 12px;
         font-weight: 700;
-        color: rgba(255, 255, 255, 0.7);
+        color: var(--cgc-txt2);
       }
 
       .thumb-menu-list {
@@ -4450,7 +5193,7 @@ class CameraGalleryCard extends LitElement {
         width: 100%;
         border: 0;
         background: transparent;
-        color: rgba(255, 255, 255, 0.96);
+        color: var(--primary-text-color);
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -4462,11 +5205,11 @@ class CameraGalleryCard extends LitElement {
       }
 
       .thumb-menu-item:hover {
-        background: rgba(255, 255, 255, 0.06);
+        background: var(--cgc-ui-bg);
       }
 
       .thumb-menu-item.danger {
-        color: #ff8a80;
+        color: var(--error-color, #ff8a80);
       }
 
       .thumb-menu-item-left {
@@ -4494,7 +5237,7 @@ class CameraGalleryCard extends LitElement {
         --mdc-icon-size: var(--ha-icon-size);
         width: var(--ha-icon-size);
         height: var(--ha-icon-size);
-        color: rgba(255, 255, 255, 0.42);
+        color: var(--cgc-txt-dis);
         flex: 0 0 auto;
       }
 
@@ -4508,8 +5251,8 @@ class CameraGalleryCard extends LitElement {
         border-radius: 16px;
         padding: 15px 16px;
         cursor: pointer;
-        background: rgba(255, 255, 255, 0.08);
-        color: rgba(255, 255, 255, 0.96);
+        background: var(--cgc-ui-bg);
+        color: var(--primary-text-color);
         font-size: 15px;
         font-weight: 900;
       }
