@@ -2,14 +2,14 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "1.7.1";
+const CARD_VERSION = "1.8.0";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
 const PREVIEW_WIDTH = "100%";
 
-const SENSOR_POSTER_CONCURRENCY = 1;
-const SENSOR_POSTER_QUEUE_LIMIT = 10;
+const SENSOR_POSTER_CONCURRENCY = 2;
+const SENSOR_POSTER_QUEUE_LIMIT = 40;
 
 const THUMBS_ENABLED = true;
 
@@ -37,6 +37,9 @@ const DEFAULT_THUMB_BAR_POSITION = "bottom"; // "bottom" | "top" | "hidden"
 const DEFAULT_THUMB_LAYOUT = "horizontal"; // "horizontal" | "vertical"
 const DEFAULT_VISIBLE_OBJECT_FILTERS = [];
 const DEFAULT_WALK_DEPTH = 8;
+
+const DEFAULT_AUTOPLAY = false;
+const DEFAULT_AUTOMUTED = true;
 
 const MAX_VISIBLE_OBJECT_FILTERS = 9;
 
@@ -128,7 +131,7 @@ class CameraGalleryCard extends LitElement {
   }
 
   static async getConfigElement() {
-    await import("/hacsfiles/camera-gallery-card/camera-gallery-card-editor.js");
+    await import("/local/camera-gallery-card/camera-gallery-card-editor.js");
     return document.createElement("camera-gallery-card-editor");
   }
 
@@ -159,6 +162,8 @@ class CameraGalleryCard extends LitElement {
       thumb_bar_position: DEFAULT_THUMB_BAR_POSITION,
       thumb_layout: DEFAULT_THUMB_LAYOUT,
       thumb_size: 140,
+      autoplay: DEFAULT_AUTOPLAY,
+      auto_muted: DEFAULT_AUTOMUTED,
     };
   }
 
@@ -365,13 +370,7 @@ class CameraGalleryCard extends LitElement {
     this._posterQueue.push(key);
 
     if (this._posterQueue.length > SENSOR_POSTER_QUEUE_LIMIT) {
-      const overflow = this._posterQueue.splice(
-        0,
-        this._posterQueue.length - SENSOR_POSTER_QUEUE_LIMIT
-      );
-      for (const oldSrc of overflow) {
-        this._posterQueued.delete(oldSrc);
-      }
+      this._posterQueue.length = SENSOR_POSTER_QUEUE_LIMIT;
     }
 
     this._drainPosterQueue();
@@ -437,6 +436,13 @@ class CameraGalleryCard extends LitElement {
       host.appendChild(video);
       this._previewVideoEl = video;
     }
+
+    // Altijd opnieuw toepassen, ook als video al bestond
+    video.autoplay = this.config?.autoplay === true;
+    video.muted =
+      this.config?.auto_muted !== undefined
+        ? this.config.auto_muted === true
+        : true;
 
     if (video.src !== selectedUrl) {
       video.src = selectedUrl;
@@ -1006,12 +1012,14 @@ class CameraGalleryCard extends LitElement {
     }
 
     const cfg = {
-      background: false,
+      type: "picture-entity",
       entity,
-      mode: "webrtc",
-      muted: true,
-      type: "custom:webrtc-camera",
-      ui: false,
+      camera_view: "live",
+      show_name: false,
+      show_state: false,
+      tap_action: { action: "none" },
+      hold_action: { action: "none" },
+      double_tap_action: { action: "none" },
     };
 
     const key = JSON.stringify(cfg);
@@ -1034,6 +1042,7 @@ class CameraGalleryCard extends LitElement {
       card.style.setProperty("display", "block");
       card.style.setProperty("height", "100%");
       card.style.setProperty("width", "100%");
+      card.style.setProperty("margin", "0");
     } catch (_) {}
 
     this._liveCard = card;
@@ -1079,16 +1088,6 @@ class CameraGalleryCard extends LitElement {
     }
 
     card.hass = this._hass;
-
-    const removeRTC = () => {
-      const rtc = card.querySelector?.(".mode, .webrtc-mode");
-      if (rtc) rtc.remove();
-    };
-
-    removeRTC();
-
-    const obs = new MutationObserver(removeRTC);
-    obs.observe(card, { childList: true, subtree: true });
   }
 
   _openLivePicker() {
@@ -1592,7 +1591,7 @@ class CameraGalleryCard extends LitElement {
   }
 
   _getFrigateSnapshotsRoot() {
-    return "media-source://frigate/snapshots";
+    return "media-source://frigate/frigate/event-search/snapshots";
   }
 
   _isVideo(src) {
@@ -1699,15 +1698,63 @@ class CameraGalleryCard extends LitElement {
       return this._snapshotCache.get(src);
     }
 
-    if (!src.includes("/clips/")) {
+    const videoName = (src.split("/").pop() || "").toLowerCase();
+    const videoStem = videoName.replace(/\.(mp4|webm|mov|m4v)$/i, "");
+
+    if (!videoStem) {
       this._snapshotCache.set(src, "");
       return "";
     }
 
-    const snapshotId = src.replace("/clips/", "/snapshots/");
+    const snapshots = Array.isArray(this._frigateSnapshots)
+      ? this._frigateSnapshots
+      : [];
 
-    this._snapshotCache.set(src, snapshotId);
-    return snapshotId;
+    if (!snapshots.length) {
+      this._snapshotCache.set(src, "");
+      return "";
+    }
+
+    let match = snapshots.find((snap) => {
+      const snapName =
+        String(snap?.id || "").split("/").pop()?.toLowerCase() || "";
+      const snapStem = snapName.replace(/\.(jpg|jpeg|png|webp)$/i, "");
+      return snapStem === videoStem;
+    });
+
+    if (!match) {
+      match = snapshots.find((snap) =>
+        String(snap?.id || "").toLowerCase().includes(videoStem)
+      );
+    }
+
+    if (!match) {
+      const videoMs = this._dtMsFromSrc(src);
+
+      if (Number.isFinite(videoMs)) {
+        let best = null;
+        let bestDiff = Infinity;
+
+        for (const snap of snapshots) {
+          const snapMs = Number(snap?.dtMs);
+          if (!Number.isFinite(snapMs)) continue;
+
+          const diff = Math.abs(snapMs - videoMs);
+          if (diff < bestDiff) {
+            best = snap;
+            bestDiff = diff;
+          }
+        }
+
+        if (best && bestDiff <= 15000) {
+          match = best;
+        }
+      }
+    }
+
+    const result = match?.id || "";
+    this._snapshotCache.set(src, result);
+    return result;
   }
 
   async _getSnapshotUrlForVideo(videoId) {
@@ -3158,6 +3205,16 @@ class CameraGalleryCard extends LitElement {
   setConfig(config) {
     const prevConfig = this.config ? { ...this.config } : null;
 
+    const autoplay =
+      config.autoplay !== undefined
+        ? !!config.autoplay
+        : DEFAULT_AUTOPLAY;
+
+    const auto_muted =
+      config.auto_muted !== undefined
+        ? !!config.auto_muted
+        : DEFAULT_AUTOMUTED;
+
     const filename_datetime_format = String(
       config.filename_datetime_format || ""
     ).trim();
@@ -3316,6 +3373,8 @@ class CameraGalleryCard extends LitElement {
     const style_variables = String(config.style_variables || "").trim();
 
     const nextConfig = {
+      autoplay,
+      auto_muted,
       allow_bulk_delete: effectiveAllowBulkDelete,
       allow_delete: effectiveAllowDelete,
       bar_opacity,
@@ -3464,6 +3523,14 @@ class CameraGalleryCard extends LitElement {
       this._msEnsureLoaded();
     }
 
+    if (changedProps.has("config") && this._previewVideoEl) {
+      this._previewVideoEl.autoplay = this.config?.autoplay === true;
+      this._previewVideoEl.muted =
+        this.config?.auto_muted !== undefined
+          ? this.config.auto_muted === true
+          : true;
+    }
+
     const usingMediaSource = this.config?.source_mode === "media";
     const rawItems = this._items();
 
@@ -3509,7 +3576,10 @@ class CameraGalleryCard extends LitElement {
       this._scheduleVisibleMediaWork(selected, filtered, idx, usingMediaSource);
 
       const visibleThumbSlice = filtered.slice(0, thumbRenderLimit);
-      const posterWorkSlice = filtered.slice(0, 6);
+      const posterWorkSlice = filtered.slice(
+        0,
+        Math.min(filtered.length, thumbRenderLimit + 6)
+      );
 
       this._queueSnapshotResolveForVisibleThumbs(visibleThumbSlice);
       this._queueSensorPosterWork(posterWorkSlice);
@@ -3882,9 +3952,15 @@ class CameraGalleryCard extends LitElement {
 
                         if (this._hasFrigateSource()) {
                           const snapshotId = this._findMatchingSnapshotMediaId(it.src);
-                          snapshotUrl = snapshotId
-                            ? this._ms?.urlCache?.get(snapshotId) || ""
-                            : "";
+
+                          if (snapshotId) {
+                            snapshotUrl = this._ms?.urlCache?.get(snapshotId) || "";
+
+                            // Als snapshot nog niet resolved is, zet hem alsnog in de queue
+                            if (!snapshotUrl) {
+                              this._msQueueResolve([snapshotId]);
+                            }
+                          }
                         }
 
                         poster = snapshotUrl || "";
@@ -3964,6 +4040,20 @@ class CameraGalleryCard extends LitElement {
                               loading="lazy"
                             />`
                           : html`<div class="tph" aria-hidden="true"></div>`}
+
+                        ${isVid
+                          ? html`
+                              <div
+                                class="video-overlay ${barPos === "bottom"
+                                  ? "has-bottom-bar"
+                                  : barPos === "top"
+                                    ? "has-top-bar"
+                                    : ""}"
+                              >
+                                <ha-icon icon="mdi:play"></ha-icon>
+                              </div>
+                            `
+                          : html``}
 
                         ${showBar
                           ? html`
@@ -4194,11 +4284,12 @@ class CameraGalleryCard extends LitElement {
 
       .panel {
         background: var(--cgc-card-bg, var(--card-background-color, #fff));
+        border: 1px solid
+          var(--cgc-card-border-color, var(--divider-color, rgba(0,0,0,0.12)));
         border-radius: var(--r);
         box-sizing: border-box;
         padding: var(--cardPad, 10px 12px);
       }
-
       .divider {
         height: 1px;
         background: var(--cgc-divider);
@@ -4573,6 +4664,40 @@ class CameraGalleryCard extends LitElement {
         color: var(--cgc-obj-icon-active-color, var(--text-primary-color, #fff));
       }
 
+      .video-overlay {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        pointer-events: none;
+        z-index: 2;
+      }
+
+      .video-overlay ha-icon {
+        --mdc-icon-size: 24px;
+        --ha-icon-size: 24px;
+        width: 30px;
+        height: 30px;
+        border-radius: 999px;
+        display: grid;
+        place-items: center;
+        color: white;
+        background: rgba(0, 0, 0, 0.30);
+        backdrop-filter: blur(6px);
+        -webkit-backdrop-filter: blur(6px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+      }
+
+      /* Als de timestampbalk onderin staat, knop optisch omhoog */
+      .video-overlay.has-bottom-bar {
+        transform: translateY(-13px);
+      }
+
+      /* Als de timestampbalk bovenin staat, knop optisch omlaag */
+      .video-overlay.has-top-bar {
+        transform: translateY(13px);
+      }
+
       .objbtn ha-icon {
         --ha-icon-size: 22px;
         --mdc-icon-size: var(--ha-icon-size);
@@ -4868,7 +4993,6 @@ class CameraGalleryCard extends LitElement {
         border-radius: inherit;
         pointer-events: none;
         box-sizing: border-box;
-        border: 1px solid var(--cgc-ui-stroke);
       }
 
       .tthumb.sel::after {
