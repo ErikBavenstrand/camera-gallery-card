@@ -2,7 +2,7 @@
 
 Custom **Home Assistant Lovelace card** for browsing camera media in a clean **timeline-style gallery** with preview player, object filters, optional live view, and a built-in visual editor.
 
-**Current version:** `v1.8.0`
+**Current version:** `v1.9.0`
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/5efa9e10-9ac3-48bf-8abf-2a009e797e79" width="48%" />
@@ -43,7 +43,8 @@ https://github.com/TarheelGrad1998/files
 - Timeline thumbnails
 - Day grouping
 - Filename timestamp parsing
-- Object filter buttons
+- Object filter buttons with custom icon support
+- Object detection pill in timestamp bar
 - Horizontal or vertical thumbnail layout
 - Mobile friendly
 - Media type icon (image / video)
@@ -57,6 +58,7 @@ https://github.com/TarheelGrad1998/files
 ### Live view
 
 - Native Home Assistant **WebRTC live preview**
+- Redesigned live view layout
 - Live badge
 - Camera switching
 - Default live mode
@@ -243,7 +245,7 @@ Notes:
 | `thumb_size` | Thumbnail size |
 | `thumb_bar_position` | Thumb timestamp bar |
 | `max_media` | Max media items |
-| `object_filters` | Filter buttons |
+| `object_filters` | Filter buttons (built-in and custom) |
 | `live_enabled` | Enable live mode |
 | `live_camera_entity` | Camera entity |
 | `live_default` | Start in live mode |
@@ -255,7 +257,7 @@ Notes:
 
 # Object filters
 
-Supported filters:
+Supported built-in filters:
 
 ```text
 bicycle
@@ -277,6 +279,18 @@ object_filters:
   - person
   - car
   - dog
+```
+
+## Custom object filters
+
+Add your own filters with a custom icon using the editor, or via YAML:
+
+```yaml
+object_filters:
+  - person
+  - car
+  - parcel: mdi:package-variant
+  - woman: mdi:account
 ```
 
 Recommended filename format:
