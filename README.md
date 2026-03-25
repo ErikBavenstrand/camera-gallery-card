@@ -68,6 +68,7 @@ https://github.com/TarheelGrad1998/files
 
 - Video autoplay toggle
 - Video auto-mute toggle
+- Per-object filter color customization
 
 ### Actions
 
@@ -221,6 +222,14 @@ Then use that service in the card:
 delete_service: shell_command.delete_file
 ```
 
+Optional delete options:
+
+```yaml
+allow_delete: true
+allow_bulk_delete: true
+delete_confirm: true
+```
+
 Notes:
 
 - Delete actions only work when a `delete_service` is configured
@@ -246,12 +255,17 @@ Notes:
 | `thumb_bar_position` | Thumb timestamp bar |
 | `max_media` | Max media items |
 | `object_filters` | Filter buttons (built-in and custom) |
+| `object_colors` | Color per object filter — `{ person: "#FF0000" }` |
+| `entity_filter_map` | Map entity to object type — `{ camera.frontdoor: person }` |
 | `live_enabled` | Enable live mode |
-| `live_camera_entity` | Camera entity |
-| `live_default` | Start in live mode |
-| `video_autoplay` | Enable automatic video playback |
-| `video_auto_mute` | Automatically mute videos |
+| `live_camera_entity` | Camera entity for live view |
+| `autoplay` | Auto-play videos (`true` / `false`) |
+| `auto_muted` | Auto-mute videos (`true` / `false`) |
+| `allow_delete` | Enable delete action |
+| `allow_bulk_delete` | Enable bulk delete |
+| `delete_confirm` | Show confirmation before deleting |
 | `delete_service` | Delete file service |
+| `style_variables` | Custom CSS variable overrides |
 
 ---
 
@@ -291,6 +305,17 @@ object_filters:
   - car
   - parcel: mdi:package-variant
   - woman: mdi:account
+```
+
+## Object filter colors
+
+Assign a color to each filter icon:
+
+```yaml
+object_colors:
+  person: "#2196F3"
+  car: "#FF9800"
+  parcel: "#4CAF50"
 ```
 
 Recommended filename format:
