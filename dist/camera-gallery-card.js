@@ -2,7 +2,7 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "1.9.0";
+const CARD_VERSION = "1.9.1";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
@@ -14,7 +14,7 @@ const SENSOR_POSTER_QUEUE_LIMIT = 40;
 const THUMBS_ENABLED = true;
 
 const THUMB_GAP = 2;
-const THUMB_RADIUS = 14;
+const THUMB_RADIUS = 10;
 const THUMB_SIZE = 86;
 
 const DEFAULT_ALLOW_BULK_DELETE = true;
@@ -123,6 +123,8 @@ class CameraGalleryCard extends LitElement {
       _suppressNextThumbClick: { type: Boolean },
       _swipeStartX: { type: Number },
       _swipeStartY: { type: Number },
+      _swipeCurX: { type: Number },
+      _swipeCurY: { type: Number },
       _swiping: { type: Boolean },
       _thumbMenuItem: { type: Object },
       _thumbMenuOpen: { type: Boolean },
@@ -135,35 +137,20 @@ class CameraGalleryCard extends LitElement {
     return document.createElement("camera-gallery-card-editor");
   }
 
-  static getStubConfig() {
+  static getStubConfig(hass) {
+    const states = hass?.states ?? {};
+    const cameraEntity = Object.keys(states).find(
+      (e) => e.startsWith("camera.") && states[e]?.state !== "unavailable"
+    );
     return {
-      allow_bulk_delete: DEFAULT_ALLOW_BULK_DELETE,
-      allow_delete: DEFAULT_ALLOW_DELETE,
-      bar_opacity: DEFAULT_BAR_OPACITY,
-      bar_position: "top",
-      delete_confirm: DEFAULT_DELETE_CONFIRM,
-      delete_service: "",
+      source_mode: "sensor",
       entities: [],
-      entity: "",
-      entity_filter_map: {},
-      filename_datetime_format: DEFAULT_FILENAME_DATETIME_FORMAT,
-      live_camera_entity: "",
-      live_enabled: DEFAULT_LIVE_ENABLED,
-      max_media: DEFAULT_MAX_MEDIA,
-      media_source: "",
-      media_sources: [],
-      object_filters: DEFAULT_VISIBLE_OBJECT_FILTERS,
-      preview_click_to_open: DEFAULT_PREVIEW_CLICK_TO_OPEN,
-      preview_close_on_tap: DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED,
+      live_enabled: true,
+      live_camera_entity: cameraEntity ?? "",
       preview_height: 320,
-      preview_position: DEFAULT_PREVIEW_POSITION,
-      style_variables: "",
-      source_mode: DEFAULT_SOURCE_MODE,
-      thumb_bar_position: DEFAULT_THUMB_BAR_POSITION,
-      thumb_layout: DEFAULT_THUMB_LAYOUT,
       thumb_size: 140,
-      autoplay: DEFAULT_AUTOPLAY,
-      auto_muted: DEFAULT_AUTOMUTED,
+      bar_position: "top",
+      object_filters: DEFAULT_VISIBLE_OBJECT_FILTERS,
     };
   }
 
@@ -199,6 +186,8 @@ class CameraGalleryCard extends LitElement {
     this._suppressNextThumbClick = false;
     this._swipeStartX = 0;
     this._swipeStartY = 0;
+    this._swipeCurX = 0;
+    this._swipeCurY = 0;
     this._swiping = false;
     this._thumbLongPressStartX = 0;
     this._thumbLongPressStartY = 0;
@@ -224,6 +213,11 @@ class CameraGalleryCard extends LitElement {
     this._posterQueue = [];
     this._posterQueued = new Set();
     this._posterInFlight = new Set();
+
+    this._revealedThumbs = new Set();
+    this._thumbObserver = null;
+    this._thumbObserverRoot = null;
+    this._observedThumbs = new WeakSet();
   }
 
   disconnectedCallback() {
@@ -240,6 +234,11 @@ class CameraGalleryCard extends LitElement {
     this._clearPreviewVideoHostPlayback();
 
     this._clearThumbLongPress();
+
+    if (this._thumbObserver) {
+      this._thumbObserver.disconnect();
+      this._thumbObserver = null;
+    }
   }
 
   set hass(hass) {
@@ -1099,6 +1098,45 @@ class CameraGalleryCard extends LitElement {
     }
 
     card.hass = this._hass;
+    this._injectLiveFillStyle(card);
+  }
+
+  _injectLiveFillStyle(card) {
+    const cssHuiImage = `
+      :host { display:block!important; width:100%!important; height:100%!important; }
+      .image-container { width:100%!important; height:100%!important; }
+      .ratio { padding-bottom:0!important; padding-top:0!important; width:100%!important; height:100%!important; position:relative!important; }
+      img, video, ha-hls-player, ha-web-rtc-player { width:100%!important; height:100%!important; object-fit:cover!important; display:block!important; position:static!important; }
+    `;
+
+    const injectIntoHuiImage = (huiImage) => {
+      const sr = huiImage.shadowRoot;
+      if (!sr || sr.querySelector("#cgc-fill-hui")) return;
+      const s = document.createElement("style");
+      s.id = "cgc-fill-hui";
+      s.textContent = cssHuiImage;
+      sr.appendChild(s);
+      // Also directly nullify the inline padding-bottom on .ratio
+      const ratio = sr.querySelector(".ratio");
+      if (ratio) ratio.style.setProperty("padding-bottom", "0", "important");
+    };
+
+    const tryInject = () => {
+      const sr = card.shadowRoot;
+      if (!sr) return false;
+      const huiImage = sr.querySelector("hui-image");
+      if (!huiImage) return false;
+      injectIntoHuiImage(huiImage);
+      return true;
+    };
+
+    if (!tryInject()) {
+      const obs = new MutationObserver(() => {
+        if (tryInject()) obs.disconnect();
+      });
+      obs.observe(card.shadowRoot || card, { childList: true, subtree: true });
+      setTimeout(() => obs.disconnect(), 5000);
+    }
   }
 
   _openLivePicker() {
@@ -1127,12 +1165,6 @@ class CameraGalleryCard extends LitElement {
     return html`
       <div class="live-stage">
         ${this._renderLiveCardHost()}
-
-        <div class="live-badge">
-          <span class="live-dot"></span>
-          <span>LIVE</span>
-        </div>
-
 
         ${this._renderLivePicker()}
       </div>
@@ -1938,11 +1970,11 @@ class CameraGalleryCard extends LitElement {
       );
 
       const internalCap = isFrigateRoot
-        ? Math.min(120, Math.max(visibleCap * 2, 40))
+        ? Math.min(400, Math.max(visibleCap * 4, 200))
         : Math.min(300, Math.max(visibleCap * 4, 80));
 
       const walkLimitTotal = isFrigateRoot
-        ? Math.min(240, Math.max(internalCap * 2, internalCap + 20))
+        ? Math.min(800, Math.max(internalCap * 2, 400))
         : Math.min(600, Math.max(internalCap * 3, internalCap + 40));
       const perRootLimit = Math.max(
         DEFAULT_PER_ROOT_MIN_LIMIT,
@@ -2780,8 +2812,12 @@ class CameraGalleryCard extends LitElement {
     return !!obj && active.includes(obj);
   }
 
-  _objectColor() {
-    return "rgba(255,255,255,0.92)";
+  _objectColor(obj) {
+    const colors = this.config?.object_colors;
+    if (obj && colors && typeof colors === "object" && colors[obj]) {
+      return colors[obj];
+    }
+    return "currentColor";
   }
 
   _objectForSrc(src) {
@@ -3037,6 +3073,8 @@ class CameraGalleryCard extends LitElement {
     this._swiping = true;
     this._swipeStartX = e.clientX;
     this._swipeStartY = e.clientY;
+    this._swipeCurX = e.clientX;
+    this._swipeCurY = e.clientY;
 
     try {
       e.currentTarget?.setPointerCapture?.(e.pointerId);
@@ -3064,8 +3102,10 @@ class CameraGalleryCard extends LitElement {
 
     if (this.config?.preview_click_to_open && !this._previewOpen) return;
 
-    const dx = e.clientX - this._swipeStartX;
-    const dy = e.clientY - this._swipeStartY;
+    const endX = (e.clientX !== 0 || e.clientY !== 0) ? e.clientX : this._swipeCurX;
+    const endY = (e.clientX !== 0 || e.clientY !== 0) ? e.clientY : this._swipeCurY;
+    const dx = endX - this._swipeStartX;
+    const dy = endY - this._swipeStartY;
 
     if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
       this._showNavChevrons();
@@ -3310,6 +3350,7 @@ class CameraGalleryCard extends LitElement {
       max_media,
       media_source: source_mode === "media" ? mediaRaw : "",
       media_sources: source_mode === "media" ? normalizedMediaRoots : [],
+      object_colors: (typeof config.object_colors === "object" && config.object_colors !== null) ? config.object_colors : {},
       object_filters: visibleObjectFilters,
       preview_click_to_open,
       preview_close_on_tap,
@@ -3357,7 +3398,11 @@ class CameraGalleryCard extends LitElement {
       this._previewOpen = this.config.preview_click_to_open ? false : true;
       this._showLivePicker = false;
       this._showLiveQuickSwitch = false;
-      this._viewMode = "media";
+      const hasMedia = nextConfig.entities.length > 0 || nextConfig.media_sources.length > 0;
+      this._viewMode =
+        nextConfig.live_enabled && nextConfig.live_camera_entity && !hasMedia
+          ? "live"
+          : "media";
     } else if (
       prevConfig.preview_click_to_open !== this.config.preview_click_to_open
     ) {
@@ -3433,6 +3478,13 @@ class CameraGalleryCard extends LitElement {
       this._forceThumbReset = false;
       this._pendingScrollToI = null;
       this._resetThumbScrollToStart();
+      this._revealedThumbs.clear();
+      if (this._thumbObserver) {
+        this._thumbObserver.disconnect();
+        this._thumbObserver = null;
+        this._thumbObserverRoot = null;
+        this._observedThumbs = new WeakSet();
+      }
     } else if (this._pendingScrollToI != null) {
       const i = this._pendingScrollToI;
       this._pendingScrollToI = null;
@@ -3510,6 +3562,50 @@ class CameraGalleryCard extends LitElement {
     } else {
       this._syncPreviewPlaybackFromState();
     }
+
+    this._setupThumbObserver();
+  }
+
+  _setupThumbObserver() {
+    const scrollEl = this.shadowRoot?.querySelector(".tthumbs");
+    if (!scrollEl) return;
+
+    if (this._thumbObserver && this._thumbObserverRoot !== scrollEl) {
+      this._thumbObserver.disconnect();
+      this._thumbObserver = null;
+      this._thumbObserverRoot = null;
+      this._observedThumbs = new WeakSet();
+    }
+
+    if (!this._thumbObserver) {
+      this._thumbObserverRoot = scrollEl;
+      const isHorizontal = scrollEl.classList.contains("horizontal");
+      const margin = isHorizontal ? "0px 200px 0px 200px" : "200px 0px 200px 0px";
+
+      this._thumbObserver = new IntersectionObserver(
+        (entries) => {
+          let changed = false;
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              const key = entry.target.dataset.lazySrc;
+              if (key && !this._revealedThumbs.has(key)) {
+                this._revealedThumbs.add(key);
+                changed = true;
+              }
+            }
+          }
+          if (changed) this.requestUpdate();
+        },
+        { root: scrollEl, rootMargin: margin, threshold: 0 }
+      );
+    }
+
+    scrollEl.querySelectorAll(".tthumb[data-lazy-src]").forEach((el) => {
+      if (!this._observedThumbs.has(el)) {
+        this._thumbObserver.observe(el);
+        this._observedThumbs.add(el);
+      }
+    });
   }
 
   // ─── Render ───────────────────────────────────────────────────────
@@ -3648,7 +3744,7 @@ class CameraGalleryCard extends LitElement {
     const showGalleryControls = !this.config?.preview_click_to_open || !this._previewOpen;
 
     const rootVars = `
-      --gap:10px; --r:18px;
+      --gap:10px; --r:10px;
       --barOpacity:${this.config.bar_opacity};
       --thumbRowH:${this.config.thumb_size}px;
       --thumbEmptyH:${this.config.thumb_size}px;
@@ -3684,7 +3780,9 @@ class CameraGalleryCard extends LitElement {
               }
               this._onPreviewPointerDown(e);
             }}
+            @pointermove=${(e) => { if (this._swiping && e.isPrimary !== false) { this._swipeCurX = e.clientX; this._swipeCurY = e.clientY; } }}
             @pointerup=${(e) => this._onPreviewPointerUp(e, filtered.length)}
+            @pointercancel=${(e) => this._onPreviewPointerUp(e, filtered.length)}
             @click=${(e) => this._onPreviewClick(e)}
           >
             ${isLive
@@ -3711,23 +3809,23 @@ class CameraGalleryCard extends LitElement {
             ${tsPosClass !== "hidden" ? html`
               <div class="tsbar ${tsPosClass}">
                 ${!isLive ? html`
-                  ${(() => { const obj = selected ? this._objectForSrc(selected) : null; const icon = obj ? this._objectIcon(obj) : ""; return icon ? html`<div class="tspill tspill-left"><ha-icon icon="${icon}"></ha-icon></div>` : html``; })()}
-                  <div class="tsleft">${tsLabel || "—"}</div>
-
                   ${previewGated && previewOpen ? html`
-                    <button class="pbackbtn-center" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => {
+                    <button class="tspill tspill-left tsbar-back-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => {
                       e.stopPropagation();
                       this._previewOpen = false;
                       this.requestUpdate();
                     }}>
-                      <ha-icon icon="mdi:close-circle-outline"></ha-icon>
+                      <ha-icon icon="mdi:arrow-left"></ha-icon>
                     </button>
-                  ` : html``}
-
+                  ` : (() => { const obj = selected ? this._objectForSrc(selected) : null; const icon = obj ? this._objectIcon(obj) : ""; const color = obj ? this._objectColor(obj) : ""; return icon ? html`<div class="tspill tspill-left"><ha-icon icon="${icon}" style="color:${color}"></ha-icon></div>` : html``; })()}
+                  <div class="tsleft">${tsLabel || "—"}</div>
                   <div class="tspill">
                     <span class="tspill-val">${idx + 1}/${filtered.length}</span>
                   </div>
                 ` : html`
+                  <button class="tspill tspill-left tsbar-back-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._setViewMode("media"); this._previewOpen = false; this.requestUpdate(); }}>
+                    <ha-icon icon="mdi:arrow-left"></ha-icon>
+                  </button>
                   ${this._getLiveCameraOptions().length > 1 ? html`
                     <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openLivePicker(); }}>
                       <ha-icon icon="mdi:video-switch"></ha-icon>
@@ -3749,6 +3847,7 @@ class CameraGalleryCard extends LitElement {
             ${visibleObjectFilters.map((filterValue) => {
               const objIcon = this._objectIcon(filterValue);
               const label = this._filterLabel(filterValue);
+              const objColor = this._objectColor(filterValue);
               return html`
                 <button
                   class="objbtn icon-only ${this._isObjectFilterActive(filterValue)
@@ -3759,7 +3858,7 @@ class CameraGalleryCard extends LitElement {
                   aria-label="Filter ${label}"
                 >
                   ${objIcon
-                    ? html`<ha-icon icon="${objIcon}"></ha-icon>`
+                    ? html`<ha-icon icon="${objIcon}" style="color:${objColor}"></ha-icon>`
                     : html``}
                 </button>
               `;
@@ -3877,7 +3976,7 @@ class CameraGalleryCard extends LitElement {
 
                     const needsResolve = isMs;
                     const hasUrl = !needsResolve || !!thumbUrl;
-                    const showImg = hasUrl && !!poster;
+                    const showImg = this._revealedThumbs.has(it.src) && hasUrl && !!poster;
 
                     const tMs = this._dtMsFromSrc(it.src);
                     const tTime = this._formatTimeFromMs(tMs);
@@ -3889,13 +3988,14 @@ class CameraGalleryCard extends LitElement {
                     const barPos = this.config?.thumb_bar_position || "bottom";
                     const showBar = barPos !== "hidden" && (!!tTime || !!objIcon);
                     const thumbStyle = isVerticalThumbs
-                      ? `aspect-ratio:${thumbRatio};border-radius:${THUMB_RADIUS}px;`
-                      : `width:${this.config.thumb_size}px;aspect-ratio:${thumbRatio};border-radius:${THUMB_RADIUS}px;`;
+                      ? `aspect-ratio:${thumbRatio};border-radius:var(--cgc-thumb-radius, ${THUMB_RADIUS}px);`
+                      : `width:${this.config.thumb_size}px;aspect-ratio:${thumbRatio};border-radius:var(--cgc-thumb-radius, ${THUMB_RADIUS}px);`;
 
                     return html`
                       <button
                         class="tthumb ${isOn ? "on" : ""} ${this._selectMode && isSel ? "sel" : ""}"
                         data-i="${it.i}"
+                        data-lazy-src="${it.src}"
                         style="${thumbStyle}"
                         @pointerdown=${(e) => {
                           e.preventDefault();
@@ -4131,7 +4231,7 @@ class CameraGalleryCard extends LitElement {
         --cgc-divider:      var(--divider-color,              rgba(0,0,0,0.10));
         --cgc-thumb-bg:     var(--secondary-background-color, rgba(0,0,0,0.06));
         --cgc-tbar-bg:      var(--secondary-background-color, rgba(0,0,0,0.16));
-        --cgc-pill-bg:      var(--secondary-background-color, rgba(0,0,0,0.10));
+        --cgc-pill-bg:      var(--secondary-background-color, rgba(0,0,0,0.45));
 
         /* ── nav overlay buttons ── */
         --cgc-nav-bg:       rgba(0,0,0,0.18);
@@ -4148,6 +4248,7 @@ class CameraGalleryCard extends LitElement {
         --cgc-ts-r: 0;
         --cgc-ts-g: 0;
         --cgc-ts-b: 0;
+        --cgc-tsbar-txt: #fff;
       }
 
       @media (prefers-color-scheme: dark) {
@@ -4187,8 +4288,8 @@ class CameraGalleryCard extends LitElement {
       }
       .divider {
         height: 1px;
-        background: var(--cgc-divider);
-        margin: 12px 0;
+        background: transparent;
+        margin: 6px 0;
       }
 
       .preview {
@@ -4206,6 +4307,7 @@ class CameraGalleryCard extends LitElement {
         height: 100%;
         object-fit: cover;
         width: 100%;
+        pointer-events: none;
       }
 
       .live-stage {
@@ -4220,7 +4322,7 @@ class CameraGalleryCard extends LitElement {
         inset: 0;
         width: 100%;
         height: 100%;
-        background: #000;
+        background: transparent;
         border-radius: inherit;
         overflow: hidden;
       }
@@ -4247,32 +4349,14 @@ class CameraGalleryCard extends LitElement {
         object-fit: cover !important;
       }
 
-      .live-badge {
-        position: absolute;
-        top: 10px;
-        left: 10px;
-        z-index: 20;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 8px;
-        border-radius: 999px;
-        background: rgba(255, 0, 0, 0.88);
-        color: #fff;
-        font-size: 9px;
-        font-weight: 800;
-        letter-spacing: 0.4px;
-        line-height: 1;
-        pointer-events: none;
-      }
 
       .segbtn.livebtn {
         width: 60px;
       }
 
       .segbtn.livebtn.on {
-        background: #ff0000;
-        color: #ffffff;
+        background: var(--cgc-live-active-bg, var(--error-color, #c62828));
+        color: var(--text-primary-color, #fff);
       }
 
       .preview-video-host {
@@ -4285,17 +4369,9 @@ class CameraGalleryCard extends LitElement {
         height: 100%;
         display: block;
         object-fit: cover;
+        pointer-events: auto;
       }
 
-      .live-dot {
-        width: 7px;
-        height: 7px;
-        border-radius: 999px;
-        background: #fff;
-        display: inline-block;
-        box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.75);
-        animation: livePulse 1.35s infinite;
-      }
 
 
       @keyframes livePulse {
@@ -4519,7 +4595,7 @@ class CameraGalleryCard extends LitElement {
         width: 100%;
         height: 28px;
         border: 0;
-        border-radius: 6px;
+        border-radius: var(--cgc-obj-btn-radius, 10px);
         padding: 0;
         background: var(--cgc-obj-btn-bg, var(--cgc-ui-bg));
         color: var(--cgc-obj-icon-color, var(--cgc-txt));
@@ -4623,7 +4699,7 @@ class CameraGalleryCard extends LitElement {
           var(--cgc-ts-b, 0),
           calc(var(--barOpacity, 45) / 100)
         );
-        color: #fff;
+        color: var(--cgc-tsbar-txt, #fff);
         font-size: 12px;
         font-weight: 700;
         display: flex;
@@ -4706,7 +4782,7 @@ class CameraGalleryCard extends LitElement {
         align-items: center;
         height: 30px;
         background: var(--cgc-ui-bg);
-        border-radius: 10px;
+        border-radius: var(--cgc-ctrl-radius, 10px);
         overflow: hidden;
         flex: 0 0 auto;
       }
@@ -4719,7 +4795,7 @@ class CameraGalleryCard extends LitElement {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        color: var(--cgc-txt2);
+        color: var(--cgc-ctrl-txt, var(--cgc-txt2));
         background: transparent;
         font-size: 13px;
         font-weight: 700;
@@ -4731,7 +4807,7 @@ class CameraGalleryCard extends LitElement {
       .segbtn.on {
         background: var(--primary-color, #2196f3);
         color: var(--text-primary-color, #fff);
-        border-radius: 8px;
+        border-radius: var(--cgc-ctrl-radius, 10px);
       }
 
       .datepill {
@@ -4739,7 +4815,7 @@ class CameraGalleryCard extends LitElement {
         align-items: center;
         height: 30px;
         background: var(--cgc-ui-bg);
-        border-radius: 10px;
+        border-radius: var(--cgc-ctrl-radius, 10px);
         overflow: hidden;
         flex: 1 1 auto;
         min-width: 0;
@@ -4750,7 +4826,7 @@ class CameraGalleryCard extends LitElement {
         height: 44px;
         border: 0;
         background: transparent;
-        color: var(--cgc-txt);
+        color: var(--cgc-ctrl-chevron, var(--cgc-txt));
         display: grid;
         place-items: center;
         cursor: pointer;
@@ -4770,7 +4846,7 @@ class CameraGalleryCard extends LitElement {
         align-items: center;
         justify-content: center;
         padding: 10px 14px;
-        color: var(--cgc-txt);
+        color: var(--cgc-ctrl-txt, var(--cgc-txt));
         font-size: 13px;
         font-weight: 800;
       }
@@ -4803,7 +4879,10 @@ class CameraGalleryCard extends LitElement {
         padding-bottom: 2px;
         overscroll-behavior-x: contain;
         overscroll-behavior-y: none;
+        scrollbar-width: none;
       }
+
+      .tthumbs.horizontal::-webkit-scrollbar { display: none; }
 
       .tthumbs.vertical {
         display: grid;
@@ -4819,7 +4898,10 @@ class CameraGalleryCard extends LitElement {
         overscroll-behavior-y: contain;
         overscroll-behavior-x: none;
         padding-right: 2px;
+        scrollbar-width: none;
       }
+
+      .tthumbs.vertical::-webkit-scrollbar { display: none; }
 
       .tthumbs.vertical .tthumb {
         width: 100%;
@@ -4883,7 +4965,7 @@ class CameraGalleryCard extends LitElement {
       }
 
       .tthumb.sel::after {
-        border: 2px solid rgba(255, 192, 203, 0.95);
+        border: 2px solid var(--primary-color, #2196f3);
       }
 
       .timg {
@@ -4913,21 +4995,17 @@ class CameraGalleryCard extends LitElement {
         -webkit-backdrop-filter: blur(6px);
         font-size: 11px;
         font-weight: 800;
-        color: var(--cgc-txt);
+        color: var(--cgc-tbar-txt, var(--cgc-txt));
         pointer-events: none;
         z-index: 2;
       }
 
       .tbar.bottom {
         bottom: 0;
-        border-bottom-left-radius: 14px;
-        border-bottom-right-radius: 14px;
       }
 
       .tbar.top {
         top: 0;
-        border-top-left-radius: 14px;
-        border-top-right-radius: 14px;
       }
 
       .tbar.hidden {
@@ -5050,8 +5128,8 @@ class CameraGalleryCard extends LitElement {
       }
 
       .bulkdelete {
-        background: rgba(255, 0, 0, 0.18);
-        border: 1px solid rgba(255, 0, 0, 0.35);
+        background: color-mix(in srgb, var(--error-color, #c62828) 18%, transparent);
+        border: 1px solid color-mix(in srgb, var(--error-color, #c62828) 35%, transparent);
       }
 
       @media (max-width: 700px) {
@@ -5265,7 +5343,7 @@ class CameraGalleryCard extends LitElement {
         justify-content: center;
         background: transparent;
         border: none;
-        color: #fff;
+        color: var(--cgc-tsbar-txt, #fff);
         cursor: pointer;
         pointer-events: auto;
         padding: 0;
@@ -5281,28 +5359,17 @@ class CameraGalleryCard extends LitElement {
         display: block;
       }
 
-      .pbackbtn-center {
-        position: absolute;
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        background: transparent;
-        border: none;
-        border-radius: 999px;
-        padding: 4px 12px;
-        color: #fff;
-        font-size: 11px;
-        font-weight: 800;
+      .tsbar-back-btn {
         cursor: pointer;
-        pointer-events: auto;
+        border: none;
       }
 
-      .pbackbtn-center ha-icon {
-        --mdc-icon-size: 24px;
-        width: 24px;
-        height: 24px;
+      .tsbar-back-btn ha-icon {
+        --ha-icon-size: 16px;
+        --mdc-icon-size: 16px;
+        width: 16px;
+        height: 16px;
+        display: block;
       }
 
       .thumb-menu-cancel {
@@ -5386,6 +5453,7 @@ window.customCards.push({
   name: "Camera Gallery Card",
   description:
     "Media gallery for Home Assistant (sensor fileList OR media_source folder) with optional live preview",
+  preview: true,
 });
 
 console.info(`Camera Gallery Card v${CARD_VERSION}`);

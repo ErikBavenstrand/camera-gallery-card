@@ -18,31 +18,58 @@ const DEFAULT_AUTOMUTED = true;
 
 const MAX_VISIBLE_OBJECT_FILTERS = AVAILABLE_OBJECT_FILTERS.length;
 
-const STYLE_COLOR_CONTROLS = [
+const STYLE_SECTIONS = [
   {
-    hostId: "bgcolor-host",
-    variable: "--cgc-card-bg",
-    label: "Card background",
+    id: "card",
+    label: "Card",
+    icon: "mdi:card-outline",
+    controls: [
+      { type: "color",  hostId: "bgcolor-host",     variable: "--cgc-card-bg",           label: "Background" },
+      { type: "color",  hostId: "bordercolor-host", variable: "--cgc-card-border-color", label: "Border color" },
+      { type: "radius", variable: "--r",             label: "Border radius", min: 0, max: 32, default: 10 },
+    ],
   },
   {
-    hostId: "iconcolor-host",
-    variable: "--cgc-obj-icon-color",
-    label: "Filter icon color",
+    id: "preview",
+    label: "Preview bar",
+    icon: "mdi:image-outline",
+    controls: [
+      { type: "color", hostId: "tsbar-txt-host", variable: "--cgc-tsbar-txt", label: "Bar text color" },
+      { type: "color", hostId: "pill-bg-host",   variable: "--cgc-pill-bg",   label: "Pill color" },
+    ],
   },
   {
-    hostId: "iconactive-host",
-    variable: "--cgc-obj-icon-active-color",
-    label: "Active filter icon",
+    id: "thumbs",
+    label: "Thumbnails",
+    icon: "mdi:view-grid-outline",
+    controls: [
+      { type: "color",  hostId: "tbarbg-host",   variable: "--cgc-tbar-bg",      label: "Bar background" },
+      { type: "color",  hostId: "tbar-txt-host", variable: "--cgc-tbar-txt",     label: "Bar text color" },
+      { type: "radius", variable: "--cgc-thumb-radius",   label: "Border radius", min: 0, max: 20, default: 10 },
+    ],
   },
   {
-    hostId: "btnactive-host",
-    variable: "--cgc-obj-btn-active-bg",
-    label: "Active filter background",
+    id: "filters",
+    label: "Filter buttons",
+    icon: "mdi:filter-outline",
+    controls: [
+      { type: "color",  hostId: "filterbg-host",   variable: "--cgc-obj-btn-bg",            label: "Background" },
+      { type: "color",  hostId: "iconcolor-host",  variable: "--cgc-obj-icon-color",        label: "Icon color" },
+      { type: "color",  hostId: "btnactive-host",  variable: "--cgc-obj-btn-active-bg",     label: "Active background" },
+      { type: "color",  hostId: "iconactive-host", variable: "--cgc-obj-icon-active-color", label: "Active icon color" },
+      { type: "radius", variable: "--cgc-obj-btn-radius", label: "Border radius", min: 0, max: 14, default: 10 },
+    ],
   },
   {
-    hostId: "bordercolor-host",
-    variable: "--cgc-card-border-color",
-    label: "Card border color",
+    id: "controls",
+    label: "Today / Date / Live",
+    icon: "mdi:calendar-outline",
+    controls: [
+      { type: "color",  hostId: "ctrl-txt-host",     variable: "--cgc-ctrl-txt",       label: "Text color" },
+      { type: "color",  hostId: "ctrl-chevron-host", variable: "--cgc-ctrl-chevron",   label: "Chevron color" },
+      { type: "color",  hostId: "live-active-host",  variable: "--cgc-live-active-bg", label: "Live active color" },
+      { type: "radius", variable: "--cgc-ctrl-radius", label: "Border radius", min: 0, max: 16, default: 10 },
+    ],
   },
 ];
 
@@ -79,6 +106,8 @@ class CameraGalleryCardEditor extends HTMLElement {
       entities: { open: false, items: [], index: -1 },
       mediasources: { open: false, items: [], index: -1 },
     };
+
+    this._openStyleSections = new Set();
   }
 
   _applyFieldValidation(id) {
@@ -834,12 +863,16 @@ class CameraGalleryCardEditor extends HTMLElement {
   }
 
   _bindColorControls() {
-    STYLE_COLOR_CONTROLS.forEach((item) => {
-      this._createColorPicker(
-        item.hostId,
-        item.variable,
-        this._getStyleVariableValue(item.variable)
-      );
+    STYLE_SECTIONS.forEach((section) => {
+      section.controls.forEach((ctrl) => {
+        if (ctrl.type === "color") {
+          this._createColorPicker(
+            ctrl.hostId,
+            ctrl.variable,
+            this._getStyleVariableValue(ctrl.variable)
+          );
+        }
+      });
     });
 
     this.shadowRoot.querySelectorAll("[data-reset]").forEach((btn) => {
@@ -866,6 +899,33 @@ class CameraGalleryCardEditor extends HTMLElement {
 
         this._fire();
         this._scheduleRender();
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("[data-radius]").forEach((slider) => {
+      const variable = slider.dataset.radius;
+      const safeId = variable.replace(/[^a-z0-9]/gi, "-");
+      const display = this.shadowRoot.getElementById("radius-val-" + safeId);
+
+      slider.addEventListener("input", (e) => {
+        if (display) display.textContent = e.target.value + "px";
+      });
+
+      slider.addEventListener("change", (e) => {
+        this._setStyleVariable(variable, e.target.value + "px");
+        this._fire();
+        this._scheduleRender();
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("details.style-section").forEach((det) => {
+      det.addEventListener("toggle", () => {
+        const id = det.id.replace("style-section-", "");
+        if (det.open) {
+          this._openStyleSections.add(id);
+        } else {
+          this._openStyleSections.delete(id);
+        }
       });
     });
   }
@@ -1028,7 +1088,7 @@ class CameraGalleryCardEditor extends HTMLElement {
       --ed-text: var(--primary-text-color, rgba(0,0,0,0.87));
       --ed-text2: var(--secondary-text-color, rgba(0,0,0,0.60));
 
-      --ed-section-bg: var(--secondary-background-color, rgba(0,0,0,0.03));
+      --ed-section-bg: var(--card-background-color, #fff);
       --ed-section-border: color-mix(
         in srgb,
         var(--divider-color, rgba(0,0,0,0.12)) 55%,
@@ -2504,6 +2564,73 @@ class CameraGalleryCardEditor extends HTMLElement {
           cursor: pointer;
         }
 
+        .style-sections {
+          display: grid;
+          gap: 8px;
+        }
+
+        .style-section {
+          border: 1px solid var(--ed-section-border);
+          border-radius: 12px;
+          overflow: hidden;
+          background: var(--ed-section-bg);
+        }
+
+        .style-section-head {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 12px 14px;
+          cursor: pointer;
+          list-style: none;
+          font-size: 13px;
+          font-weight: 800;
+          color: var(--ed-text);
+          user-select: none;
+        }
+
+        .style-section-head::-webkit-details-marker { display: none; }
+
+        .style-section-head ha-icon:first-child {
+          --mdc-icon-size: 18px;
+          color: var(--ed-text2);
+          flex: 0 0 auto;
+        }
+
+        .style-section-head > span {
+          flex: 1 1 auto;
+        }
+
+        .style-chevron {
+          --mdc-icon-size: 18px;
+          color: var(--ed-text2);
+          flex: 0 0 auto;
+          transition: transform 0.2s ease;
+        }
+
+        details[open] .style-chevron {
+          transform: rotate(180deg);
+        }
+
+        .style-section-body {
+          padding: 4px 14px 14px;
+          border-top: 1px solid var(--ed-section-border);
+        }
+
+        .radius-range {
+          width: 90px;
+          cursor: pointer;
+          accent-color: var(--primary-color, #03a9f4);
+        }
+
+        .radius-value {
+          font-size: 12px;
+          font-weight: 800;
+          color: var(--ed-text2);
+          min-width: 34px;
+          text-align: right;
+        }
+
         .browser-empty {
           display: grid;
           place-items: center;
@@ -2573,8 +2700,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "general"
               ? `
             <div class="tabpanel" data-panel="general">
-              ${panelHead("mdi:cog-outline", "General")}
-
               <div class="row">
                 <div class="lbl">Source mode</div>
                 <div class="segwrap">
@@ -2711,8 +2836,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "viewer"
               ? `
             <div class="tabpanel" data-panel="viewer">
-              ${panelHead("mdi:image-outline", "Viewer")}
-
               <div class="row">
                 <div class="subrows">
                   <div class="row-head">
@@ -2786,8 +2909,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "live"
               ? `
             <div class="tabpanel" data-panel="live">
-              ${panelHead("mdi:video-outline", "Live")}
-
               <div class="row ${liveControlsDisabled ? "muted" : ""}">
                 <div class="row-head">
                   <div class="lbl">Live preview</div>
@@ -2842,8 +2963,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "thumbs"
               ? `
             <div class="tabpanel" data-panel="thumbs">
-              ${panelHead("mdi:view-grid-outline", "Thumbnails")}
-
               <div class="row">
                 <div class="lbl">Thumbnail layout</div>
                 <div class="desc">Choose how thumbnails are displayed inside the card</div>
@@ -2965,39 +3084,68 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "styling"
               ? `
               <div class="tabpanel" data-panel="styling">
-                ${panelHead("mdi:palette-outline", "Styling")}
-
-                <div class="row">
-                  <div class="color-grid">
-                    ${STYLE_COLOR_CONTROLS.map(
-                      (item) => `
-                        <div class="color-row">
-                          <div class="lbl">${item.label}</div>
-
-                          <div class="color-controls">
-                            <div id="${item.hostId}"></div>
-
-                            <label class="color-transparent">
-                              <input
-                                type="checkbox"
-                                data-transparent="${item.variable}"
-                              >
-                              Transparent
-                            </label>
-
-                            <button
-                              type="button"
-                              class="color-reset"
-                              data-reset="${item.variable}"
-                              title="Reset to default"
-                            >
-                              <ha-icon icon="mdi:backup-restore"></ha-icon>
-                            </button>
-                          </div>
+                <div class="style-sections">
+                  ${STYLE_SECTIONS.map((section) => `
+                    <details
+                      class="style-section"
+                      id="style-section-${section.id}"
+                      ${this._openStyleSections.has(section.id) ? "open" : ""}
+                    >
+                      <summary class="style-section-head">
+                        <ha-icon icon="${section.icon}"></ha-icon>
+                        <span>${section.label}</span>
+                        <ha-icon class="style-chevron" icon="mdi:chevron-down"></ha-icon>
+                      </summary>
+                      <div class="style-section-body">
+                        <div class="color-grid">
+                          ${section.controls.map((ctrl) => {
+                            if (ctrl.type === "color") {
+                              return `
+                                <div class="color-row">
+                                  <div class="lbl">${ctrl.label}</div>
+                                  <div class="color-controls">
+                                    <div id="${ctrl.hostId}"></div>
+                                    <label class="color-transparent">
+                                      <input type="checkbox" data-transparent="${ctrl.variable}">
+                                      Transparent
+                                    </label>
+                                    <button type="button" class="color-reset" data-reset="${ctrl.variable}" title="Reset to default">
+                                      <ha-icon icon="mdi:backup-restore"></ha-icon>
+                                    </button>
+                                  </div>
+                                </div>
+                              `;
+                            }
+                            if (ctrl.type === "radius") {
+                              const raw = this._getStyleVariableValue(ctrl.variable);
+                              const val = raw ? parseInt(raw) : ctrl.default;
+                              const safeId = ctrl.variable.replace(/[^a-z0-9]/gi, "-");
+                              return `
+                                <div class="color-row">
+                                  <div class="lbl">${ctrl.label}</div>
+                                  <div class="color-controls">
+                                    <input
+                                      type="range"
+                                      class="radius-range"
+                                      data-radius="${ctrl.variable}"
+                                      min="${ctrl.min}"
+                                      max="${ctrl.max}"
+                                      value="${val}"
+                                    >
+                                    <span class="radius-value" id="radius-val-${safeId}">${val}px</span>
+                                    <button type="button" class="color-reset" data-reset="${ctrl.variable}" title="Reset to default">
+                                      <ha-icon icon="mdi:backup-restore"></ha-icon>
+                                    </button>
+                                  </div>
+                                </div>
+                              `;
+                            }
+                            return "";
+                          }).join("")}
                         </div>
-                      `
-                    ).join("")}
-                  </div>
+                      </div>
+                    </details>
+                  `).join("")}
                 </div>
               </div>
             `

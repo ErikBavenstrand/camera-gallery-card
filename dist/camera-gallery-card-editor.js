@@ -18,31 +18,58 @@ const DEFAULT_AUTOMUTED = true;
 
 const MAX_VISIBLE_OBJECT_FILTERS = AVAILABLE_OBJECT_FILTERS.length;
 
-const STYLE_COLOR_CONTROLS = [
+const STYLE_SECTIONS = [
   {
-    hostId: "bgcolor-host",
-    variable: "--cgc-card-bg",
-    label: "Card background",
+    id: "card",
+    label: "Card",
+    icon: "mdi:card-outline",
+    controls: [
+      { type: "color",  hostId: "bgcolor-host",     variable: "--cgc-card-bg",           label: "Background" },
+      { type: "color",  hostId: "bordercolor-host", variable: "--cgc-card-border-color", label: "Border color" },
+      { type: "radius", variable: "--r",             label: "Border radius", min: 0, max: 32, default: 10 },
+    ],
   },
   {
-    hostId: "iconcolor-host",
-    variable: "--cgc-obj-icon-color",
-    label: "Filter icon color",
+    id: "preview",
+    label: "Preview bar",
+    icon: "mdi:image-outline",
+    controls: [
+      { type: "color", hostId: "tsbar-txt-host", variable: "--cgc-tsbar-txt", label: "Bar text color" },
+      { type: "color", hostId: "pill-bg-host",   variable: "--cgc-pill-bg",   label: "Pill color" },
+    ],
   },
   {
-    hostId: "iconactive-host",
-    variable: "--cgc-obj-icon-active-color",
-    label: "Active filter icon",
+    id: "thumbs",
+    label: "Thumbnails",
+    icon: "mdi:view-grid-outline",
+    controls: [
+      { type: "color",  hostId: "tbarbg-host",   variable: "--cgc-tbar-bg",      label: "Bar background" },
+      { type: "color",  hostId: "tbar-txt-host", variable: "--cgc-tbar-txt",     label: "Bar text color" },
+      { type: "radius", variable: "--cgc-thumb-radius",   label: "Border radius", min: 0, max: 20, default: 10 },
+    ],
   },
   {
-    hostId: "btnactive-host",
-    variable: "--cgc-obj-btn-active-bg",
-    label: "Active filter background",
+    id: "filters",
+    label: "Filter buttons",
+    icon: "mdi:filter-outline",
+    controls: [
+      { type: "color",  hostId: "filterbg-host",   variable: "--cgc-obj-btn-bg",            label: "Background" },
+      { type: "color",  hostId: "iconcolor-host",  variable: "--cgc-obj-icon-color",        label: "Icon color" },
+      { type: "color",  hostId: "btnactive-host",  variable: "--cgc-obj-btn-active-bg",     label: "Active background" },
+      { type: "color",  hostId: "iconactive-host", variable: "--cgc-obj-icon-active-color", label: "Active icon color" },
+      { type: "radius", variable: "--cgc-obj-btn-radius", label: "Border radius", min: 0, max: 14, default: 10 },
+    ],
   },
   {
-    hostId: "bordercolor-host",
-    variable: "--cgc-card-border-color",
-    label: "Card border color",
+    id: "controls",
+    label: "Today / Date / Live",
+    icon: "mdi:calendar-outline",
+    controls: [
+      { type: "color",  hostId: "ctrl-txt-host",     variable: "--cgc-ctrl-txt",       label: "Text color" },
+      { type: "color",  hostId: "ctrl-chevron-host", variable: "--cgc-ctrl-chevron",   label: "Chevron color" },
+      { type: "color",  hostId: "live-active-host",  variable: "--cgc-live-active-bg", label: "Live active color" },
+      { type: "radius", variable: "--cgc-ctrl-radius", label: "Border radius", min: 0, max: 16, default: 10 },
+    ],
   },
 ];
 
@@ -79,6 +106,8 @@ class CameraGalleryCardEditor extends HTMLElement {
       entities: { open: false, items: [], index: -1 },
       mediasources: { open: false, items: [], index: -1 },
     };
+
+    this._openStyleSections = new Set();
   }
 
   _applyFieldValidation(id) {
@@ -834,12 +863,16 @@ class CameraGalleryCardEditor extends HTMLElement {
   }
 
   _bindColorControls() {
-    STYLE_COLOR_CONTROLS.forEach((item) => {
-      this._createColorPicker(
-        item.hostId,
-        item.variable,
-        this._getStyleVariableValue(item.variable)
-      );
+    STYLE_SECTIONS.forEach((section) => {
+      section.controls.forEach((ctrl) => {
+        if (ctrl.type === "color") {
+          this._createColorPicker(
+            ctrl.hostId,
+            ctrl.variable,
+            this._getStyleVariableValue(ctrl.variable)
+          );
+        }
+      });
     });
 
     this.shadowRoot.querySelectorAll("[data-reset]").forEach((btn) => {
@@ -866,6 +899,33 @@ class CameraGalleryCardEditor extends HTMLElement {
 
         this._fire();
         this._scheduleRender();
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("[data-radius]").forEach((slider) => {
+      const variable = slider.dataset.radius;
+      const safeId = variable.replace(/[^a-z0-9]/gi, "-");
+      const display = this.shadowRoot.getElementById("radius-val-" + safeId);
+
+      slider.addEventListener("input", (e) => {
+        if (display) display.textContent = e.target.value + "px";
+      });
+
+      slider.addEventListener("change", (e) => {
+        this._setStyleVariable(variable, e.target.value + "px");
+        this._fire();
+        this._scheduleRender();
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("details.style-section").forEach((det) => {
+      det.addEventListener("toggle", () => {
+        const id = det.id.replace("style-section-", "");
+        if (det.open) {
+          this._openStyleSections.add(id);
+        } else {
+          this._openStyleSections.delete(id);
+        }
       });
     });
   }
@@ -930,6 +990,7 @@ class CameraGalleryCardEditor extends HTMLElement {
       c.object_filters || []
     );
     const selectedCount = objectFiltersArr.length;
+    const objectColors = (typeof c.object_colors === "object" && c.object_colors !== null) ? c.object_colors : {};
 
     const height = Number(c.preview_height) || 320;
     const thumbSize = Number(c.thumb_size) || 140;
@@ -1027,7 +1088,7 @@ class CameraGalleryCardEditor extends HTMLElement {
       --ed-text: var(--primary-text-color, rgba(0,0,0,0.87));
       --ed-text2: var(--secondary-text-color, rgba(0,0,0,0.60));
 
-      --ed-section-bg: var(--secondary-background-color, rgba(0,0,0,0.03));
+      --ed-section-bg: var(--card-background-color, #fff);
       --ed-section-border: color-mix(
         in srgb,
         var(--divider-color, rgba(0,0,0,0.12)) 55%,
@@ -1409,6 +1470,7 @@ class CameraGalleryCardEditor extends HTMLElement {
           border: 1px solid var(--ed-section-border);
           display: grid;
           gap: 14px;
+          align-content: start;
           box-shadow: var(--ed-section-glow);
           min-height: 420px;
           box-sizing: border-box;
@@ -1989,7 +2051,7 @@ class CameraGalleryCardEditor extends HTMLElement {
 
         .chip-grid {
           display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-columns: repeat(2, minmax(0, 1fr));
           gap: 10px;
           margin-top: 4px;
         }
@@ -2011,12 +2073,8 @@ class CameraGalleryCardEditor extends HTMLElement {
             background 0.18s ease,
             border-color 0.18s ease,
             color 0.18s ease,
-            transform 0.18s ease,
             box-shadow 0.18s ease;
           box-sizing: border-box;
-          font-size: 13px;
-          font-weight: 900;
-          text-align: left;
           box-shadow: var(--ed-section-glow);
         }
 
@@ -2070,32 +2128,38 @@ class CameraGalleryCardEditor extends HTMLElement {
         }
 
         .objchip-check {
-          width: 18px;
-          height: 18px;
-          opacity: 0;
-          transform: scale(0.8);
-          transition:
-            opacity 0.16s ease,
-            transform 0.16s ease;
-          color: inherit;
+          display: none;
+        }
+
+        .objchip ha-checkbox {
+          --mdc-checkbox-unchecked-color: var(--ed-chip-border);
+          pointer-events: none;
+          justify-self: end;
         }
 
         /* Nieuwe styles voor custom filters */
         .custom-filter-add {
-          display: grid;
-          grid-template-columns: 1fr 1fr auto;
+          display: flex;
+          flex-direction: column;
           gap: 8px;
-          align-items: end;
           margin-top: 16px;
-          padding: 12px;
-          background: var(--ed-input-bg);
-          border-radius: var(--ed-radius-input);
-          border: 1px dashed var(--ed-input-border);
+        }
+
+        .custom-filter-add ha-textfield,
+        .custom-filter-add ha-icon-picker {
+          width: 100%;
+          display: block;
+        }
+
+        .custom-filter-add .actionbtn {
+          width: 100%;
+          justify-content: center;
         }
 
         .custom-filter-list {
-          display: grid;
-          gap: 8px;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
           margin-top: 12px;
         }
 
@@ -2103,16 +2167,25 @@ class CameraGalleryCardEditor extends HTMLElement {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 8px 12px;
+          padding: 4px 8px 4px 12px;
           background: var(--ed-row-bg);
           border: 1px solid var(--ed-row-border);
           border-radius: 10px;
+          min-height: 48px;
         }
 
         .custom-item-info {
           display: flex;
           align-items: center;
           gap: 12px;
+          font-size: 14px;
+          font-weight: 500;
+          color: var(--ed-text);
+        }
+
+        .custom-item-info ha-icon {
+          --mdc-icon-size: 20px;
+          color: var(--primary-color);
         }
 
         .remove-btn {
@@ -2120,18 +2193,45 @@ class CameraGalleryCardEditor extends HTMLElement {
           cursor: pointer;
           background: none;
           border: none;
-          padding: 4px;
+          padding: 8px;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
         }
 
-        .objchip.on .objchip-check {
-          opacity: 1;
-          transform: scale(1);
+        .remove-btn:hover {
+          background: color-mix(in srgb, var(--ed-invalid) 12%, transparent);
         }
 
-        .objchip-check ha-icon {
+        .remove-btn ha-icon {
           --mdc-icon-size: 18px;
-          width: 18px;
-          height: 18px;
+        }
+
+
+        .objchip-color {
+          display: flex;
+          align-items: center;
+          justify-self: center;
+          gap: 4px;
+        }
+
+        .objchip-color .cgc-color {
+          width: 26px;
+          height: 22px;
+          min-width: 26px;
+          flex: 0 0 26px;
+        }
+
+        .objchip-color .color-reset {
+          width: 16px;
+          height: 16px;
+          margin-left: 0;
+        }
+
+        .objchip-color .color-reset ha-icon {
+          --mdc-icon-size: 13px;
         }
 
         .cgc-color {
@@ -2464,6 +2564,73 @@ class CameraGalleryCardEditor extends HTMLElement {
           cursor: pointer;
         }
 
+        .style-sections {
+          display: grid;
+          gap: 8px;
+        }
+
+        .style-section {
+          border: 1px solid var(--ed-section-border);
+          border-radius: 12px;
+          overflow: hidden;
+          background: var(--ed-section-bg);
+        }
+
+        .style-section-head {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 12px 14px;
+          cursor: pointer;
+          list-style: none;
+          font-size: 13px;
+          font-weight: 800;
+          color: var(--ed-text);
+          user-select: none;
+        }
+
+        .style-section-head::-webkit-details-marker { display: none; }
+
+        .style-section-head ha-icon:first-child {
+          --mdc-icon-size: 18px;
+          color: var(--ed-text2);
+          flex: 0 0 auto;
+        }
+
+        .style-section-head > span {
+          flex: 1 1 auto;
+        }
+
+        .style-chevron {
+          --mdc-icon-size: 18px;
+          color: var(--ed-text2);
+          flex: 0 0 auto;
+          transition: transform 0.2s ease;
+        }
+
+        details[open] .style-chevron {
+          transform: rotate(180deg);
+        }
+
+        .style-section-body {
+          padding: 4px 14px 14px;
+          border-top: 1px solid var(--ed-section-border);
+        }
+
+        .radius-range {
+          width: 90px;
+          cursor: pointer;
+          accent-color: var(--primary-color, #03a9f4);
+        }
+
+        .radius-value {
+          font-size: 12px;
+          font-weight: 800;
+          color: var(--ed-text2);
+          min-width: 34px;
+          text-align: right;
+        }
+
         .browser-empty {
           display: grid;
           place-items: center;
@@ -2515,9 +2682,7 @@ class CameraGalleryCardEditor extends HTMLElement {
             width: 100%;
           }
 
-          .chip-grid {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-          }
+
         }
       </style>
 
@@ -2535,8 +2700,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "general"
               ? `
             <div class="tabpanel" data-panel="general">
-              ${panelHead("mdi:cog-outline", "General")}
-
               <div class="row">
                 <div class="lbl">Source mode</div>
                 <div class="segwrap">
@@ -2673,8 +2836,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "viewer"
               ? `
             <div class="tabpanel" data-panel="viewer">
-              ${panelHead("mdi:image-outline", "Viewer")}
-
               <div class="row">
                 <div class="subrows">
                   <div class="row-head">
@@ -2695,7 +2856,7 @@ class CameraGalleryCardEditor extends HTMLElement {
 
               <div class="row">
                 <div class="lbl">Height</div>
-                <ha-textfield id="height" label="Height" type="number"></ha-textfield>
+                <ha-textfield id="height" label="Height" type="number" suffix="px"></ha-textfield>
               </div>
 
               <div class="row">
@@ -2748,8 +2909,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "live"
               ? `
             <div class="tabpanel" data-panel="live">
-              ${panelHead("mdi:video-outline", "Live")}
-
               <div class="row ${liveControlsDisabled ? "muted" : ""}">
                 <div class="row-head">
                   <div class="lbl">Live preview</div>
@@ -2804,12 +2963,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "thumbs"
               ? `
             <div class="tabpanel" data-panel="thumbs">
-              ${panelHead(
-                "mdi:view-grid-outline",
-                "Thumbnails",
-                "Control thumbnail layout, sizing, bar position, and which object filters are available."
-              )}
-
               <div class="row">
                 <div class="lbl">Thumbnail layout</div>
                 <div class="desc">Choose how thumbnails are displayed inside the card</div>
@@ -2826,6 +2979,7 @@ class CameraGalleryCardEditor extends HTMLElement {
                   id="thumb"
                   label="Thumbnail size"
                   type="number"
+                  suffix="px"
                 ></ha-textfield>
               </div>
 
@@ -2836,6 +2990,7 @@ class CameraGalleryCardEditor extends HTMLElement {
                   id="maxmedia"
                   label="Maximum thumbnails shown"
                   type="number"
+                  suffix="items"
                 ></ha-textfield>
               </div>
 
@@ -2860,6 +3015,8 @@ class CameraGalleryCardEditor extends HTMLElement {
                   ${AVAILABLE_OBJECT_FILTERS
                     .map((obj) => {
                       const isOn = objectFiltersArr.includes(obj);
+                      const currentColor = objectColors[obj] || "";
+                      const colorVal = currentColor && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(currentColor) ? currentColor : "#ffffff";
                       return `
                       <button
                         type="button"
@@ -2868,12 +3025,12 @@ class CameraGalleryCardEditor extends HTMLElement {
                         title="${this._objectLabel(obj)}"
                       >
                         <span class="objchip-icon">
-                          <ha-icon icon="${this._objectIcon(obj)}"></ha-icon>
+                          <ha-icon icon="${this._objectIcon(obj)}" style="${currentColor ? "color:" + currentColor : ""}"></ha-icon>
                         </span>
-                        <span class="objchip-label">${this._objectLabel(obj)}</span>
-                        <span class="objchip-check">
-                          <ha-icon icon="mdi:check"></ha-icon>
+                        <span class="objchip-color">
+                          <input type="color" class="cgc-color" value="${colorVal}" style="${!currentColor ? "opacity:0.35" : ""}" data-filtercolor="${obj}">
                         </span>
+                        <ha-checkbox ${isOn ? "checked" : ""} tabindex="-1" style="pointer-events:none;"></ha-checkbox>
                       </button>
                     `;
                     })
@@ -2886,9 +3043,10 @@ class CameraGalleryCardEditor extends HTMLElement {
                   
                   <div class="custom-filter-add">
                     <ha-textfield id="new-filter-name" label="Name" placeholder="e.g. parcel"></ha-textfield>
-                    <ha-textfield id="new-filter-icon" label="Icon" placeholder="mdi:package"></ha-textfield>
+                    <ha-icon-picker id="new-filter-icon" label="Icon"></ha-icon-picker>
                     <button class="actionbtn" id="add-filter-btn">
                       <ha-icon icon="mdi:plus"></ha-icon>
+                      Add filter
                     </button>
                   </div>
 
@@ -2896,15 +3054,20 @@ class CameraGalleryCardEditor extends HTMLElement {
                   ${objectFiltersArr.filter(f => typeof f === 'object').map((f, index) => {
                     const name = Object.keys(f)[0];
                     const icon = f[name];
+                    const currentColor = objectColors[name] || "";
+                    const colorVal = currentColor && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(currentColor) ? currentColor : "#ffffff";
                     return `
                       <div class="custom-item">
                         <div class="custom-item-info">
-                          <ha-icon icon="${icon}"></ha-icon>
+                          <ha-icon icon="${icon}" style="${currentColor ? "color:" + currentColor : ""}"></ha-icon>
                           <span class="lbl">${this._objectLabel(name)}</span>
                         </div>
-                        <button class="remove-btn" data-remove-index="${name}">
-                          <ha-icon icon="mdi:delete-outline"></ha-icon>
-                        </button>
+                        <div class="color-controls">
+                          <input type="color" class="cgc-color" value="${colorVal}" style="${!currentColor ? "opacity:0.35" : ""}" data-filtercolor="${name}">
+                          <button class="remove-btn" data-remove-index="${name}">
+                            <ha-icon icon="mdi:delete-outline"></ha-icon>
+                          </button>
+                        </div>
                       </div>
                     `;
                   }).join('')}
@@ -2921,42 +3084,68 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "styling"
               ? `
               <div class="tabpanel" data-panel="styling">
-                ${panelHead(
-                  "mdi:palette-outline",
-                  "Styling"
-                )}
-
-                <div class="row">
-                  <div class="color-grid">
-                    ${STYLE_COLOR_CONTROLS.map(
-                      (item) => `
-                        <div class="color-row">
-                          <div class="lbl">${item.label}</div>
-
-                          <div class="color-controls">
-                            <div id="${item.hostId}"></div>
-
-                            <label class="color-transparent">
-                              <input
-                                type="checkbox"
-                                data-transparent="${item.variable}"
-                              >
-                              Transparent
-                            </label>
-
-                            <button
-                              type="button"
-                              class="color-reset"
-                              data-reset="${item.variable}"
-                              title="Reset to default"
-                            >
-                              <ha-icon icon="mdi:backup-restore"></ha-icon>
-                            </button>
-                          </div>
+                <div class="style-sections">
+                  ${STYLE_SECTIONS.map((section) => `
+                    <details
+                      class="style-section"
+                      id="style-section-${section.id}"
+                      ${this._openStyleSections.has(section.id) ? "open" : ""}
+                    >
+                      <summary class="style-section-head">
+                        <ha-icon icon="${section.icon}"></ha-icon>
+                        <span>${section.label}</span>
+                        <ha-icon class="style-chevron" icon="mdi:chevron-down"></ha-icon>
+                      </summary>
+                      <div class="style-section-body">
+                        <div class="color-grid">
+                          ${section.controls.map((ctrl) => {
+                            if (ctrl.type === "color") {
+                              return `
+                                <div class="color-row">
+                                  <div class="lbl">${ctrl.label}</div>
+                                  <div class="color-controls">
+                                    <div id="${ctrl.hostId}"></div>
+                                    <label class="color-transparent">
+                                      <input type="checkbox" data-transparent="${ctrl.variable}">
+                                      Transparent
+                                    </label>
+                                    <button type="button" class="color-reset" data-reset="${ctrl.variable}" title="Reset to default">
+                                      <ha-icon icon="mdi:backup-restore"></ha-icon>
+                                    </button>
+                                  </div>
+                                </div>
+                              `;
+                            }
+                            if (ctrl.type === "radius") {
+                              const raw = this._getStyleVariableValue(ctrl.variable);
+                              const val = raw ? parseInt(raw) : ctrl.default;
+                              const safeId = ctrl.variable.replace(/[^a-z0-9]/gi, "-");
+                              return `
+                                <div class="color-row">
+                                  <div class="lbl">${ctrl.label}</div>
+                                  <div class="color-controls">
+                                    <input
+                                      type="range"
+                                      class="radius-range"
+                                      data-radius="${ctrl.variable}"
+                                      min="${ctrl.min}"
+                                      max="${ctrl.max}"
+                                      value="${val}"
+                                    >
+                                    <span class="radius-value" id="radius-val-${safeId}">${val}px</span>
+                                    <button type="button" class="color-reset" data-reset="${ctrl.variable}" title="Reset to default">
+                                      <ha-icon icon="mdi:backup-restore"></ha-icon>
+                                    </button>
+                                  </div>
+                                </div>
+                              `;
+                            }
+                            return "";
+                          }).join("")}
                         </div>
-                      `
-                    ).join("")}
-                  </div>
+                      </div>
+                    </details>
+                  `).join("")}
                 </div>
               </div>
             `
@@ -2975,6 +3164,7 @@ class CameraGalleryCardEditor extends HTMLElement {
         const addBtn = $("add-filter-btn");
         const nameInput = $("new-filter-name");
         const iconInput = $("new-filter-icon");
+        if (iconInput && this._hass) iconInput.hass = this._hass;
 
         // 2. Maak een herbruikbare functie voor het toevoegen
         const handleAddFilter = () => {
@@ -2998,14 +3188,9 @@ class CameraGalleryCardEditor extends HTMLElement {
         // 3. Koppel de Click listener aan de knop
         addBtn?.addEventListener("click", handleAddFilter);
 
-        // 4. Koppel Enter-toets aan beide invoervelden
-        [nameInput, iconInput].forEach(el => {
-          el?.addEventListener("keydown", (e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              handleAddFilter();
-            }
-          });
+        // 4. Enter op naam-veld voegt toe; ha-icon-picker gebruikt value-changed (geen keydown)
+        nameInput?.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); handleAddFilter(); }
         });
 
     // Filter verwijderen
@@ -3020,6 +3205,16 @@ class CameraGalleryCardEditor extends HTMLElement {
         });
 
         this._set("object_filters", nextFilters);
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("[data-filtercolor]").forEach(input => {
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("change", (e) => {
+        e.stopPropagation();
+        const name = input.dataset.filtercolor;
+        const colors = { ...(this._config.object_colors || {}), [name]: e.target.value };
+        this._set("object_colors", colors);
       });
     });
 
