@@ -1215,25 +1215,6 @@ class CameraGalleryCard extends LitElement {
       <div class="live-stage">
         ${this._renderLiveCardHost()}
 
-        <div class="live-ctrl-bar">
-          <button
-            class="live-ctrl-btn"
-            @click=${() => this._toggleLiveMute()}
-            title="${this._liveMuted ? "Unmute" : "Mute"}"
-            aria-label="${this._liveMuted ? "Unmute" : "Mute"}"
-          >
-            <ha-icon icon="${this._liveMuted ? "mdi:volume-off" : "mdi:volume-high"}"></ha-icon>
-          </button>
-          <button
-            class="live-ctrl-btn"
-            @click=${() => this._toggleLiveFullscreen()}
-            title="${this._liveFullscreen ? "Exit fullscreen" : "Fullscreen"}"
-            aria-label="${this._liveFullscreen ? "Exit fullscreen" : "Fullscreen"}"
-          >
-            <ha-icon icon="${this._liveFullscreen ? "mdi:fullscreen-exit" : "mdi:fullscreen"}"></ha-icon>
-          </button>
-        </div>
-
         ${this._renderLivePicker()}
       </div>
     `;
@@ -3894,11 +3875,19 @@ class CameraGalleryCard extends LitElement {
                   <button class="tspill tspill-left tsbar-back-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._setViewMode("media"); this._previewOpen = false; this.requestUpdate(); }}>
                     <ha-icon icon="mdi:arrow-left"></ha-icon>
                   </button>
-                  ${this._getLiveCameraOptions().length > 1 ? html`
-                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openLivePicker(); }}>
-                      <ha-icon icon="mdi:video-switch"></ha-icon>
+                  <div class="tsbar-live-center">
+                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveMute(); }} title="${this._liveMuted ? "Unmute" : "Mute"}">
+                      <ha-icon icon="${this._liveMuted ? "mdi:volume-off" : "mdi:volume-high"}"></ha-icon>
                     </button>
-                  ` : html``}
+                    ${this._getLiveCameraOptions().length > 1 ? html`
+                      <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openLivePicker(); }}>
+                        <ha-icon icon="mdi:video-switch"></ha-icon>
+                      </button>
+                    ` : html``}
+                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveFullscreen(); }} title="${this._liveFullscreen ? "Exit fullscreen" : "Fullscreen"}">
+                      <ha-icon icon="${this._liveFullscreen ? "mdi:fullscreen-exit" : "mdi:fullscreen"}"></ha-icon>
+                    </button>
+                  </div>
                   <div class="tspill">
                     <span class="tspill-val">${this._friendlyCameraName(this._getEffectiveLiveCamera())}</span>
                   </div>
@@ -4415,34 +4404,6 @@ class CameraGalleryCard extends LitElement {
         width: 100% !important;
         height: 100% !important;
         object-fit: cover !important;
-      }
-
-      .live-ctrl-bar {
-        position: absolute;
-        bottom: 10px;
-        right: 10px;
-        display: flex;
-        gap: 6px;
-        z-index: 20;
-      }
-
-      .live-ctrl-btn {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 36px;
-        height: 36px;
-        border: none;
-        border-radius: 50%;
-        background: rgba(0, 0, 0, 0.45);
-        color: #fff;
-        cursor: pointer;
-        padding: 0;
-        transition: background 0.15s;
-      }
-
-      .live-ctrl-btn:hover {
-        background: rgba(0, 0, 0, 0.65);
       }
 
       .segbtn.livebtn {
@@ -5429,10 +5390,16 @@ class CameraGalleryCard extends LitElement {
         padding: 0 12px 12px;
       }
 
-      .tsbar-cam-btn {
+      .tsbar-live-center {
         position: absolute;
         left: 50%;
         transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .tsbar-cam-btn {
         display: flex;
         align-items: center;
         justify-content: center;
