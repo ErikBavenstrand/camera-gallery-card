@@ -199,10 +199,11 @@ class CameraGalleryCard extends LitElement {
     this._thumbMenuOpenedAt = 0;
     this._viewMode = "media";
     this._liveSelectedCamera = "";
-    this._liveMuted = true;
+    this._liveMuted = false;
     this._liveFullscreen = false;
     this._onFullscreenChange = () => {
       this._liveFullscreen = !!document.fullscreenElement;
+      this.toggleAttribute("data-live-fs", this._liveFullscreen);
     };
 
     this._ms = {
@@ -1123,12 +1124,25 @@ class CameraGalleryCard extends LitElement {
   }
 
   async _toggleLiveFullscreen() {
-    const stage = this.renderRoot?.querySelector(".live-stage");
-    if (!stage) return;
     if (!document.fullscreenElement) {
-      await stage.requestFullscreen().catch(() => {});
+      await this.requestFullscreen().catch(() => {});
     } else {
       await document.exitFullscreen().catch(() => {});
+    }
+  }
+
+  _syncLiveMuted() {
+    const trySync = () => {
+      const video = this._findLiveVideo();
+      if (video) {
+        this._liveMuted = video.muted;
+        return true;
+      }
+      return false;
+    };
+    if (!trySync()) {
+      const t1 = setTimeout(() => { if (!trySync()) setTimeout(() => trySync(), 1500); }, 500);
+      void t1;
     }
   }
 
@@ -1148,6 +1162,7 @@ class CameraGalleryCard extends LitElement {
 
     card.hass = this._hass;
     this._injectLiveFillStyle(card);
+    this._syncLiveMuted();
   }
 
   _injectLiveFillStyle(card) {
@@ -4335,6 +4350,29 @@ class CameraGalleryCard extends LitElement {
         position: relative;
       }
 
+      :host(:fullscreen) .root,
+      :host([data-live-fs]) .root {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        background: #000;
+      }
+
+      :host(:fullscreen) .panel,
+      :host([data-live-fs]) .panel {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+      }
+
+      :host(:fullscreen) .preview,
+      :host([data-live-fs]) .preview {
+        flex: 1 !important;
+        height: auto !important;
+        min-height: 0;
+      }
+
       .panel {
         background: var(--cgc-card-bg, var(--card-background-color, #fff));
         border: 1px solid
@@ -5396,7 +5434,7 @@ class CameraGalleryCard extends LitElement {
         transform: translateX(-50%);
         display: flex;
         align-items: center;
-        gap: 4px;
+        gap: 10px;
       }
 
       .tsbar-cam-btn {
@@ -5409,15 +5447,15 @@ class CameraGalleryCard extends LitElement {
         cursor: pointer;
         pointer-events: auto;
         padding: 0;
-        height: 22px;
-        width: 22px;
+        height: 28px;
+        width: 28px;
       }
 
       .tsbar-cam-btn ha-icon {
-        --ha-icon-size: 18px;
-        --mdc-icon-size: 18px;
-        width: 18px;
-        height: 18px;
+        --ha-icon-size: 22px;
+        --mdc-icon-size: 22px;
+        width: 22px;
+        height: 22px;
         display: block;
       }
 
