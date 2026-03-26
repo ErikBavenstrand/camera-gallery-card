@@ -2,7 +2,7 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "1.9.1";
+const CARD_VERSION = "1.9.2";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
@@ -129,11 +129,14 @@ class CameraGalleryCard extends LitElement {
       _thumbMenuItem: { type: Object },
       _thumbMenuOpen: { type: Boolean },
       _viewMode: { type: String }, // "media" | "live"
+      _liveMuted: { type: Boolean },
+      _liveFullscreen: { type: Boolean },
     };
   }
 
   static async getConfigElement() {
-    await import("/local/camera-gallery-card/camera-gallery-card-editor.js");
+    const editorUrl = new URL("camera-gallery-card-editor.js", import.meta.url).href;
+    await import(editorUrl);
     return document.createElement("camera-gallery-card-editor");
   }
 
@@ -197,6 +200,9 @@ class CameraGalleryCard extends LitElement {
     this._thumbMenuOpenedAt = 0;
     this._viewMode = "media";
     this._liveSelectedCamera = "";
+    this._liveMuted = false;
+    this._liveFullscreen = false;
+    this._onFullscreenChange = () => {};
 
     this._ms = {
       key: "",
@@ -220,8 +226,16 @@ class CameraGalleryCard extends LitElement {
     this._observedThumbs = new WeakSet();
   }
 
+  connectedCallback() {
+    super.connectedCallback();
+    document.addEventListener("fullscreenchange", this._onFullscreenChange);
+  }
+
   disconnectedCallback() {
     super.disconnectedCallback();
+
+    document.removeEventListener("fullscreenchange", this._onFullscreenChange);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 
     if (this._liveQuickSwitchTimer) clearTimeout(this._liveQuickSwitchTimer);
     if (this._navHideT) clearTimeout(this._navHideT);
@@ -1083,6 +1097,60 @@ class CameraGalleryCard extends LitElement {
     this.requestUpdate();
   }
 
+  _findLiveVideo() {
+    const host = this.renderRoot?.querySelector("#live-card-host");
+    if (!host) return null;
+    const search = (root) => {
+      const video = root.querySelector("video");
+      if (video) return video;
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) {
+          const found = search(el.shadowRoot);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    return search(host);
+  }
+
+  _toggleLiveMute() {
+    const video = this._findLiveVideo();
+    if (!video) {
+      console.warn("[CGC] mute: geen video element gevonden in shadow DOM");
+      return;
+    }
+    video.muted = !video.muted;
+    this._liveMuted = video.muted;
+  }
+
+  _toggleLiveFullscreen() {
+    this._liveFullscreen = !this._liveFullscreen;
+    this.toggleAttribute("data-live-fs", this._liveFullscreen);
+  }
+
+  _syncLiveMuted() {
+    const trySync = () => {
+      const video = this._findLiveVideo();
+      if (video) {
+        this._liveMuted = video.muted;
+        return true;
+      }
+      return false;
+    };
+    if (!trySync()) {
+      setTimeout(() => {
+        if (!trySync()) {
+          setTimeout(() => {
+            if (!trySync()) {
+              setTimeout(() => trySync(), 3000);
+            }
+          }, 2000);
+        }
+      }, 1000);
+    }
+  }
+
   async _mountLiveCard() {
     if (!this._isLiveActive()) return;
 
@@ -1099,6 +1167,7 @@ class CameraGalleryCard extends LitElement {
 
     card.hass = this._hass;
     this._injectLiveFillStyle(card);
+    this._syncLiveMuted();
   }
 
   _injectLiveFillStyle(card) {
@@ -3826,11 +3895,19 @@ class CameraGalleryCard extends LitElement {
                   <button class="tspill tspill-left tsbar-back-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._setViewMode("media"); this._previewOpen = false; this.requestUpdate(); }}>
                     <ha-icon icon="mdi:arrow-left"></ha-icon>
                   </button>
-                  ${this._getLiveCameraOptions().length > 1 ? html`
-                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openLivePicker(); }}>
-                      <ha-icon icon="mdi:video-switch"></ha-icon>
+                  <div class="tsbar-live-center">
+                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveMute(); }} title="${this._liveMuted ? "Unmute" : "Mute"}">
+                      <ha-icon icon="${this._liveMuted ? "mdi:volume-off" : "mdi:volume-high"}"></ha-icon>
                     </button>
-                  ` : html``}
+                    ${this._getLiveCameraOptions().length > 1 ? html`
+                      <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openLivePicker(); }}>
+                        <ha-icon icon="mdi:video-switch"></ha-icon>
+                      </button>
+                    ` : html``}
+                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveFullscreen(); }} title="${this._liveFullscreen ? "Exit fullscreen" : "Fullscreen"}">
+                      <ha-icon icon="${this._liveFullscreen ? "mdi:fullscreen-exit" : "mdi:fullscreen"}"></ha-icon>
+                    </button>
+                  </div>
                   <div class="tspill">
                     <span class="tspill-val">${this._friendlyCameraName(this._getEffectiveLiveCamera())}</span>
                   </div>
@@ -4278,6 +4355,44 @@ class CameraGalleryCard extends LitElement {
         position: relative;
       }
 
+      :host([data-live-fs]) {
+        position: fixed !important;
+        inset: 0 !important;
+        z-index: 9999 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+      }
+
+      :host([data-live-fs]) .root {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        background: #000;
+      }
+
+      :host([data-live-fs]) .panel {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        border-radius: 0 !important;
+      }
+
+      :host([data-live-fs]) .preview {
+        flex: 1 !important;
+        height: auto !important;
+        min-height: 0;
+        border-radius: 0 !important;
+      }
+
+      :host([data-live-fs]) .divider,
+      :host([data-live-fs]) .objfilters,
+      :host([data-live-fs]) .tthumbs,
+      :host([data-live-fs]) .datepill,
+      :host([data-live-fs]) .seg {
+        display: none !important;
+      }
+
       .panel {
         background: var(--cgc-card-bg, var(--card-background-color, #fff));
         border: 1px solid
@@ -4348,7 +4463,6 @@ class CameraGalleryCard extends LitElement {
         height: 100% !important;
         object-fit: cover !important;
       }
-
 
       .segbtn.livebtn {
         width: 60px;
@@ -5334,10 +5448,16 @@ class CameraGalleryCard extends LitElement {
         padding: 0 12px 12px;
       }
 
-      .tsbar-cam-btn {
+      .tsbar-live-center {
         position: absolute;
         left: 50%;
         transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .tsbar-cam-btn {
         display: flex;
         align-items: center;
         justify-content: center;
@@ -5347,15 +5467,15 @@ class CameraGalleryCard extends LitElement {
         cursor: pointer;
         pointer-events: auto;
         padding: 0;
-        height: 22px;
-        width: 22px;
+        height: 28px;
+        width: 28px;
       }
 
       .tsbar-cam-btn ha-icon {
-        --ha-icon-size: 18px;
-        --mdc-icon-size: 18px;
-        width: 18px;
-        height: 18px;
+        --ha-icon-size: 22px;
+        --mdc-icon-size: 22px;
+        width: 22px;
+        height: 22px;
         display: block;
       }
 

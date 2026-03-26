@@ -2,7 +2,7 @@
 
 Custom **Home Assistant Lovelace card** for browsing camera media in a clean **timeline-style gallery** with preview player, object filters, optional live view, and a built-in visual editor.
 
-**Current version:** `v1.9.1`
+**Current version:** `v1.9.2`
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/5efa9e10-9ac3-48bf-8abf-2a009e797e79" width="48%" />
@@ -25,13 +25,80 @@ Your camera entity only needs to support WebRTC streaming within Home Assistant.
 
 ## Files integration (optional – for sensor mode)
 
-If you want to use **sensor mode**, create sensors with a `fileList` attribute using the **Files integration**.
+> **Using sensor mode?** Follow the steps below to set up your file sensors.
+
+The **Files** integration creates a sensor that scans a folder and exposes its contents as a `fileList` attribute — this is what the Camera Gallery Card reads in **sensor mode**.
 
 <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=TarheelGrad1998&repository=files&category=integration">
   <img src="https://my.home-assistant.io/badges/hacs_repository.svg" />
 </a>
 
 https://github.com/TarheelGrad1998/files
+
+### Step 1 — Install
+
+Install the **Files** integration via the HACS button above, then **restart Home Assistant**.
+
+### Step 2 — Configure a sensor
+
+Add to your `configuration.yaml`:
+
+```yaml
+sensor:
+  - platform: files
+    folder: /config/www/camera/frontdoor
+    name: frontdoor_gallery
+    sort: date
+```
+
+This creates a `sensor.frontdoor_gallery` with a `fileList` attribute listing all files found in the folder.
+
+> After editing `configuration.yaml`, restart Home Assistant for the sensor to appear.
+
+### Step 3 — Store your files
+
+Files must be placed inside `/config/www/` so Home Assistant can serve them at `/local/`:
+
+```
+/config/www/camera/frontdoor/2026-03-09_12-31-10_person.jpg
+/config/www/camera/frontdoor/2026-03-09_12-32-01_car.mp4
+```
+
+The recommended filename format includes a timestamp and optional object label — see [Filename parsing](#filename-parsing) below.
+
+### Step 4 — Use in the card
+
+```yaml
+type: custom:camera-gallery-card
+source_mode: sensor
+entity: sensor.frontdoor_gallery
+```
+
+### Multiple cameras
+
+Create one sensor per camera folder:
+
+```yaml
+sensor:
+  - platform: files
+    folder: /config/www/camera/frontdoor
+    name: frontdoor_gallery
+    sort: date
+  - platform: files
+    folder: /config/www/camera/backyard
+    name: backyard_gallery
+    sort: date
+```
+
+Then reference both in the card:
+
+```yaml
+type: custom:camera-gallery-card
+source_mode: sensor
+entities:
+  - sensor.frontdoor_gallery
+  - sensor.backyard_gallery
+```
 
 ---
 

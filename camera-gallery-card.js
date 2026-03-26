@@ -2,7 +2,7 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "1.9.1";
+const CARD_VERSION = "1.9.2";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
@@ -135,7 +135,8 @@ class CameraGalleryCard extends LitElement {
   }
 
   static async getConfigElement() {
-    await import("/local/camera-gallery-card/camera-gallery-card-editor.js");
+    const editorUrl = new URL("camera-gallery-card-editor.js", import.meta.url).href;
+    await import(editorUrl);
     return document.createElement("camera-gallery-card-editor");
   }
 
