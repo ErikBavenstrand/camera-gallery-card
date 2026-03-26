@@ -2,18 +2,19 @@ Custom **Home Assistant Lovelace card** for browsing camera media in a clean **t
 
 ## Features
 
-- Image & video preview with timeline thumbnails
+- Image & video preview with timeline thumbnails and lazy loading
 - Day grouping & filename timestamp parsing
 - Object filter buttons with custom icon and color support
 - Object detection pill in timestamp bar
 - Horizontal or vertical thumbnail layout
-- Redesigned live camera view (native WebRTC)
+- Live camera view (native Home Assistant WebRTC)
 - Delete, bulk delete & download actions
-- Built-in visual editor
+- Built-in visual editor with styling tab (colors, border radius)
+- Auto-live mode
 
 ## Sources
 
-- `sensor` entities with `fileList` attribute
+- `sensor` entities with `fileList` attribute (via Files integration)
 - Home Assistant `media_source` (including Frigate)
 - Multiple sensors or media folders
 
