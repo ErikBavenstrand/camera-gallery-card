@@ -1035,43 +1035,24 @@ class CameraGalleryCard extends LitElement {
       return null;
     }
 
-    const cfg = {
-      type: "picture-entity",
-      entity,
-      camera_view: "live",
-      show_name: false,
-      show_state: false,
-      tap_action: { action: "none" },
-      hold_action: { action: "none" },
-      double_tap_action: { action: "none" },
-    };
-
-    const key = JSON.stringify(cfg);
+    const key = `webrtc:${entity}`;
 
     if (this._liveCard && this._liveCardConfigKey === key) {
       this._liveCard.hass = this._hass;
       return this._liveCard;
     }
 
-    const helpers = await window.loadCardHelpers?.();
-    if (!helpers) {
-      console.warn("[camera-gallery-card] loadCardHelpers unavailable");
-      return null;
-    }
+    await customElements.whenDefined("ha-camera-stream");
+    const player = document.createElement("ha-camera-stream");
+    player.stateObj = this._hass?.states?.[entity];
+    player.hass = this._hass;
+    player.muted = true; // start muted zodat autoplay werkt; _syncLiveMuted unmute daarna
+    player.controls = true;
+    player.style.cssText = "display:block;width:100%;height:100%;margin:0;object-fit:cover;";
 
-    const card = await helpers.createCardElement(cfg);
-    card.hass = this._hass;
-
-    try {
-      card.style.setProperty("display", "block");
-      card.style.setProperty("height", "100%");
-      card.style.setProperty("width", "100%");
-      card.style.setProperty("margin", "0");
-    } catch (_) {}
-
-    this._liveCard = card;
+    this._liveCard = player;
     this._liveCardConfigKey = key;
-    return card;
+    return player;
   }
 
   _getEffectiveLiveCamera() {
@@ -1115,13 +1096,11 @@ class CameraGalleryCard extends LitElement {
   }
 
   _toggleLiveMute() {
+    const newMuted = !this._liveMuted;
+    this._liveMuted = newMuted;
+    if (this._liveCard) this._liveCard.muted = newMuted;
     const video = this._findLiveVideo();
-    if (!video) {
-      console.warn("[CGC] mute: geen video element gevonden in shadow DOM");
-      return;
-    }
-    video.muted = !video.muted;
-    this._liveMuted = video.muted;
+    if (video) video.muted = newMuted;
   }
 
   _toggleLiveFullscreen() {
@@ -1129,26 +1108,30 @@ class CameraGalleryCard extends LitElement {
     this.toggleAttribute("data-live-fs", this._liveFullscreen);
   }
 
-  _syncLiveMuted() {
-    const trySync = () => {
-      const video = this._findLiveVideo();
-      if (video) {
-        this._liveMuted = video.muted;
-        return true;
+  _applyLiveUnmute() {
+    if (this._liveMuted) return true; // gebruiker heeft handmatig gemutet, niet overschrijven
+    if (this._liveCard) this._liveCard.muted = false;
+    const video = this._findLiveVideo();
+    if (video) {
+      video.muted = false;
+      video.controls = true;
+      video.setAttribute("playsinline", "");
+      // Sync _liveMuted wanneer gebruiker native controls gebruikt
+      if (!video._cgcVolumeSync) {
+        video._cgcVolumeSync = true;
+        video.addEventListener("volumechange", () => {
+          this._liveMuted = video.muted;
+        });
       }
-      return false;
-    };
-    if (!trySync()) {
-      setTimeout(() => {
-        if (!trySync()) {
-          setTimeout(() => {
-            if (!trySync()) {
-              setTimeout(() => trySync(), 3000);
-            }
-          }, 2000);
-        }
-      }, 1000);
     }
+    return true;
+  }
+
+  _syncLiveMuted() {
+    this._applyLiveUnmute();
+    // Herhaal na 2s voor het geval ha-camera-stream intern opnieuw opbouwt
+    setTimeout(() => this._applyLiveUnmute(), 2000);
+    setTimeout(() => this._applyLiveUnmute(), 5000);
   }
 
   async _mountLiveCard() {
@@ -1166,36 +1149,51 @@ class CameraGalleryCard extends LitElement {
     }
 
     card.hass = this._hass;
+    if (card.stateObj !== undefined) {
+      const entity = this._getEffectiveLiveCamera();
+      card.stateObj = this._hass?.states?.[entity];
+    }
     this._injectLiveFillStyle(card);
     this._syncLiveMuted();
   }
 
   _injectLiveFillStyle(card) {
-    const cssHuiImage = `
+    const cssFill = `
       :host { display:block!important; width:100%!important; height:100%!important; }
       .image-container { width:100%!important; height:100%!important; }
       .ratio { padding-bottom:0!important; padding-top:0!important; width:100%!important; height:100%!important; position:relative!important; }
-      img, video, ha-hls-player, ha-web-rtc-player { width:100%!important; height:100%!important; object-fit:cover!important; display:block!important; position:static!important; }
+      img, video, ha-hls-player, ha-web-rtc-player, ha-camera-stream { width:100%!important; height:100%!important; object-fit:cover!important; display:block!important; position:static!important; }
     `;
 
-    const injectIntoHuiImage = (huiImage) => {
-      const sr = huiImage.shadowRoot;
-      if (!sr || sr.querySelector("#cgc-fill-hui")) return;
+    const injectInto = (el) => {
+      const sr = el.shadowRoot;
+      if (!sr || sr.querySelector("#cgc-fill")) return;
       const s = document.createElement("style");
-      s.id = "cgc-fill-hui";
-      s.textContent = cssHuiImage;
+      s.id = "cgc-fill";
+      s.textContent = cssFill;
       sr.appendChild(s);
-      // Also directly nullify the inline padding-bottom on .ratio
+      // Fix het padding-bottom ratio-hack als die bestaat (hui-image)
       const ratio = sr.querySelector(".ratio");
       if (ratio) ratio.style.setProperty("padding-bottom", "0", "important");
+    };
+
+    // Injecteer in de card zelf
+    injectInto(card);
+
+    // Injecteer ook recursief in geneste shadow roots (hui-image, ha-web-rtc-player, etc.)
+    const injectDeep = (root) => {
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) {
+          injectInto(el);
+          injectDeep(el.shadowRoot);
+        }
+      }
     };
 
     const tryInject = () => {
       const sr = card.shadowRoot;
       if (!sr) return false;
-      const huiImage = sr.querySelector("hui-image");
-      if (!huiImage) return false;
-      injectIntoHuiImage(huiImage);
+      injectDeep(sr);
       return true;
     };
 
@@ -1206,6 +1204,11 @@ class CameraGalleryCard extends LitElement {
       obs.observe(card.shadowRoot || card, { childList: true, subtree: true });
       setTimeout(() => obs.disconnect(), 5000);
     }
+
+    // Herhaal na 2s voor lazy-rendered interne elementen
+    setTimeout(() => {
+      if (card.shadowRoot) injectDeep(card.shadowRoot);
+    }, 2000);
   }
 
   _openLivePicker() {
@@ -2291,7 +2294,7 @@ class CameraGalleryCard extends LitElement {
 
       if (!children.length) {
         if (node?.media_content_id) {
-          const ok = this._msIsRenderable(
+          const ok = !!node?.can_play || this._msIsRenderable(
             node?.mime_type,
             node?.media_class,
             node?.title
@@ -2308,16 +2311,14 @@ class CameraGalleryCard extends LitElement {
         const mid = String(ch?.media_content_id || "");
         if (!mid) continue;
 
+        const canExpand = !!ch?.can_expand;
+        const canPlay = !!ch?.can_play;
         const cls = String(ch?.media_class || "").toLowerCase();
-        if (cls === "directory") {
+
+        if (canExpand || (!canPlay && cls === "directory")) {
           stack.push({ depth: depth + 1, id: mid });
-        } else {
-          const ok = this._msIsRenderable(
-            ch?.mime_type,
-            ch?.media_class,
-            ch?.title
-          );
-          if (ok) out.push(ch);
+        } else if (canPlay || this._msIsRenderable(ch?.mime_type, ch?.media_class, ch?.title)) {
+          out.push(ch);
         }
       }
     }
@@ -3786,8 +3787,9 @@ class CameraGalleryCard extends LitElement {
       !!this.config?.allow_bulk_delete &&
       !!sp;
 
-    const tsPosClass =
-      this.config.bar_position === "bottom"
+    const tsPosClass = this._isLiveActive()
+      ? "bottom"
+      : this.config.bar_position === "bottom"
         ? "bottom"
         : this.config.bar_position === "hidden"
           ? "hidden"
@@ -3896,17 +3898,11 @@ class CameraGalleryCard extends LitElement {
                     <ha-icon icon="mdi:arrow-left"></ha-icon>
                   </button>
                   <div class="tsbar-live-center">
-                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveMute(); }} title="${this._liveMuted ? "Unmute" : "Mute"}">
-                      <ha-icon icon="${this._liveMuted ? "mdi:volume-off" : "mdi:volume-high"}"></ha-icon>
-                    </button>
                     ${this._getLiveCameraOptions().length > 1 ? html`
                       <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openLivePicker(); }}>
                         <ha-icon icon="mdi:video-switch"></ha-icon>
                       </button>
                     ` : html``}
-                    <button class="tsbar-cam-btn" style="pointer-events:auto;" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveFullscreen(); }} title="${this._liveFullscreen ? "Exit fullscreen" : "Fullscreen"}">
-                      <ha-icon icon="${this._liveFullscreen ? "mdi:fullscreen-exit" : "mdi:fullscreen"}"></ha-icon>
-                    </button>
                   </div>
                   <div class="tspill">
                     <span class="tspill-val">${this._friendlyCameraName(this._getEffectiveLiveCamera())}</span>
