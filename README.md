@@ -2,7 +2,7 @@
 
 Custom **Home Assistant Lovelace card** for browsing camera media in a clean **timeline-style gallery** with preview player, object filters, optional live view, and a built-in visual editor.
 
-**Current version:** `v1.9.2`
+**Current version:** `v2.0.0`
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/5efa9e10-9ac3-48bf-8abf-2a009e797e79" width="48%" />
@@ -15,7 +15,7 @@ Custom **Home Assistant Lovelace card** for browsing camera media in a clean **t
 
 ## Native WebRTC (required for Live View)
 
-Live camera preview now uses **Home Assistant’s native WebRTC streaming**.
+Live camera preview now uses **Home Assistant's native WebRTC streaming**.
 
 No additional WebRTC integration is required anymore.
 
@@ -23,39 +23,27 @@ Your camera entity only needs to support WebRTC streaming within Home Assistant.
 
 ---
 
-## Files integration (optional – for sensor mode)
+## FileTrack (optional – for sensor mode)
 
 > **Using sensor mode?** Follow the steps below to set up your file sensors.
 
-The **Files** integration creates a sensor that scans a folder and exposes its contents as a `fileList` attribute — this is what the Camera Gallery Card reads in **sensor mode**.
+The **FileTrack** integration creates a sensor that scans a folder and exposes its contents as a `fileList` attribute — this is what the Camera Gallery Card reads in **sensor mode**.
 
-<a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=TarheelGrad1998&repository=files&category=integration">
-  <img src="https://my.home-assistant.io/badges/hacs_repository.svg" />
-</a>
-
-https://github.com/TarheelGrad1998/files
+FileTrack is a fork of the archived [files integration by TarheelGrad1998](https://github.com/TarheelGrad1998/files).
 
 ### Step 1 — Install
 
-Install the **Files** integration via the HACS button above, then **restart Home Assistant**.
+1. Open **HACS**
+2. Go to **Integrations**
+3. Click the three-dot menu and choose **Custom repositories**
+4. Add `https://github.com/TheScubadiver/FileTrack` as an **Integration**
+5. Search for **FileTrack** and install it
+6. **Restart Home Assistant**
+7. Go to **Settings → Devices & Services** and add **FileTrack**
 
-### Step 2 — Configure a sensor
+No YAML configuration is needed — sensors are configured entirely through the UI.
 
-Add to your `configuration.yaml`:
-
-```yaml
-sensor:
-  - platform: files
-    folder: /config/www/camera/frontdoor
-    name: frontdoor_gallery
-    sort: date
-```
-
-This creates a `sensor.frontdoor_gallery` with a `fileList` attribute listing all files found in the folder.
-
-> After editing `configuration.yaml`, restart Home Assistant for the sensor to appear.
-
-### Step 3 — Store your files
+### Step 2 — Store your files
 
 Files must be placed inside `/config/www/` so Home Assistant can serve them at `/local/`:
 
@@ -66,7 +54,9 @@ Files must be placed inside `/config/www/` so Home Assistant can serve them at `
 
 The recommended filename format includes a timestamp and optional object label — see [Filename parsing](#filename-parsing) below.
 
-### Step 4 — Use in the card
+### Step 3 — Use in the card
+
+Once your FileTrack sensor is created, use it in the card:
 
 ```yaml
 type: custom:camera-gallery-card
@@ -74,31 +64,7 @@ source_mode: sensor
 entity: sensor.frontdoor_gallery
 ```
 
-### Multiple cameras
-
-Create one sensor per camera folder:
-
-```yaml
-sensor:
-  - platform: files
-    folder: /config/www/camera/frontdoor
-    name: frontdoor_gallery
-    sort: date
-  - platform: files
-    folder: /config/www/camera/backyard
-    name: backyard_gallery
-    sort: date
-```
-
-Then reference both in the card:
-
-```yaml
-type: custom:camera-gallery-card
-source_mode: sensor
-entities:
-  - sensor.frontdoor_gallery
-  - sensor.backyard_gallery
-```
+You can also create a new FileTrack sensor directly from the card editor: open the **General** tab and click **Create new FileTrack sensor**.
 
 ---
 
@@ -115,6 +81,7 @@ entities:
 - Horizontal or vertical thumbnail layout
 - Mobile friendly
 - Media type icon (image / video)
+- Cover / Contain option for media display (`object_fit`)
 
 ### Sources
 
@@ -127,14 +94,14 @@ entities:
 - Native Home Assistant **WebRTC live preview**
 - Redesigned live view layout
 - Live badge
-- Camera switching
-- Default live mode
-- Camera friendly names in selector
+- Camera switching with configurable picker (`live_camera_entities`)
+- Default live camera
+- Camera friendly names and entity IDs in selector
 
 ### Video controls
 
-- Video autoplay toggle
-- Video auto-mute toggle
+- Video autoplay toggle (gallery)
+- Separate auto-mute toggle for gallery (`auto_muted`) and live view (`live_auto_muted`)
 - Per-object filter color customization
 
 ### Actions
@@ -157,11 +124,12 @@ Built-in Lovelace editor with tabs:
 Features:
 
 - Entity suggestions (`sensor.*`)
-- Media folder suggestions
+- Media folder browser (starts at root)
 - Field validation
 - Object filter picker
 - Cleanup of legacy config keys
 - Live preview in the HA card picker
+- Create new FileTrack sensor from the General tab
 
 ### Styling
 
@@ -259,6 +227,8 @@ media_sources:
   - media-source://frigate/frigate/event-search/snapshots
 ```
 
+The media folder browser starts at the root, so you can navigate to any media source.
+
 ---
 
 # Example configuration
@@ -284,6 +254,12 @@ object_filters:
 
 live_enabled: true
 live_camera_entity: camera.frontdoor
+live_camera_entities:
+  - camera.frontdoor
+  - camera.backyard
+live_auto_muted: true
+
+object_fit: cover
 
 delete_service: shell_command.delete_file
 ```
@@ -341,9 +317,12 @@ Notes:
 | `object_colors` | Color per object filter — `{ person: "#FF0000" }` |
 | `entity_filter_map` | Map entity to object type — `{ camera.frontdoor: person }` |
 | `live_enabled` | Enable live mode |
-| `live_camera_entity` | Camera entity for live view |
-| `autoplay` | Auto-play videos (`true` / `false`) |
-| `auto_muted` | Auto-mute videos (`true` / `false`) |
+| `live_camera_entity` | Default camera entity for live view |
+| `live_camera_entities` | Array of camera entity IDs visible in the live picker |
+| `live_auto_muted` | Auto-mute audio in live view (`true` / `false`) |
+| `autoplay` | Auto-play videos in gallery (`true` / `false`) |
+| `auto_muted` | Auto-mute videos in gallery (`true` / `false`) |
+| `object_fit` | Media display mode: `cover` or `contain` |
 | `allow_delete` | Enable delete action |
 | `allow_bulk_delete` | Enable bulk delete |
 | `delete_confirm` | Show confirmation before deleting |
