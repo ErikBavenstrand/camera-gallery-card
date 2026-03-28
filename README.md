@@ -22,6 +22,18 @@ No additional WebRTC integration is required anymore.
 Your camera entity only needs to support WebRTC streaming within Home Assistant.
 
 ---
+# Installation
+
+## HACS
+
+1. Open **HACS**
+2. Go to **Frontend**
+3. Add this repository
+4. Install **Camera Gallery Card**
+5. Reload Home Assistant
+
+
+---
 
 ## FileTrack (optional – for sensor mode)
 
@@ -41,7 +53,11 @@ FileTrack is a fork of the archived [files integration by TarheelGrad1998](https
 6. **Restart Home Assistant**
 7. Go to **Settings → Devices & Services** and add **FileTrack**
 
-No YAML configuration is needed — sensors are configured entirely through the UI.
+No YAML configuration is needed — sensors are configured entirely through the card editor UI.
+
+<img width="434" height="181" alt="Scherm­afbeelding 2026-03-28 om 13 51 00" src="https://github.com/user-attachments/assets/3d0bb033-7523-4204-bedf-2548cebbbec1" />
+
+**Make sure to restart Home Assistant after creating the sensor**
 
 ### Step 2 — Use in the card
 
@@ -52,8 +68,6 @@ type: custom:camera-gallery-card
 source_mode: sensor
 entity: sensor.frontdoor_gallery
 ```
-
-You can also create a new FileTrack sensor directly from the card editor: open the **General** tab and click **Create new FileTrack sensor**.
 
 ---
 
@@ -133,35 +147,6 @@ The **Styling** tab provides a visual editor for colors and border radius, organ
 | Today / Date / Live | Text color, Chevron color, Live active color, Border radius |
 
 All styling options can also be set manually via `style_variables` using CSS custom properties (see below).
-
----
-
-# Installation
-
-## HACS
-
-1. Open **HACS**
-2. Go to **Frontend**
-3. Add this repository
-4. Install **Camera Gallery Card**
-5. Reload Home Assistant
-
----
-
-## Manual
-
-Copy files to:
-
-```text
-/config/www/
-```
-
-Add resource:
-
-```yaml
-url: /local/camera-gallery-card.js
-type: module
-```
 
 ---
 
