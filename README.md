@@ -11,39 +11,33 @@ Custom **Home Assistant Lovelace card** for browsing camera media in a clean **t
 
 ---
 
-# Requirements
+## Requirements
 
-## Native WebRTC (required for Live View)
+### Native WebRTC (required for Live View)
 
-Live camera preview now uses **Home Assistant's native WebRTC streaming**.
+Live camera preview uses **Home Assistant's native WebRTC streaming**.
 
-No additional WebRTC integration is required anymore.
-
-Your camera entity only needs to support WebRTC streaming within Home Assistant.
-
----
-# Installation
-
-## HACS
-
-1. Open **HACS**
-2. Go to **Frontend**
-3. Add this repository
-4. Install **Camera Gallery Card**
-5. Reload Home Assistant
-
+No additional WebRTC integration is required. Your camera entity only needs to support WebRTC streaming within Home Assistant.
 
 ---
 
-## FileTrack (optional – for sensor mode)
+## Installation
+
+### HACS (Recommended)
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=TheScubadiver&repository=camera-gallery-card&category=plugin)
+
+1. Click the button above
+2. Click **Download**
+3. Restart Home Assistant
+
+### FileTrack (optional – for sensor mode)
 
 > **Using sensor mode?** Follow the steps below to set up your file sensors.
 
 The **FileTrack** integration creates a sensor that scans a folder and exposes its contents as a `fileList` attribute — this is what the Camera Gallery Card reads in **sensor mode**.
 
 FileTrack is a fork of the archived [files integration by TarheelGrad1998](https://github.com/TarheelGrad1998/files).
-
-### Step 1 — Install
 
 1. Open **HACS**
 2. Go to **Integrations**
@@ -57,21 +51,11 @@ No YAML configuration is needed — sensors are configured entirely through the 
 
 <img width="434" height="181" alt="Scherm­afbeelding 2026-03-28 om 13 51 00" src="https://github.com/user-attachments/assets/3d0bb033-7523-4204-bedf-2548cebbbec1" />
 
-**Make sure to restart Home Assistant after creating the sensor**
-
-### Step 2 — Use in the card
-
-Once your FileTrack sensor is created, use it in the card:
-
-```yaml
-type: custom:camera-gallery-card
-source_mode: sensor
-entity: sensor.frontdoor_gallery
-```
+**Make sure to restart Home Assistant after creating the sensor.**
 
 ---
 
-# Features
+## Features
 
 ### Gallery
 
@@ -84,11 +68,11 @@ entity: sensor.frontdoor_gallery
 - Horizontal or vertical thumbnail layout
 - Mobile friendly
 - Media type icon (image / video)
-- Cover / Contain option for media display (`object_fit`)
+- Cover / Contain option for media display
 
 ### Sources
 
-- `sensor` entities with `fileList`
+- Sensor entities with `fileList`
 - Home Assistant `media_source`
 - Multiple sensors or media folders
 
@@ -97,14 +81,14 @@ entity: sensor.frontdoor_gallery
 - Native Home Assistant **WebRTC live preview**
 - Redesigned live view layout
 - Live badge
-- Camera switching with configurable picker (`live_camera_entities`)
+- Camera switching with configurable picker
 - Default live camera
 - Camera friendly names and entity IDs in selector
 
 ### Video controls
 
 - Video autoplay toggle (gallery)
-- Separate auto-mute toggle for gallery (`auto_muted`) and live view (`live_auto_muted`)
+- Separate auto-mute toggle for gallery and live view
 - Per-object filter color customization
 
 ### Actions
@@ -126,7 +110,7 @@ Built-in Lovelace editor with tabs:
 
 Features:
 
-- Entity suggestions (`sensor.*`)
+- Entity suggestions
 - Media folder browser (starts at root)
 - Field validation
 - Object filter picker
@@ -146,132 +130,22 @@ The **Styling** tab provides a visual editor for colors and border radius, organ
 | Filter buttons | Background, Icon color, Active background, Active icon color, Border radius |
 | Today / Date / Live | Text color, Chevron color, Live active color, Border radius |
 
-All styling options can also be set manually via `style_variables` using CSS custom properties (see below).
+---
+
+## Delete setup
+
+To enable delete actions, configure a shell command in Home Assistant and provide the service name in the card editor under **General → Delete service**.
+
+Optional delete options are also available in the editor:
+
+- Confirm before deleting
+- Allow bulk delete
+
+> Delete is intended for files inside `/config/www/`. Frigate media sources do not support delete actions.
 
 ---
 
-# Basic usage
-
-## Sensor mode
-
-```yaml
-type: custom:camera-gallery-card
-source_mode: sensor
-entity: sensor.frontdoor_gallery
-```
-
-Example `fileList` attribute:
-
-```json
-[
-  "/local/camera/frontdoor/2026-03-09_12-32-10_person.jpg",
-  "/local/camera/frontdoor/2026-03-09_12-33-01_person.mp4"
-]
-```
-
-Files must be inside:
-
-```text
-/config/www/
-```
-
----
-
-## Media source mode
-
-```yaml
-type: custom:camera-gallery-card
-source_mode: media
-media_source: media-source://media_source/local/camera
-```
-
-Example with multiple folders:
-
-```yaml
-media_sources:
-  - media-source://media_source/local/frontdoor
-  - media-source://media_source/local/backyard
-```
-
-Frigate example:
-
-```yaml
-media_sources:
-  - media-source://frigate/frigate/event-search/clips
-  - media-source://frigate/frigate/event-search/snapshots
-```
-
-The media folder browser starts at the root, so you can navigate to any media source.
-
----
-
-# Example configuration
-
-```yaml
-type: custom:camera-gallery-card
-
-source_mode: sensor
-entities:
-  - sensor.frontdoor_gallery
-
-preview_height: 320
-preview_position: top
-
-thumb_layout: horizontal
-thumb_size: 140
-max_media: 20
-
-object_filters:
-  - person
-  - car
-  - dog
-
-live_enabled: true
-live_camera_entity: camera.frontdoor
-live_camera_entities:
-  - camera.frontdoor
-  - camera.backyard
-live_auto_muted: true
-
-object_fit: cover
-
-delete_service: shell_command.delete_file
-```
-
----
-
-# Delete setup
-
-To enable delete actions, create a shell command in Home Assistant:
-
-```yaml
-shell_command:
-  delete_file: 'rm "$path"'
-```
-
-Then use that service in the card:
-
-```yaml
-delete_service: shell_command.delete_file
-```
-
-Optional delete options:
-
-```yaml
-allow_delete: true
-allow_bulk_delete: true
-delete_confirm: true
-```
-
-Notes:
-
-- Delete actions only work when a `delete_service` is configured
-- Delete is intended for files inside `/config/www/`
-- Frigate media sources do not support delete actions
-
----
-
-# Configuration options
+## Configuration options
 
 | Option | Description |
 |------|------|
@@ -288,26 +162,26 @@ Notes:
 | `thumb_bar_position` | Thumb timestamp bar |
 | `max_media` | Max media items |
 | `object_filters` | Filter buttons (built-in and custom) |
-| `object_colors` | Color per object filter — `{ person: "#FF0000" }` |
-| `entity_filter_map` | Map entity to object type — `{ camera.frontdoor: person }` |
+| `object_colors` | Color per object filter |
+| `entity_filter_map` | Map entity to object type |
 | `live_enabled` | Enable live mode |
 | `live_camera_entity` | Default camera entity for live view |
-| `live_camera_entities` | Array of camera entity IDs visible in the live picker |
-| `live_auto_muted` | Auto-mute audio in live view (`true` / `false`) |
-| `autoplay` | Auto-play videos in gallery (`true` / `false`) |
-| `auto_muted` | Auto-mute videos in gallery (`true` / `false`) |
+| `live_camera_entities` | Camera entities visible in the live picker |
+| `live_auto_muted` | Auto-mute audio in live view |
+| `autoplay` | Auto-play videos in gallery |
+| `auto_muted` | Auto-mute videos in gallery |
 | `object_fit` | Media display mode: `cover` or `contain` |
 | `allow_delete` | Enable delete action |
 | `allow_bulk_delete` | Enable bulk delete |
 | `delete_confirm` | Show confirmation before deleting |
 | `delete_service` | Delete file service |
-| `style_variables` | Custom CSS variable overrides (see styling section) |
+| `style_variables` | Custom CSS variable overrides |
 
 ---
 
-# Styling / CSS variables
+## Styling / CSS variables
 
-All visual styling can be customized via the **Styling** tab in the editor, or manually via `style_variables` in YAML.
+All visual styling can be customized via the **Styling** tab in the editor.
 
 | Variable | Element | Default |
 |---|---|---|
@@ -329,100 +203,42 @@ All visual styling can be customized via the **Styling** tab in the editor, or m
 | `--cgc-live-active-bg` | Live button active background | error color |
 | `--cgc-ctrl-radius` | Controls bar border radius | `10px` |
 
-Example:
-
-```yaml
-style_variables: |
-  --cgc-card-bg: transparent;
-  --cgc-card-border-color: transparent;
-  --r: 0px;
-  --cgc-thumb-radius: 4px;
-```
-
 ---
 
-# Object filters
+## Object filters
 
 Supported built-in filters:
 
-```text
-bicycle
-bird
-bus
-car
-cat
-dog
-motorcycle
-person
-truck
-visitor
+```
+bicycle · bird · bus · car · cat · dog · motorcycle · person · truck · visitor
 ```
 
-Example:
+Custom filters with a custom icon can be added via the editor.
 
-```yaml
-object_filters:
-  - person
-  - car
-  - dog
+Object filter colors can be assigned per filter type in the editor.
+
+Recommended filename format for object detection:
+
 ```
-
-## Custom object filters
-
-Add your own filters with a custom icon using the editor, or via YAML:
-
-```yaml
-object_filters:
-  - person
-  - car
-  - parcel: mdi:package-variant
-  - woman: mdi:account
-```
-
-## Object filter colors
-
-Assign a color to each filter icon:
-
-```yaml
-object_colors:
-  person: "#2196F3"
-  car: "#FF9800"
-  parcel: "#4CAF50"
-```
-
-Recommended filename format:
-
-```text
 2026-03-09_12-31-10_person.jpg
 2026-03-09_12-31-10_car.mp4
 ```
 
 ---
 
-# Filename parsing
+## Filename parsing
 
-The card extracts timestamps from filenames for:
+The card extracts timestamps from filenames for sorting, day grouping, preview timestamps, and thumbnail labels.
 
-- sorting
-- day grouping
-- preview timestamps
-- thumbnail labels
+Example supported formats:
 
-Example formats:
-
-```text
+```
 2026-03-09_12-31-10_person.jpg
 20260309_123110_person.jpg
 clip-1741512345-person.mp4
 ```
 
-Custom format:
-
-```yaml
-filename_datetime_format:
-```
-
-Tokens:
+A custom format can be set in the editor using these tokens:
 
 | Token | Meaning |
 |------|------|
@@ -433,18 +249,8 @@ Tokens:
 | mm | Minutes |
 | ss | Seconds |
 
-Example:
-
-```text
-Deurbel_00_20260309183452.mp4
-```
-
-```yaml
-filename_datetime_format: YYYYMMDDHHmmss
-```
-
 ---
 
-# License
+## License
 
 MIT License
