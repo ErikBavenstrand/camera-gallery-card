@@ -2,14 +2,14 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "2.0.1";
+const CARD_VERSION = "2.2.0";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
 const PREVIEW_WIDTH = "100%";
 
-const SENSOR_POSTER_CONCURRENCY = 2;
-const SENSOR_POSTER_QUEUE_LIMIT = 40;
+const SENSOR_POSTER_CONCURRENCY = 4;
+const SENSOR_POSTER_QUEUE_LIMIT = 100;
 
 const THUMBS_ENABLED = true;
 
@@ -20,7 +20,7 @@ const THUMB_SIZE = 86;
 const DEFAULT_ALLOW_BULK_DELETE = true;
 const DEFAULT_ALLOW_DELETE = true;
 const DEFAULT_BAR_OPACITY = 30;
-const DEFAULT_BROWSE_TIMEOUT_MS = 8000;
+const DEFAULT_BROWSE_TIMEOUT_MS = 3000;
 const DEFAULT_DELETE_CONFIRM = true;
 const DEFAULT_DELETE_PREFIX = "/config/www/";
 const DEFAULT_DELETE_SERVICE = "";
@@ -36,7 +36,7 @@ const DEFAULT_SOURCE_MODE = "sensor"; // "sensor" | "media"
 const DEFAULT_THUMB_BAR_POSITION = "bottom"; // "bottom" | "top" | "hidden"
 const DEFAULT_THUMB_LAYOUT = "horizontal"; // "horizontal" | "vertical"
 const DEFAULT_VISIBLE_OBJECT_FILTERS = [];
-const DEFAULT_WALK_DEPTH = 8;
+const DEFAULT_WALK_DEPTH = 6;
 
 const DEFAULT_AUTOPLAY = false;
 const DEFAULT_AUTOMUTED = true;
@@ -132,6 +132,8 @@ class CameraGalleryCard extends LitElement {
       _viewMode: { type: String }, // "media" | "live"
       _liveMuted: { type: Boolean },
       _liveFullscreen: { type: Boolean },
+      _imgFsOpen: { type: Boolean },
+      _aspectRatio: { type: String },
     };
   }
 
@@ -149,7 +151,6 @@ class CameraGalleryCard extends LitElement {
       entities: [],
       live_enabled: true,
       live_camera_entity: cameraEntity ?? "",
-      preview_height: 320,
       thumb_size: 140,
       bar_position: "top",
       object_filters: DEFAULT_VISIBLE_OBJECT_FILTERS,
@@ -203,7 +204,104 @@ class CameraGalleryCard extends LitElement {
     this._liveSelectedCamera = "";
     this._liveMuted = false;
     this._liveFullscreen = false;
-    this._onFullscreenChange = () => { this.requestUpdate(); };
+    this._imgFsOpen = false;
+
+    // Pinch-to-zoom state (alleen actief in fullscreen live mode)
+    this._zoomScale = 1;
+    this._zoomPanX = 0;
+    this._zoomPanY = 0;
+    this._zoomPinchDist = 0;
+    this._zoomPinchScale = 1;
+    this._zoomIsPinching = false;
+    this._zoomIsPanning = false;
+    this._zoomPanStartX = 0;
+    this._zoomPanStartY = 0;
+    this._zoomPanBaseX = 0;
+    this._zoomPanBaseY = 0;
+
+    this._onFullscreenChange = () => {
+      const isFs = document.fullscreenElement === this || document.webkitFullscreenElement === this;
+      if (isFs) {
+        this.setAttribute('data-live-fs', '');
+        this._showPills();
+      } else if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+        this.removeAttribute('data-live-fs');
+        this._liveFullscreen = false;
+        this._resetZoom();
+      }
+      this.requestUpdate();
+    };
+
+    this._onZoomTouchStart = (e) => {
+      if (!this._isLiveFullscreen()) return;
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        this._zoomIsPinching = true;
+        this._zoomIsPanning = false;
+        const t = e.touches;
+        this._zoomPinchDist = Math.hypot(t[1].clientX - t[0].clientX, t[1].clientY - t[0].clientY);
+        this._zoomPinchScale = this._zoomScale;
+      } else if (e.touches.length === 1 && this._zoomScale > 1) {
+        e.preventDefault();
+        this._zoomIsPanning = true;
+        this._zoomIsPinching = false;
+        this._zoomPanStartX = e.touches[0].clientX;
+        this._zoomPanStartY = e.touches[0].clientY;
+        this._zoomPanBaseX = this._zoomPanX;
+        this._zoomPanBaseY = this._zoomPanY;
+      }
+    };
+
+    this._onZoomTouchMove = (e) => {
+      if (!this._isLiveFullscreen()) return;
+      if (this._zoomIsPinching && e.touches.length >= 2) {
+        e.preventDefault();
+        const t = e.touches;
+        const dist = Math.hypot(t[1].clientX - t[0].clientX, t[1].clientY - t[0].clientY);
+        this._zoomScale = Math.max(1, Math.min(5, this._zoomPinchScale * (dist / this._zoomPinchDist)));
+        if (this._zoomScale <= 1) { this._zoomPanX = 0; this._zoomPanY = 0; }
+        else this._clampZoomPan();
+        this._applyZoom();
+      } else if (this._zoomIsPanning && e.touches.length === 1 && this._zoomScale > 1) {
+        e.preventDefault();
+        this._zoomPanX = this._zoomPanBaseX + (e.touches[0].clientX - this._zoomPanStartX);
+        this._zoomPanY = this._zoomPanBaseY + (e.touches[0].clientY - this._zoomPanStartY);
+        this._clampZoomPan();
+        this._applyZoom();
+      }
+    };
+
+    this._onZoomTouchEnd = (e) => {
+      if (e.touches.length < 2) this._zoomIsPinching = false;
+      if (e.touches.length === 0) this._zoomIsPanning = false;
+      if (this._zoomScale < 1.05) this._resetZoom();
+    };
+
+    this._onZoomWheel = (e) => {
+      if (!this._isLiveFullscreen() || !e.ctrlKey) return;
+      e.preventDefault();
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      const oldScale = this._zoomScale;
+      const newScale = Math.max(1, Math.min(5, oldScale * factor));
+      if (newScale !== oldScale) {
+        // Zoom naar de cursorpositie: bereken de layout center van het element
+        // (onafhankelijk van de huidige transform) en gebruik cursor-offset als ankerpunt.
+        // LC = visual center - panOffset (want visual center = layout center + pan)
+        const host = this.renderRoot?.querySelector('#live-card-host');
+        if (host) {
+          const r = host.getBoundingClientRect();
+          const lcX = r.left + r.width / 2 - this._zoomPanX;
+          const lcY = r.top + r.height / 2 - this._zoomPanY;
+          const k = newScale / oldScale;
+          this._zoomPanX = (e.clientX - lcX) * (1 - k) + this._zoomPanX * k;
+          this._zoomPanY = (e.clientY - lcY) * (1 - k) + this._zoomPanY * k;
+        }
+        this._zoomScale = newScale;
+      }
+      if (this._zoomScale <= 1) { this._zoomPanX = 0; this._zoomPanY = 0; }
+      else this._clampZoomPan();
+      this._applyZoom();
+    };
 
     this._ms = {
       key: "",
@@ -231,6 +329,11 @@ class CameraGalleryCard extends LitElement {
     super.connectedCallback();
     document.addEventListener("fullscreenchange", this._onFullscreenChange);
     document.addEventListener("webkitfullscreenchange", this._onFullscreenChange);
+    this.addEventListener('touchstart', this._onZoomTouchStart, { passive: false });
+    this.addEventListener('touchmove', this._onZoomTouchMove, { passive: false });
+    this.addEventListener('touchend', this._onZoomTouchEnd);
+    this.addEventListener('touchcancel', this._onZoomTouchEnd);
+    this.addEventListener('wheel', this._onZoomWheel, { passive: false });
   }
 
   disconnectedCallback() {
@@ -238,6 +341,11 @@ class CameraGalleryCard extends LitElement {
 
     document.removeEventListener("fullscreenchange", this._onFullscreenChange);
     document.removeEventListener("webkitfullscreenchange", this._onFullscreenChange);
+    this.removeEventListener('touchstart', this._onZoomTouchStart);
+    this.removeEventListener('touchmove', this._onZoomTouchMove);
+    this.removeEventListener('touchend', this._onZoomTouchEnd);
+    this.removeEventListener('touchcancel', this._onZoomTouchEnd);
+    this.removeEventListener('wheel', this._onZoomWheel);
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 
     if (this._liveQuickSwitchTimer) clearTimeout(this._liveQuickSwitchTimer);
@@ -259,7 +367,11 @@ class CameraGalleryCard extends LitElement {
   }
 
   set hass(hass) {
+    const firstHass = !this._hass;
     this._hass = hass;
+    if (firstHass && this.config?.start_mode === "live" && this._hasLiveConfig()) {
+      this._viewMode = "live";
+    }
     this.requestUpdate();
   }
 
@@ -457,11 +569,14 @@ class CameraGalleryCard extends LitElement {
       this._previewVideoEl = video;
     }
 
-    video.autoplay = this.config?.autoplay === true;
-    video.muted =
+    const shouldAutoplay = this.config?.autoplay === true;
+    const shouldMute =
       this.config?.auto_muted !== undefined
         ? this.config.auto_muted === true
         : true;
+
+    video.autoplay = shouldAutoplay;
+    video.muted = shouldMute;
 
     if (video.src !== selectedUrl) {
       video.src = selectedUrl;
@@ -471,6 +586,22 @@ class CameraGalleryCard extends LitElement {
         video.poster = poster;
       } else {
         video.removeAttribute("poster");
+        // Enqueue poster pas na laden: voorkomt dat de capture de preview-verbinding blokkeert
+        const urlForPoster = selectedUrl;
+        video.addEventListener("canplay", () => {
+          if (!this._posterCache.has(urlForPoster)) this._enqueuePoster(urlForPoster);
+        }, { once: true });
+      }
+
+      if (shouldAutoplay) {
+        // video.load() reset muted in sommige browsers naar defaultMuted.
+        // Herstel muted ná load en start expliciet via play() zodat autoplay
+        // niet afhankelijk is van een recente user-gesture (relevant in MS mode
+        // waar de URL async wordt opgelost en de gesture al "oud" is).
+        video.addEventListener("canplay", () => {
+          video.muted = shouldMute;
+          video.play().catch(() => {});
+        }, { once: true });
       }
 
       try {
@@ -914,7 +1045,6 @@ class CameraGalleryCard extends LitElement {
       "object_filters",
       "preview_click_to_open",
       "preview_close_on_tap",
-      "preview_height",
       "preview_position",
       "pill_size",
       "thumb_bar_position",
@@ -1085,7 +1215,8 @@ class CameraGalleryCard extends LitElement {
     player.hass = this._hass;
     player.muted = true; // start muted zodat autoplay werkt; _syncLiveMuted unmute daarna
     player.controls = false;
-    player.style.cssText = "display:block;width:100%;height:100%;margin:0;object-fit:cover;";
+    const _liveObjFit1 = this.config?.object_fit || "cover";
+    player.style.cssText = `display:block;width:100%;height:100%;margin:0;object-fit:${_liveObjFit1};`;
 
     this._liveCard = player;
     this._liveCardConfigKey = key;
@@ -1111,9 +1242,11 @@ class CameraGalleryCard extends LitElement {
     const video = document.createElement("video");
     video.autoplay = true;
     video.muted = true;
+    video.setAttribute('muted', '');
     video.playsInline = true;
     video.controls = false;
-    video.style.cssText = "display:block;width:100%;height:100%;margin:0;object-fit:cover;";
+    const _liveObjFit2 = this.config?.object_fit || "cover";
+    video.style.cssText = `display:block;width:100%;height:100%;margin:0;object-fit:${_liveObjFit2};`;
 
     try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
@@ -1218,6 +1351,67 @@ class CameraGalleryCard extends LitElement {
     return search(host);
   }
 
+  _parseAspectRatio(val) {
+    const map = { "16:9": "16/9", "4:3": "4/3", "1:1": "1/1" };
+    return map[val] || "16/9";
+  }
+
+  _aspectRatioStorageKey() {
+    const id = this._liveSelectedCamera || this.config?.live_camera_entity || this.config?.entities?.[0] || this.config?.media_sources?.[0] || "default";
+    return `cgc_aspect_ratio_${id}`;
+  }
+
+  _toggleAspectRatio() {
+    const cycle = ["16/9", "4/3", "1/1"];
+    const next = cycle[(cycle.indexOf(this._aspectRatio) + 1) % cycle.length];
+    this._aspectRatio = next;
+    try { localStorage.setItem(this._aspectRatioStorageKey(), next); } catch (_) {}
+    this.requestUpdate();
+  }
+
+  _aspectRatioLabel() {
+    const map = { "16/9": "16:9", "4/3": "4:3", "1/1": "1:1" };
+    return map[this._aspectRatio] || "16:9";
+  }
+
+  _isLiveFullscreen() {
+    return this._isLiveActive() && (
+      !!document.fullscreenElement ||
+      !!document.webkitFullscreenElement ||
+      !!this._liveFullscreen
+    );
+  }
+
+  _resetZoom() {
+    this._zoomScale = 1;
+    this._zoomPanX = 0;
+    this._zoomPanY = 0;
+    this._zoomIsPinching = false;
+    this._zoomIsPanning = false;
+    this._applyZoom();
+  }
+
+  _clampZoomPan() {
+    const host = this.renderRoot?.querySelector('#live-card-host');
+    if (!host) return;
+    const maxX = host.offsetWidth * (this._zoomScale - 1) / 2;
+    const maxY = host.offsetHeight * (this._zoomScale - 1) / 2;
+    this._zoomPanX = Math.max(-maxX, Math.min(maxX, this._zoomPanX));
+    this._zoomPanY = Math.max(-maxY, Math.min(maxY, this._zoomPanY));
+  }
+
+  _applyZoom() {
+    const host = this.renderRoot?.querySelector('#live-card-host');
+    if (!host) return;
+    if (this._zoomScale <= 1) {
+      host.style.transform = '';
+      host.style.transformOrigin = '';
+    } else {
+      host.style.transformOrigin = 'center center';
+      host.style.transform = `translate(${this._zoomPanX / this._zoomScale}px, ${this._zoomPanY / this._zoomScale}px) scale(${this._zoomScale})`;
+    }
+  }
+
   _toggleLiveMute() {
     const newMuted = !this._liveMuted;
     this._liveMuted = newMuted;
@@ -1241,15 +1435,29 @@ class CameraGalleryCard extends LitElement {
       return;
     }
 
-    // Standard fullscreen API
+    // Standard fullscreen API — altijd op 'this' zodat pinch-zoom werkt
     if (document.fullscreenEnabled) {
-      (video || this).requestFullscreen().catch(() => {});
+      this.requestFullscreen().catch(() => {});
       return;
     }
 
     // CSS fallback
     this._liveFullscreen = !this._liveFullscreen;
+    if (!this._liveFullscreen) this._resetZoom();
     this.toggleAttribute("data-live-fs", this._liveFullscreen);
+    this.requestUpdate();
+  }
+
+  _openImageFullscreen() {
+    this._imgFsOpen = true;
+    try { screen.orientation?.lock?.("landscape"); } catch (_) {}
+    this._showPills();
+    this.requestUpdate();
+  }
+
+  _closeImageFullscreen() {
+    this._imgFsOpen = false;
+    try { screen.orientation?.unlock?.(); } catch (_) {}
     this.requestUpdate();
   }
 
@@ -1304,11 +1512,12 @@ class CameraGalleryCard extends LitElement {
   }
 
   _injectLiveFillStyle(card) {
+    const objFit = this.config?.object_fit || "cover";
     const cssFill = `
       :host { display:block!important; width:100%!important; height:100%!important; }
       .image-container { width:100%!important; height:100%!important; }
       .ratio { padding-bottom:0!important; padding-top:0!important; width:100%!important; height:100%!important; position:relative!important; }
-      img, video, ha-hls-player, ha-web-rtc-player, ha-camera-stream { width:100%!important; height:100%!important; object-fit:cover!important; display:block!important; position:static!important; }
+      img, video, ha-hls-player, ha-web-rtc-player, ha-camera-stream { width:100%!important; height:100%!important; object-fit:${objFit}!important; display:block!important; position:static!important; }
     `;
 
     const injectInto = (el) => {
@@ -1454,6 +1663,11 @@ class CameraGalleryCard extends LitElement {
     this._liveCard = null;
     this._liveCardConfigKey = "";
     this._liveSelectedCamera = next;
+
+    const defaultRatio = this._parseAspectRatio(this.config?.aspect_ratio);
+    const stored = (() => { try { return localStorage.getItem(`cgc_aspect_ratio_${next}`); } catch (_) { return null; } })();
+    this._aspectRatio = ["16/9", "4/3", "1/1"].includes(stored) ? stored : defaultRatio;
+
     this._showLivePicker = false;
     this.requestUpdate();
 
@@ -1702,7 +1916,7 @@ class CameraGalleryCard extends LitElement {
         class="thumb-menu-sheet"
         role="dialog"
         aria-modal="true"
-        aria-label="Thumbnail acties"
+        aria-label="Thumbnail actions"
         @click=${(e) => e.stopPropagation()}
       >
         <div class="thumb-menu-handle"></div>
@@ -2068,6 +2282,7 @@ class CameraGalleryCard extends LitElement {
     return new Promise((resolve, reject) => {
       const v = document.createElement("video");
       v.muted = true;
+      v.setAttribute('muted', '');
       v.playsInline = true;
       v.preload = "metadata";
       v.controls = false;
@@ -2111,23 +2326,26 @@ class CameraGalleryCard extends LitElement {
         }
       };
 
-      v.addEventListener(
-        "error",
-        () => fail(new Error("video load error")),
-        { once: true }
-      );
+      const timeout = setTimeout(() => fail(new Error("poster timeout")), 5000);
+      const origFail = fail;
+      const origDraw = draw;
+      // Override fail/draw to also clear the timeout
+      const failOnce = (err) => { clearTimeout(timeout); origFail(err); };
+      const drawOnce = () => { clearTimeout(timeout); origDraw(); };
+
+      v.addEventListener("error", () => failOnce(new Error("video load error")), { once: true });
       v.addEventListener(
         "loadedmetadata",
         () => {
           try {
             v.currentTime = 0.01;
           } catch (_) {
-            draw();
+            drawOnce();
           }
         },
         { once: true }
       );
-      v.addEventListener("seeked", () => draw(), { once: true });
+      v.addEventListener("seeked", () => drawOnce(), { once: true });
 
       v.src = src;
       try {
@@ -2172,7 +2390,7 @@ class CameraGalleryCard extends LitElement {
     const now = Date.now();
     const key = this._msKeyFromRoots(roots);
     const sameKey = this._ms.key === key;
-    const fresh = sameKey && now - (this._ms.loadedAt || 0) < 60_000;
+    const fresh = sameKey && now - (this._ms.loadedAt || 0) < 300_000;
 
     if (this._ms.loading || fresh) return;
 
@@ -2197,7 +2415,7 @@ class CameraGalleryCard extends LitElement {
 
       const walkLimitTotal = isFrigateRoot
         ? Math.min(800, Math.max(internalCap * 2, 400))
-        : Math.min(600, Math.max(internalCap * 3, internalCap + 40));
+        : Math.min(400, Math.max(Math.ceil(internalCap * 1.5), internalCap + 20));
       const perRootLimit = Math.max(
         DEFAULT_PER_ROOT_MIN_LIMIT,
         Math.ceil(walkLimitTotal / roots.length)
@@ -2205,24 +2423,46 @@ class CameraGalleryCard extends LitElement {
 
       const flat = [];
 
-      for (const root of roots) {
-        try {
-          const rootStr = String(root);
-          const isLocalRoot = rootStr.includes("media_source/local/");
-          const isFrigateRoot = rootStr.includes("media-source://frigate/");
+      const rootResults = await Promise.all(
+        roots.map(async (root) => {
+          try {
+            const rootStr = String(root);
+            const isLocalRoot = rootStr.includes("media_source/local/");
+            const isFrigateRoot = rootStr.includes("media-source://frigate/");
 
-          const depthLimit = isFrigateRoot
-            ? 3
-            : isLocalRoot
-              ? Math.min(6, DEFAULT_WALK_DEPTH)
-              : DEFAULT_WALK_DEPTH;
+            const depthLimit = isFrigateRoot
+              ? 3
+              : isLocalRoot
+                ? Math.min(6, DEFAULT_WALK_DEPTH)
+                : DEFAULT_WALK_DEPTH;
 
-          const tmp = await this._msWalkIter(root, perRootLimit, depthLimit);
-          flat.push(...tmp);
-        } catch (e) {
-          console.warn("MS root failed:", root, e);
-        }
-      }
+            // For single-root: progressively show first items while the rest loads
+            const onProgress = roots.length === 1
+              ? (partial) => {
+                  if (this._ms.list.length === 0 && partial.length >= 3) {
+                    this._ms.list = partial
+                      .filter((x) => !!x?.media_content_id)
+                      .map((x) => ({
+                        cls: String(x.media_class || ""),
+                        id: String(x.media_content_id || ""),
+                        mime: String(x.mime_type || ""),
+                        title: String(x.title || ""),
+                      }))
+                      .filter((x) => !!x.id)
+                      .slice(0, internalCap);
+                    this.requestUpdate();
+                  }
+                }
+              : null;
+
+            return await this._msWalkIter(root, perRootLimit, depthLimit, onProgress);
+          } catch (e) {
+            console.warn("MS root failed:", root, e);
+            return [];
+          }
+        })
+      );
+      flat.push(...rootResults.flat());
 
       if (roots.some((r) => this._isFrigateRoot(r))) {
         try {
@@ -2425,52 +2665,69 @@ class CameraGalleryCard extends LitElement {
     return it?.title || "";
   }
 
-  async _msWalkIter(rootId, limit, depthLimit) {
+  async _msWalkIter(rootId, limit, depthLimit, onProgress = null) {
+    const BATCH = 3;
     const out = [];
     const stack = [{ depth: 0, id: rootId }];
 
     while (stack.length && out.length < limit) {
-      const { depth, id } = stack.pop();
-      if (!id || depth > depthLimit) continue;
+      const prevCount = out.length;
 
-      let node;
-      try {
-        node = await this._msBrowse(id);
-      } catch (_) {
-        continue;
+      // Pop a batch and browse in parallel
+      const batch = [];
+      while (stack.length && batch.length < BATCH) {
+        const item = stack.pop();
+        if (item && item.depth <= depthLimit) batch.push(item);
       }
+      if (!batch.length) break;
 
-      const children = Array.isArray(node?.children) ? node.children : [];
+      const results = await Promise.all(
+        batch.map(async ({ depth, id }) => {
+          try {
+            return { depth, node: await this._msBrowse(id) };
+          } catch (_) {
+            return { depth, node: null };
+          }
+        })
+      );
 
-      if (!children.length) {
-        if (node?.media_content_id) {
-          const ok = !!node?.can_play || this._msIsRenderable(
-            node?.mime_type,
-            node?.media_class,
-            node?.title
-          );
-          if (ok) out.push(node);
+      for (const { depth, node } of results) {
+        if (!node) continue;
+
+        const children = Array.isArray(node?.children) ? node.children : [];
+
+        if (!children.length) {
+          if (node?.media_content_id) {
+            const ok = !!node?.can_play || this._msIsRenderable(
+              node?.mime_type,
+              node?.media_class,
+              node?.title
+            );
+            if (ok && out.length < limit) out.push(node);
+          }
+          continue;
         }
-        continue;
-      }
 
-      for (let i = children.length - 1; i >= 0; i--) {
-        if (out.length >= limit) break;
+        for (let i = children.length - 1; i >= 0; i--) {
+          if (out.length >= limit) break;
 
-        const ch = children[i];
-        const mid = String(ch?.media_content_id || "");
-        if (!mid) continue;
+          const ch = children[i];
+          const mid = String(ch?.media_content_id || "");
+          if (!mid) continue;
 
-        const canExpand = !!ch?.can_expand;
-        const canPlay = !!ch?.can_play;
-        const cls = String(ch?.media_class || "").toLowerCase();
+          const canExpand = !!ch?.can_expand;
+          const canPlay = !!ch?.can_play;
+          const cls = String(ch?.media_class || "").toLowerCase();
 
-        if (canExpand || (!canPlay && cls === "directory")) {
-          stack.push({ depth: depth + 1, id: mid });
-        } else if (canPlay || this._msIsRenderable(ch?.mime_type, ch?.media_class, ch?.title)) {
-          out.push(ch);
+          if (canExpand || (!canPlay && cls === "directory")) {
+            stack.push({ depth: depth + 1, id: mid });
+          } else if (canPlay || this._msIsRenderable(ch?.mime_type, ch?.media_class, ch?.title)) {
+            out.push(ch);
+          }
         }
       }
+
+      if (onProgress && out.length > prevCount) onProgress([...out]);
     }
 
     return out;
@@ -2539,6 +2796,17 @@ class CameraGalleryCard extends LitElement {
   }
 
   _dtMsFromSrc(src) {
+    if (String(src || "").startsWith("media-source://reolink/")) {
+      const seg = src.split("/").pop();
+      const parts = (seg || "").split("|");
+      const ts = parts[1];
+      if (ts && /^\d{14}$/.test(ts)) {
+        const yr = +ts.slice(0,4), mo = +ts.slice(4,6), dy = +ts.slice(6,8);
+        const hr = +ts.slice(8,10), mn = +ts.slice(10,12), sc = +ts.slice(12,14);
+        return new Date(yr, mo - 1, dy, hr, mn, sc).getTime();
+      }
+    }
+
     const custom = this._parseDateFromFilename(
       src,
       this.config?.filename_datetime_format
@@ -3397,8 +3665,17 @@ class CameraGalleryCard extends LitElement {
     if (e.deltaMode === 1) step = delta * 16;
     if (e.deltaMode === 2) step = delta * el.clientWidth * 0.85;
 
-    const next = Math.max(0, Math.min(maxScroll, el.scrollLeft + step));
-    el.scrollLeft = next;
+    this._thumbWheelAccum = (this._thumbWheelAccum || 0) + step;
+
+    if (!this._thumbWheelRaf) {
+      this._thumbWheelRaf = requestAnimationFrame(() => {
+        this._thumbWheelRaf = null;
+        const accumulated = this._thumbWheelAccum || 0;
+        this._thumbWheelAccum = 0;
+        const maxSc = el.scrollWidth - el.clientWidth;
+        el.scrollLeft = Math.max(0, Math.min(maxSc, el.scrollLeft + accumulated));
+      });
+    }
   }
 
   // ─── Lifecycle / config ───────────────────────────────────────────
@@ -3610,9 +3887,10 @@ class CameraGalleryCard extends LitElement {
       object_filters: visibleObjectFilters,
       preview_click_to_open,
       preview_close_on_tap,
-      preview_height: Number(config.preview_height) || 320,
       preview_position,
+      aspect_ratio: ["16:9", "4:3", "1:1"].includes(config.aspect_ratio) ? config.aspect_ratio : "16:9",
       source_mode,
+      start_mode: config.start_mode === "live" ? "live" : "gallery",
       style_variables,
       object_fit,
       pill_size,
@@ -3658,11 +3936,22 @@ class CameraGalleryCard extends LitElement {
       this._previewOpen = this.config.preview_click_to_open ? false : true;
       this._showLivePicker = false;
       this._showLiveQuickSwitch = false;
+      const defaultRatio = this._parseAspectRatio(config.aspect_ratio);
+      const id = config.live_camera_entity || (Array.isArray(config.entities) ? config.entities[0] : null) || (Array.isArray(config.media_sources) ? config.media_sources[0] : null) || "default";
+      const stored = (() => { try { return localStorage.getItem(`cgc_aspect_ratio_${id}`); } catch (_) { return null; } })();
+      this._aspectRatio = ["16/9", "4/3", "1/1"].includes(stored) ? stored : defaultRatio;
       const hasMedia = nextConfig.entities.length > 0 || nextConfig.media_sources.length > 0;
-      this._viewMode =
-        nextConfig.live_enabled && nextConfig.live_camera_entity && !hasMedia
-          ? "live"
-          : "media";
+      const startMode = nextConfig.start_mode;
+      if (startMode === "live" && nextConfig.live_enabled && nextConfig.live_camera_entity) {
+        this._viewMode = "live";
+      } else if (startMode === "gallery") {
+        this._viewMode = "media";
+      } else {
+        this._viewMode =
+          nextConfig.live_enabled && nextConfig.live_camera_entity && !hasMedia
+            ? "live"
+            : "media";
+      }
     } else if (
       prevConfig.preview_click_to_open !== this.config.preview_click_to_open
     ) {
@@ -4011,7 +4300,7 @@ class CameraGalleryCard extends LitElement {
       --thumbEmptyH:${this.config.thumb_size}px;
       --topbarMar:${STYLE.topbar_margin};
       --topbarPad:${STYLE.topbar_padding};
-      --thumbsMaxHeight:${Math.max(160, Number(this.config.preview_height) || 320)}px;
+      --thumbsMaxHeight:320px;
       --cgc-object-fit:${this.config.object_fit || "cover"};
       --cgc-pill-size:${this.config.pill_size}px;
       ${this.config.style_variables || ""}
@@ -4021,7 +4310,7 @@ class CameraGalleryCard extends LitElement {
       ? html`
           <div
             class="preview"
-            style="height:${this.config.preview_height}px; touch-action:${isLive ? "auto" : "pan-y"};"
+            style="aspect-ratio:${this._aspectRatio || "16/9"}; touch-action:${isLive ? "auto" : "pan-y"};"
             @pointerdown=${(e) => {
               if (e?.isPrimary === false) return;
               const path = e.composedPath?.() || [];
@@ -4054,9 +4343,9 @@ class CameraGalleryCard extends LitElement {
             ${isLive
               ? this._renderLiveInner()
               : noResultsForFilter
-                ? html`<div class="preview-empty">Geen media voor deze dag.</div>`
+                ? html`<div class="preview-empty">No media for this day.</div>`
                 : !selectedHasUrl
-                  ? html`<div class="empty inpreview">Laden...</div>`
+                  ? html`<div class="empty inpreview">Loading...</div>`
                   : selectedIsVideo
                     ? html`<div id="preview-video-host" class="preview-video-host"></div>`
                     : html`<img class="pimg" src=${selectedUrl} alt="" />`}
@@ -4086,6 +4375,11 @@ class CameraGalleryCard extends LitElement {
                   return html`<div class="gallery-pill"><ha-icon icon="${icon}"></ha-icon></div>`;
                 })()}
                 <div class="gallery-pill"><span>${idx + 1}/${filtered.length}</span></div>
+                ${!selectedIsVideo && selectedHasUrl && !noResultsForFilter ? html`
+                  <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openImageFullscreen(); }}>
+                    <ha-icon icon="mdi:fullscreen"></ha-icon>
+                  </button>
+                ` : html``}
               </div>
             ` : isLive ? html`
               <div class="live-controls-bar ${this._pillsVisible || this._showLivePicker ? "visible" : ""}">
@@ -4093,6 +4387,9 @@ class CameraGalleryCard extends LitElement {
                   <div class="gallery-pill"><span>${this._friendlyCameraName(this._getEffectiveLiveCamera())}</span></div>
                 </div>
                 <div class="live-pills-right">
+                  <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleAspectRatio(); }}>
+                    <span>${this._aspectRatioLabel()}</span>
+                  </button>
                   <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleLiveMute(); }}>
                     <ha-icon icon=${this._liveMuted ? "mdi:volume-off" : "mdi:volume-high"}></ha-icon>
                   </button>
@@ -4240,7 +4537,10 @@ class CameraGalleryCard extends LitElement {
                           poster = snapshotUrl;
                         } else if (thumbUrl) {
                           poster = this._posterCache.get(thumbUrl) || "";
-                          if (!poster) this._enqueuePoster(thumbUrl);
+                          // Sla poster-capture over voor de geselecteerde video: die laadt
+                          // al als preview. Gelijktijdig laden van dezelfde MS-URL blokkeert
+                          // de preview video en verhindert autoplay.
+                          if (!poster && thumbUrl !== selectedUrl) this._enqueuePoster(thumbUrl);
                         }
                       } else {
                         poster = this._posterCache.get(it.src) || "";
@@ -4477,6 +4777,15 @@ class CameraGalleryCard extends LitElement {
           : html``}
 
         ${this._renderThumbActionSheet()}
+
+        ${this._imgFsOpen && selectedUrl ? html`
+          <div class="img-fs-overlay" @click=${() => this._closeImageFullscreen()}>
+            <img src=${selectedUrl} alt="" @click=${(e) => e.stopPropagation()} />
+            <button class="img-fs-close" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._closeImageFullscreen(); }}>
+              <ha-icon icon="mdi:fullscreen-exit"></ha-icon>
+            </button>
+          </div>
+        ` : html``}
       </div>
     `;
   }
@@ -4582,6 +4891,7 @@ class CameraGalleryCard extends LitElement {
         height: auto !important;
         min-height: 0;
         border-radius: 0 !important;
+        overflow: hidden;
       }
 
       :host([data-live-fs]) .divider,
@@ -4624,6 +4934,37 @@ class CameraGalleryCard extends LitElement {
         pointer-events: none;
       }
 
+      .img-fs-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100dvw;
+        height: 100dvh;
+      }
+      .img-fs-overlay img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+      }
+      .img-fs-close {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        background: rgba(0,0,0,0.5);
+        border: none;
+        border-radius: 50%;
+        color: #fff;
+        cursor: pointer;
+        padding: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
       .live-stage {
         position: absolute;
         inset: 0;
@@ -4660,7 +5001,7 @@ class CameraGalleryCard extends LitElement {
       .live-card-host video {
         width: 100% !important;
         height: 100% !important;
-        object-fit: cover !important;
+        object-fit: var(--cgc-object-fit, cover) !important;
       }
 
       .segbtn.livebtn {
@@ -4681,7 +5022,7 @@ class CameraGalleryCard extends LitElement {
         width: 100%;
         height: 100%;
         display: block;
-        object-fit: cover;
+        object-fit: var(--cgc-object-fit, cover);
         pointer-events: auto;
       }
 
@@ -5150,8 +5491,10 @@ class CameraGalleryCard extends LitElement {
         z-index: 1;
       }
       .gallery-pill span {
-        display: block;
+        display: flex;
+        align-items: center;
         font-size: calc(var(--cgc-pill-size, 14px) - 2px);
+        height: calc(var(--cgc-pill-size, 14px) + 2px);
         line-height: 1;
       }
       .gallery-pill ha-icon {
@@ -5423,7 +5766,7 @@ class CameraGalleryCard extends LitElement {
       .timg {
         width: 100%;
         height: 100%;
-        object-fit: cover;
+        object-fit: var(--cgc-object-fit, cover);
         display: block;
       }
 
@@ -6857,6 +7200,7 @@ class CameraGalleryCardEditor extends HTMLElement {
     const cSourceMode = String(c.source_mode || "sensor");
     const sensorModeOn = cSourceMode === "sensor";
     const mediaModeOn = cSourceMode === "media";
+    const startMode = String(c.start_mode || "gallery");
 
     const entitiesArr = Array.isArray(c.entities)
       ? c.entities.map(String).map((s) => s.trim()).filter(Boolean)
@@ -6894,7 +7238,6 @@ class CameraGalleryCardEditor extends HTMLElement {
     const selectedCount = objectFiltersArr.length;
     const objectColors = (typeof c.object_colors === "object" && c.object_colors !== null) ? c.object_colors : {};
 
-    const height = Number(c.preview_height) || 320;
     const thumbSize = Number(c.thumb_size) || 140;
     const maxMedia = (() => {
       const n = this._numInt(c.max_media, 20);
@@ -8727,6 +9070,14 @@ class CameraGalleryCardEditor extends HTMLElement {
               ? `
             <div class="tabpanel" data-panel="general">
               <div class="row">
+                <div class="lbl">Default view</div>
+                <div class="segwrap">
+                  <button class="seg ${startMode !== "live" ? "on" : ""}" data-startmode="gallery">Gallery</button>
+                  <button class="seg ${startMode === "live" ? "on" : ""}" data-startmode="live">Live</button>
+                </div>
+              </div>
+
+              <div class="row">
                 <div class="lbl">Source mode</div>
                 <div class="segwrap">
                   <button class="seg ${sensorModeOn ? "on" : ""}" data-src="sensor">File sensor</button>
@@ -8862,11 +9213,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             this._activeTab === "viewer"
               ? `
             <div class="tabpanel" data-panel="viewer">
-              <div class="row">
-                <div class="lbl">Height</div>
-                <div class="ed-input-row"><input type="number" class="ed-input" id="height" /><span class="ed-suffix">px</span></div>
-              </div>
-
               <div class="row">
                 <div class="lbl">Image fit</div>
                 <div class="segwrap">
@@ -9283,7 +9629,7 @@ class CameraGalleryCardEditor extends HTMLElement {
     const mediaEl = $("mediasources");
     const filenameFmtEl = $("filenamefmt");
     const delserviceEl = $("delservice");
-    const heightEl = $("height");
+
     const thumbEl = $("thumb");
     const maxmediaEl = $("maxmedia");
     const baropEl = $("barop");
@@ -9298,7 +9644,6 @@ class CameraGalleryCardEditor extends HTMLElement {
     this._setControlValue(entitiesEl, entitiesText);
     this._setControlValue(mediaEl, mediaSourcesText);
     this._setControlValue(filenameFmtEl, filenameDatetimeFormat);
-    this._setControlValue(heightEl, String(height));
     this._setControlValue(thumbEl, String(thumbSize));
     this._setControlValue(maxmediaEl, String(maxMedia));
     this._setControlValue(baropEl, barOpacity);
@@ -9493,16 +9838,6 @@ class CameraGalleryCardEditor extends HTMLElement {
     filenameFmtEl?.addEventListener("change", () => commitFilenameFormat(true));
     filenameFmtEl?.addEventListener("blur", () => commitFilenameFormat(true));
 
-    heightEl?.addEventListener("input", () =>
-      commitNumberField("preview_height", heightEl, 320, false)
-    );
-    heightEl?.addEventListener("change", () =>
-      commitNumberField("preview_height", heightEl, 320, true)
-    );
-    heightEl?.addEventListener("blur", () =>
-      commitNumberField("preview_height", heightEl, 320, true)
-    );
-
     this.shadowRoot.querySelectorAll(".seg[data-objfit]").forEach((btn) => {
       btn.addEventListener("click", () =>
         this._set("object_fit", btn.dataset.objfit)
@@ -9512,6 +9847,12 @@ class CameraGalleryCardEditor extends HTMLElement {
     this.shadowRoot.querySelectorAll(".seg[data-ppos]").forEach((btn) => {
       btn.addEventListener("click", () =>
         this._set("preview_position", btn.dataset.ppos)
+      );
+    });
+
+    this.shadowRoot.querySelectorAll(".seg[data-startmode]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        this._set("start_mode", btn.dataset.startmode)
       );
     });
 
@@ -10180,7 +10521,6 @@ class CameraGalleryCardEditor extends HTMLElement {
         id === "entities" ||
         id === "mediasources" ||
         id === "filenamefmt" ||
-        id === "height" ||
         id === "thumb" ||
         id === "maxmedia" ||
         id === "new-filter-name" ||
