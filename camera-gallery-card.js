@@ -2,7 +2,7 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "2.3.0";
+const CARD_VERSION = "2.3.1";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
@@ -1647,10 +1647,10 @@ class CameraGalleryCard extends LitElement {
   }
 
   _syncCurrentMedia(src) {
-    if (!src || src === this._lastSyncedSrc) return;
-    this._lastSyncedSrc = src;
     const syncEntity = this.config?.sync_entity;
     if (!syncEntity || !syncEntity.startsWith("input_text.")) return;
+    if (!src || src === this._lastSyncedSrc) return;
+    this._lastSyncedSrc = src;
     const filename = src.split("/").pop().split("?")[0];
     this._hass?.callService("input_text", "set_value", {
       entity_id: syncEntity,
@@ -4341,6 +4341,7 @@ class CameraGalleryCard extends LitElement {
       thumb_size,
       live_go2rtc_stream: String(config.live_go2rtc_stream || "").trim() || null,
       folder_datetime_format: String(config.folder_datetime_format || "").trim() || null,
+      sync_entity: String(config.sync_entity || "").trim() || null,
     };
 
     this.config = nextConfig;
@@ -4404,6 +4405,10 @@ class CameraGalleryCard extends LitElement {
       prevConfig.preview_click_to_open !== this.config.preview_click_to_open
     ) {
       this._previewOpen = !this.config.preview_click_to_open;
+    }
+
+    if (prevConfig && prevConfig.sync_entity !== this.config.sync_entity) {
+      this._lastSyncedSrc = null;
     }
 
     if (sourceChange) {
