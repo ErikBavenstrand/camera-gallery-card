@@ -2,7 +2,7 @@
 
 Custom **Home Assistant Lovelace card** for browsing camera media in a clean **timeline-style gallery** with preview player, object filters, optional live view, and a built-in visual editor.
 
-**Current version:** `v2.3.0`
+**Current version:** `v2.3.1`
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/1c71ada8-98bb-435e-bbc6-b6974186c2e0" width="30%" />
@@ -145,6 +145,30 @@ The **Styling** tab provides a visual editor for colors and border radius.
 ---
 
 ## Delete setup
+
+Add this to your `configuration.yaml` and restart Home Assistant:
+
+```yaml
+shell_command:
+  gallery_delete: 'rm -f "{{ path }}"'
+```
+
+*(Note: The `{{ path }}` represents the absolute path to the file inside your Home Assistant container, for example: `/config/www/doorbell/visitor/{{ file }}`
+
+Then configure the card to use it:
+
+```yaml
+type: custom:camera-gallery-card
+camera_entity: camera.my_camera
+delete_service: shell_command.gallery_delete
+allow_delete: true
+```
+
+The card will show a delete option in the thumbnail context menu (e.g. `/config/www/doorbell/visitor/snapshot1.jpg`). A confirmation dialog is shown by default — you can disable it with `delete_confirm: false`.
+
+> ⚠️ **Warning:** This permanently deletes the file from disk. There is no undo.
+
+---
 
 > [!TIP]
 > To enable delete actions, configure a shell command in Home Assistant and provide the service name in the card editor under **General → Delete service**.
