@@ -159,6 +159,28 @@ Optional delete options are also available in the editor:
 
 ---
 
+## Sync selected filename to Home Assistant
+
+The card can write the filename of the currently selected image or video to a Home Assistant `input_text` helper. You can then use it anywhere in HA — other cards, template sensors, automations, etc.
+
+**1. Create a helper**
+
+Go to **Settings → Helpers → Create helper → Text** and give it a name (e.g. `camera_selected_file`).
+
+**2. Add to your card config**
+
+```yaml
+sync_entity: input_text.camera_selected_file
+```
+
+**3. Use it anywhere in HA**
+
+```yaml
+{{ states('input_text.camera_selected_file') }}
+```
+
+---
+
 ## Configuration options
 
 <details>
