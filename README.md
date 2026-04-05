@@ -51,7 +51,7 @@ FileTrack is a fork of the archived [files integration by TarheelGrad1998](https
 - Image & video preview
 - Timeline thumbnails with lazy loading
 - Day grouping
-- Filename timestamp parsing
+- Automatic timestamp parsing from filename and folder path — no configuration needed for most setups
 - Object filter buttons with custom icon support
 - Object detection pill in timestamp bar
 - Horizontal or vertical thumbnail layout
@@ -101,6 +101,7 @@ FileTrack is a fork of the archived [files integration by TarheelGrad1998](https
 - Multiple delete
 - Download
 - Long-press action menu
+- **Write selected filename to `input_text` helper** — use `{{ states('input_text.your_helper') }}` anywhere in HA
 
 <img width="441" height="307" alt="Scherm­afbeelding 2026-03-29 om 20 49 53" src="https://github.com/user-attachments/assets/bdcde10e-b882-444f-a99d-0ae0073e68a7" />
 
@@ -188,6 +189,9 @@ Optional delete options are also available in the editor:
 | `autoplay` | Auto-play videos in gallery |
 | `auto_muted` | Auto-mute videos in gallery |
 | `object_fit` | Media display mode: `cover` or `contain` |
+| `sync_entity` | `input_text.*` entity to write the selected filename to |
+| `folder_datetime_format` | Custom folder date format (e.g. `YYYY-MM-DD`) |
+| `filename_datetime_format` | Custom filename date/time format (e.g. `YYYY{MM}{DD}_{HH}{mm}{ss}`) |
 | `allow_delete` | Enable delete action |
 | `allow_bulk_delete` | Enable bulk delete |
 | `delete_confirm` | Show confirmation before deleting |
@@ -251,36 +255,71 @@ Object filter colors can be assigned per filter type in the editor.
 
 ## Filename & path parsing
 
-The card extracts timestamps from filenames and folder paths for sorting, day grouping, preview timestamps, and thumbnail labels.
+The card extracts timestamps from filenames and folder paths for sorting, day grouping, preview timestamps, and thumbnail labels. Most common NVR and camera setups are recognised automatically — no configuration needed.
 
-Example supported formats:
-```
-2026-03-09_12-31-10_person.jpg
-20260309_123110_person.jpg
-clip-1741512345-person.mp4
-```
+### Automatic detection
 
-### Folder-based date format
+**Folder = date, filename = time**
 
-Some NVR systems (Reolink, Blue Iris, NAS) store recordings in day-based folders:
+Many NVR systems store recordings in dated folders. The card detects the date from the folder name and the time from the filename:
 
 ```
-/media/recordings/20260314/173154.mp4
-                  └─date─┘ └─time─┘
+/media/recordings/2026-03-14/14_30_00.mp4
+/media/recordings/20260314/143000.mp4
+/media/recordings/14-03-2026/cam_14:30:00.mp4
 ```
 
-The card automatically recognises this `YYYYMMDD/HHMMSS` pattern — no extra configuration needed.
+Recognised folder formats:
 
-A custom format can be set in the editor using these tokens:
+| Format | Example |
+|---|---|
+| `YYYY-MM-DD` / `YYYY.MM.DD` / `YYYY_MM_DD` | `2026-03-14` |
+| `DD-MM-YYYY` / `DD.MM.YYYY` / `DD_MM_YYYY` | `14-03-2026` |
+| `YYYYMMDD` | `20260314` |
+| `DDMM` (4 digits, European first) | `1403` |
+| `MMDD` (4 digits, fallback) | `0314` |
+
+Recognised time formats in filename (prefix/suffix allowed):
+
+| Format | Example |
+|---|---|
+| `HH:MM:SS` | `cam_14:30:00.mp4` |
+| `HH-MM-SS` | `cam_14-30-00.mp4` |
+| `HH_MM_SS` | `cam_14_30_00.mp4` |
+| `HHMMSS` (exact 6 digits only) | `143000.mp4` |
+
+**All date/time in the filename**
+
+| Format | Example |
+|---|---|
+| `YYYY-MM-DD` + separator + `HH:MM:SS` / `HH-MM-SS` / `HH.MM.SS` | `2026-03-14_14-30-00.jpg` |
+| `YYYYMMDD_HHMMSS` or `YYYYMMDD-HHMMSS` | `20260314_143000.jpg` |
+| `/YYYYMMDD/HHMMSS.` (path structure) | `.../20260314/143000.jpg` |
+| Unix timestamp (9–11 digits) | `1741512345.jpg` |
+| Reolink media source | detected automatically |
+
+---
+
+### Custom format (for non-standard setups)
+
+If your folder or filename uses a different pattern, set `folder_datetime_format` and/or `filename_datetime_format` in the editor.
+
+Available tokens:
 
 | Token | Meaning |
-|------|------|
-| YYYY | Year |
-| MM | Month |
-| DD | Day |
-| HH | Hour |
-| mm | Minutes |
-| ss | Seconds |
+|---|---|
+| `YYYY` | 4-digit year |
+| `YY` | 2-digit year (2000+) |
+| `MM` | Month |
+| `DD` | Day |
+| `HH` | Hour |
+| `mm` | Minutes |
+| `ss` | Seconds |
+
+Everything outside the tokens is matched literally. Example: `cam_{YYYY}{MM}{DD}` matches `cam_20260314`.
+
+> [!TIP]
+> `folder_datetime_format` and `filename_datetime_format` take priority over auto-detection. Use them only when auto-detection does not cover your setup.
 
 ---
 
