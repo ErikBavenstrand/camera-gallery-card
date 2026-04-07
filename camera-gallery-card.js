@@ -2,7 +2,7 @@
  * Camera Gallery Card
  */
 
-const CARD_VERSION = "2.4.0";
+const CARD_VERSION = "2.5.0";
 
 // -------- HARD CODED SETTINGS --------
 const ATTR_NAME = "fileList";
@@ -28,7 +28,7 @@ const DEFAULT_FILENAME_DATETIME_FORMAT = "";
 const DEFAULT_LIVE_ENABLED = false;
 const DEFAULT_MAX_MEDIA = 20;
 const DEFAULT_PER_ROOT_MIN_LIMIT = 40;
-const DEFAULT_PREVIEW_CLICK_TO_OPEN = false;
+const DEFAULT_CLEAN_MODE = false;
 const DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED = true;
 const DEFAULT_PREVIEW_POSITION = "top"; // "top" | "bottom"
 const DEFAULT_RESOLVE_BATCH = 8;
@@ -500,7 +500,7 @@ class CameraGalleryCard extends LitElement {
       !!selected &&
       this._isVideoSmart(selectedUrl || selectedTitle, selectedMime, selectedCls);
 
-    const previewGated = !!this.config?.preview_click_to_open;
+    const previewGated = !!this.config?.clean_mode;
     const previewOpen = !previewGated || !!this._previewOpen;
     const selectedNeedsResolve =
       !!selected && usingMediaSource && this._isMediaSourceId(selected);
@@ -1144,7 +1144,7 @@ class CameraGalleryCard extends LitElement {
   _friendlyCameraName(entityId) {
     const id = String(entityId || "").trim();
     if (!id) return "";
-    if (id === "__cgc_stream__") return String(this.config?.live_stream_name || "Stream").trim();
+    if (id.startsWith("__cgc_stream")) { const se = this._getStreamEntryById(id); return se ? se.name : "Stream"; }
 
     const st = this._hass?.states?.[id];
     const friendly = String(st?.attributes?.friendly_name || "").trim();
@@ -1288,7 +1288,7 @@ class CameraGalleryCard extends LitElement {
 
   _hasLiveConfig() {
     if (!this.config?.live_enabled) return false;
-    if (this.config?.live_stream_url) return true;
+    if (this._getStreamEntries().length > 0) return true;
     return this._getLiveCameraOptions().length > 0;
   }
 
@@ -1324,7 +1324,7 @@ class CameraGalleryCard extends LitElement {
       "live_default_camera",
       "live_enabled",
       "object_filters",
-      "preview_click_to_open",
+      "clean_mode",
       "preview_close_on_tap",
       "preview_position",
       "pill_size",
@@ -1625,9 +1625,31 @@ class CameraGalleryCard extends LitElement {
     return options[0] || "";
   }
 
+  _getStreamEntries() {
+    const urls = this.config?.live_stream_urls;
+    if (Array.isArray(urls) && urls.length > 0) {
+      return urls
+        .filter(e => e && String(e.url || "").trim())
+        .map((e, i) => ({ id: `__cgc_stream_${i}__`, url: String(e.url).trim(), name: String(e.name || "").trim() || `Stream ${i + 1}` }));
+    }
+    if (this.config?.live_stream_url) {
+      return [{ id: "__cgc_stream_0__", url: this.config.live_stream_url, name: this.config.live_stream_name || "Stream" }];
+    }
+    return [];
+  }
+
+  _getStreamEntryById(id) {
+    const sid = String(id || "");
+    if (!sid.startsWith("__cgc_stream")) return null;
+    const entries = this._getStreamEntries();
+    // exact match first, then fallback __cgc_stream__ → index 0
+    return entries.find(e => e.id === sid) || (sid === "__cgc_stream__" ? (entries[0] || null) : null);
+  }
+
   _getLiveCameraOptions() {
     const entities = this._getAllLiveCameraEntities();
-    return this.config?.live_stream_url ? ["__cgc_stream__", ...entities] : entities;
+    const streamIds = this._getStreamEntries().map(e => e.id);
+    return [...streamIds, ...entities];
   }
 
   _hideLiveQuickSwitchButton() {
@@ -1900,10 +1922,10 @@ class CameraGalleryCard extends LitElement {
     if (!host) return;
 
     const effectiveCam = this._getEffectiveLiveCamera();
-    const isStreamUrl = effectiveCam === "__cgc_stream__" ||
-      (this.config?.live_stream_url && !effectiveCam);
+    const streamEntry = this._getStreamEntryById(effectiveCam);
+    const isStreamUrl = !!streamEntry;
     const card = isStreamUrl
-      ? await this._ensureLiveCardFromUrl(this.config.live_stream_url)
+      ? await this._ensureLiveCardFromUrl(streamEntry.url)
       : await this._ensureLiveCard();
     if (!card) return;
 
@@ -2000,8 +2022,7 @@ class CameraGalleryCard extends LitElement {
 
   _renderLiveInner() {
     const effectiveCam = this._getEffectiveLiveCamera();
-    const isStreamUrl = effectiveCam === "__cgc_stream__" ||
-      (this.config?.live_stream_url && !effectiveCam);
+    const isStreamUrl = !!this._getStreamEntryById(effectiveCam);
     if (!isStreamUrl) {
       const entity = effectiveCam;
       if (!entity) {
@@ -2060,7 +2081,7 @@ class CameraGalleryCard extends LitElement {
                     this._pendingScrollToI = null;
                     this._forceThumbReset = true;
                     this._exitSelectMode();
-                    if (this.config?.preview_click_to_open) this._previewOpen = false;
+                    if (this.config?.clean_mode) this._previewOpen = false;
                     this._closeDatePicker();
                   }}
                 >
@@ -2165,10 +2186,6 @@ class CameraGalleryCard extends LitElement {
     if (mode !== "live") {
       this._hideLiveQuickSwitchButton();
       this._showLivePicker = false;
-    }
-
-    if (this.config?.preview_click_to_open) {
-      this._previewOpen = mode === "live" ? true : !!this._previewOpen;
     }
 
     this.requestUpdate();
@@ -2981,12 +2998,12 @@ class CameraGalleryCard extends LitElement {
       );
 
       const internalCap = isFrigateRoot
-        ? Math.min(400, Math.max(visibleCap * 4, 200))
-        : Math.min(300, Math.max(visibleCap * 4, 80));
+        ? Math.min(10000, Math.max(visibleCap * 10, 2000))
+        : Math.min(2000, Math.max(visibleCap * 4, 400));
 
       const walkLimitTotal = isFrigateRoot
-        ? Math.min(800, Math.max(internalCap * 2, 400))
-        : Math.min(400, Math.max(Math.ceil(internalCap * 1.5), internalCap + 20));
+        ? Math.min(20000, Math.max(internalCap * 3, 6000))
+        : Math.min(4000, Math.max(internalCap * 2, 800));
       const perRootLimit = Math.max(
         DEFAULT_PER_ROOT_MIN_LIMIT,
         Math.ceil(walkLimitTotal / roots.length)
@@ -3111,7 +3128,7 @@ class CameraGalleryCard extends LitElement {
       h ^= key.charCodeAt(i);
       h = Math.imul(h, 16777619) >>> 0;
     }
-    return "cgc_mswalk_" + h.toString(36);
+    return "cgc_mswalk2_" + h.toString(36);
   }
 
   _msWalkCacheSave(key, list) {
@@ -3805,7 +3822,7 @@ class CameraGalleryCard extends LitElement {
     this._forceThumbReset = true;
     this._exitSelectMode();
 
-    if (this.config?.preview_click_to_open) this._previewOpen = false;
+    if (this.config?.clean_mode) this._previewOpen = false;
     if (this._isLiveActive()) this._setViewMode("media");
 
     this.requestUpdate();
@@ -4187,7 +4204,7 @@ class CameraGalleryCard extends LitElement {
   // ─── Preview interactions ─────────────────────────────────────────
 
   _closePreviewIfEnabled(e) {
-    if (!this.config?.preview_click_to_open) return;
+    if (!this.config?.clean_mode) return;
     if (!this.config?.preview_close_on_tap) return;
     if (!this._previewOpen) return;
     if (this._isInsideTsbar(e)) return;
@@ -4275,7 +4292,7 @@ class CameraGalleryCard extends LitElement {
     }
 
     if (!this._swiping) {
-      if (this.config?.preview_click_to_open && !this._previewOpen) return;
+      if (this.config?.clean_mode && !this._previewOpen) return;
       if (this._selectMode) return;
       this._showNavChevrons();
       this._showPills();
@@ -4284,7 +4301,7 @@ class CameraGalleryCard extends LitElement {
 
     this._swiping = false;
 
-    if (this.config?.preview_click_to_open && !this._previewOpen) return;
+    if (this.config?.clean_mode && !this._previewOpen) return;
 
     const endX = (e.clientX !== 0 || e.clientY !== 0) ? e.clientX : this._swipeCurX;
     const endY = (e.clientX !== 0 || e.clientY !== 0) ? e.clientY : this._swipeCurY;
@@ -4504,15 +4521,14 @@ class CameraGalleryCard extends LitElement {
       );
     }
 
-    const preview_click_to_open =
-      config.preview_click_to_open !== undefined
-        ? !!config.preview_click_to_open
-        : DEFAULT_PREVIEW_CLICK_TO_OPEN;
+    const clean_mode = config.clean_mode !== undefined
+      ? !!config.clean_mode
+      : (config.preview_click_to_open !== undefined ? !!config.preview_click_to_open : DEFAULT_CLEAN_MODE);
 
     const preview_close_on_tap =
       config.preview_close_on_tap !== undefined
         ? !!config.preview_close_on_tap
-        : preview_click_to_open
+        : clean_mode
           ? DEFAULT_PREVIEW_CLOSE_ON_TAP_WHEN_GATED
           : false;
 
@@ -4532,6 +4548,11 @@ class CameraGalleryCard extends LitElement {
     const live_stream_url = String(config.live_stream_url || "").trim();
     const live_stream_name = String(config.live_stream_name || "").trim();
     const live_go2rtc_url = String(config.live_go2rtc_url || "").trim();
+    const live_stream_urls = Array.isArray(config.live_stream_urls)
+      ? config.live_stream_urls
+          .filter(e => e && typeof e === "object" && String(e.url || "").trim())
+          .map(e => ({ url: String(e.url).trim(), name: String(e.name || "").trim() || null }))
+      : [];
 
     const live_camera_entities = Array.isArray(config.live_camera_entities)
       ? config.live_camera_entities.map(String).map((s) => s.trim()).filter(Boolean)
@@ -4562,13 +4583,14 @@ class CameraGalleryCard extends LitElement {
       live_enabled,
       live_stream_url: live_stream_url || null,
       live_stream_name: live_stream_name || null,
+      live_stream_urls: live_stream_urls.length > 0 ? live_stream_urls : null,
       live_go2rtc_url: live_go2rtc_url || null,
       max_media,
       media_source: source_mode === "media" ? mediaRaw : "",
       media_sources: source_mode === "media" ? normalizedMediaRoots : [],
       object_colors: (typeof config.object_colors === "object" && config.object_colors !== null) ? config.object_colors : {},
       object_filters: visibleObjectFilters,
-      preview_click_to_open,
+      clean_mode,
       preview_close_on_tap,
       preview_position,
       aspect_ratio: ["16:9", "4:3", "1:1"].includes(config.aspect_ratio) ? config.aspect_ratio : "16:9",
@@ -4619,7 +4641,7 @@ class CameraGalleryCard extends LitElement {
     const visibleSet = new Set(this._getVisibleObjectFilters());
     this._objectFilters = this._objectFilters.filter((x) => visibleSet.has(x));
 
-    const liveEntityChanged = !prevConfig || prevConfig.live_camera_entity !== live_camera_entity || prevConfig.live_stream_url !== config.live_stream_url;
+    const liveEntityChanged = !prevConfig || prevConfig.live_camera_entity !== live_camera_entity || prevConfig.live_stream_url !== config.live_stream_url || JSON.stringify(prevConfig.live_stream_urls) !== JSON.stringify(nextConfig.live_stream_urls);
     if (liveEntityChanged) {
       const liveOptions = this._getLiveCameraOptions();
       const validSelected =
@@ -4639,7 +4661,7 @@ class CameraGalleryCard extends LitElement {
     }
 
     if (!prevConfig) {
-      this._previewOpen = this.config.preview_click_to_open ? false : true;
+      this._previewOpen = this.config.clean_mode ? false : true;
       this._showLivePicker = false;
       this._showLiveQuickSwitch = false;
       const defaultRatio = this._parseAspectRatio(config.aspect_ratio);
@@ -4658,9 +4680,9 @@ class CameraGalleryCard extends LitElement {
             : "media";
       }
     } else if (
-      prevConfig.preview_click_to_open !== this.config.preview_click_to_open
+      prevConfig.clean_mode !== this.config.clean_mode
     ) {
-      this._previewOpen = !this.config.preview_click_to_open;
+      this._previewOpen = !this.config.clean_mode;
     }
 
     if (prevConfig && prevConfig.sync_entity !== this.config.sync_entity) {
@@ -4671,7 +4693,7 @@ class CameraGalleryCard extends LitElement {
       this._closeThumbMenu();
       this._forceThumbReset = false;
       this._pendingScrollToI = 0;
-      this._previewOpen = !this.config.preview_click_to_open;
+      this._previewOpen = !this.config.clean_mode;
       this._selectMode = false;
       this._selectedIndex = 0;
       this._selectedSet.clear();
@@ -4994,10 +5016,8 @@ class CameraGalleryCard extends LitElement {
           ? "hidden"
           : "top";
 
-    const previewGated = !!this.config?.preview_click_to_open;
+    const previewGated = !!this.config?.clean_mode;
     const previewOpen = !previewGated || !!this._previewOpen;
-
-    const showPreviewSection = previewOpen === true;
     const previewAtBottom = this.config?.preview_position === "bottom";
 
     const selectedNeedsResolve =
@@ -5006,13 +5026,16 @@ class CameraGalleryCard extends LitElement {
 
     const showLiveToggle = this._hasLiveConfig();
     const isLive = this._isLiveActive();
-    const useDatePicker = showTypeFilter;
+    // Live view is always "open" regardless of _previewOpen
+    const previewOpenFinal = previewOpen || isLive;
+    const showPreviewSection = previewOpenFinal;
+    const useDatePicker = showTypeFilter && navigator.maxTouchPoints > 0;
     const isVerticalThumbs = this._isThumbLayoutVertical();
 
     // DIT IS DE BELANGRIJKE LOGICA: 
     // showGalleryControls is TRUE als we de gallery/navigatie MOETEN zien.
-    // showGalleryControls is FALSE als click_to_open aan staat én de preview open is.
-    const showGalleryControls = !this.config?.preview_click_to_open || !this._previewOpen;
+    // showGalleryControls is FALSE als click_to_open aan staat én de preview open is, of als live actief is.
+    const showGalleryControls = !this.config?.clean_mode || (!this._previewOpen && !isLive);
 
     const rootVars = `
       --gap:10px; --r:10px;
@@ -5090,28 +5113,37 @@ class CameraGalleryCard extends LitElement {
 
             ${!isLive && tsPosClass !== "hidden" ? html`
               <div class="gallery-pills ${tsPosClass} ${this._pillsVisible || this.config?.persistent_controls ? "visible" : ""}">
-                ${previewGated && previewOpen ? html`
-                  <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._setViewMode("media"); this._previewOpen = false; this.requestUpdate(); }}>
-                    <ha-icon icon="mdi:arrow-left"></ha-icon>
-                  </button>
-                ` : html``}
-                ${(() => {
-                  const obj = this._objectForSrc(selected);
-                  const icon = obj ? this._objectIcon(obj) : null;
-                  if (!icon) return html``;
-                  return html`<div class="gallery-pill live-pill-btn" style="flex-shrink:0;width:calc(var(--cgc-pill-size,14px)*1.6 + 2px);height:calc(var(--cgc-pill-size,14px)*1.6 + 2px);padding:0"><ha-icon icon="${icon}"></ha-icon></div>`;
-                })()}
-                <div class="gallery-pill live-pill-btn" style="flex-shrink:0;width:calc(var(--cgc-pill-size,14px)*1.6 + 2px);height:calc(var(--cgc-pill-size,14px)*1.6 + 2px);padding:0;overflow:hidden"><span style="font-size:calc(var(--cgc-pill-size,14px) - 6px)">${idx + 1}/${filtered.length}</span></div>
-                ${!selectedIsVideo && selectedHasUrl && !noResultsForFilter ? html`
-                  <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openImageFullscreen(); }}>
-                    <ha-icon icon="mdi:fullscreen"></ha-icon>
-                  </button>
-                ` : html``}
+                <div class="gallery-pills-left">
+                  ${previewGated ? html`
+                    <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._setViewMode("media"); this._previewOpen = false; this.requestUpdate(); }}>
+                      <ha-icon icon="mdi:arrow-left"></ha-icon>
+                    </button>
+                  ` : html``}
+                </div>
+                <div class="gallery-pills-right">
+                  ${(() => {
+                    const obj = this._objectForSrc(selected);
+                    const icon = obj ? this._objectIcon(obj) : null;
+                    if (!icon) return html``;
+                    return html`<div class="gallery-pill live-pill-btn" style="flex-shrink:0;width:calc(var(--cgc-pill-size,14px)*1.6 + 2px);height:calc(var(--cgc-pill-size,14px)*1.6 + 2px);padding:0"><ha-icon icon="${icon}"></ha-icon></div>`;
+                  })()}
+                  <div class="gallery-pill live-pill-btn" style="flex-shrink:0;width:calc(var(--cgc-pill-size,14px)*1.6 + 2px);height:calc(var(--cgc-pill-size,14px)*1.6 + 2px);padding:0;overflow:hidden"><span style="font-size:calc(var(--cgc-pill-size,14px) - 6px)">${idx + 1}/${filtered.length}</span></div>
+                  ${!selectedIsVideo && selectedHasUrl && !noResultsForFilter ? html`
+                    <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._openImageFullscreen(); }}>
+                      <ha-icon icon="mdi:fullscreen"></ha-icon>
+                    </button>
+                  ` : html``}
+                </div>
               </div>
             ` : isLive ? html`
               <div class="live-controls-bar ${this._pillsVisible || this._showLivePicker || this.config?.persistent_controls ? "visible" : ""}">
                 <div class="live-pills-left">
-                  <div class="gallery-pill"><span>${this.config?.live_stream_url ? (this.config?.live_stream_name || "Live") : this._friendlyCameraName(this._getEffectiveLiveCamera())}</span></div>
+                  ${previewGated ? html`
+                    <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._setViewMode("media"); this._previewOpen = false; this.requestUpdate(); }}>
+                      <ha-icon icon="mdi:arrow-left"></ha-icon>
+                    </button>
+                  ` : html``}
+                  <div class="gallery-pill"><span>${this._friendlyCameraName(this._getEffectiveLiveCamera())}</span></div>
                 </div>
                 <div class="live-pills-right">
                   <button class="gallery-pill live-pill-btn" @pointerdown=${(e) => e.stopPropagation()} @click=${(e) => { e.stopPropagation(); this._toggleAspectRatio(); }}>
@@ -5365,7 +5397,7 @@ class CameraGalleryCard extends LitElement {
                             this._setViewMode("media");
                           }
 
-                          if (this.config?.preview_click_to_open) {
+                          if (this.config?.clean_mode) {
                             if (it.i === this._selectedIndex) {
                               this._previewOpen = !this._previewOpen;
                             } else {
@@ -5459,7 +5491,7 @@ class CameraGalleryCard extends LitElement {
                     this._pendingScrollToI = null;
                     this._forceThumbReset = true;
                     this._exitSelectMode();
-                    if (this.config?.preview_click_to_open) this._previewOpen = false;
+                    if (this.config?.clean_mode) this._previewOpen = false;
                     if (this._isLiveActive()) this._setViewMode("media");
                     this.requestUpdate();
                   }}
@@ -6259,15 +6291,23 @@ class CameraGalleryCard extends LitElement {
       }
       .gallery-pills {
         position: absolute;
-        left: 50%;
-        transform: translateX(-50%);
+        left: 8px;
+        right: 8px;
         display: flex;
         flex-direction: row;
-        gap: 6px;
+        justify-content: space-between;
+        align-items: center;
         opacity: 0;
         transition: opacity 0.25s ease;
         pointer-events: none;
         z-index: 10;
+      }
+      .gallery-pills-left,
+      .gallery-pills-right {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 6px;
       }
       .gallery-pills.visible {
         opacity: 1;
@@ -8165,7 +8205,7 @@ class CameraGalleryCardEditor extends HTMLElement {
 
     const barDisabled = tsPos === "hidden";
     const pillSize = Math.max(10, Math.min(28, Number(c.pill_size) || 14));
-    const clickToOpen = c.preview_click_to_open === true;
+    const cleanMode = c.clean_mode === true;
     const persistentControls = c.persistent_controls === true;
 
     const liveEnabled = c.live_enabled === true;
@@ -8512,114 +8552,61 @@ class CameraGalleryCardEditor extends HTMLElement {
               </div>
 
               <div class="row">
-                <div class="lbl">Source mode</div>
+                <div class="lbl">Source</div>
                 <div class="segwrap">
                   <button class="seg ${sensorModeOn ? "on" : ""}" data-src="sensor">File sensor</button>
                   <button class="seg ${mediaModeOn ? "on" : ""}" data-src="media">Media folders</button>
                 </div>
-              </div>
 
-              <div class="row ${sensorModeOn ? "" : "muted"}">
-                <div class="lbl">File sensors</div>
-                <div class="desc">Enter <b>one</b> sensor per line</div>
-
-                <div class="field" id="entities-field">
-                  <textarea
-                    id="entities"
-                    rows="4"
-                    ${sensorModeOn ? "" : "disabled"}
-                    placeholder="sensor.gallery_auto&#10;sensor.gallery_muis"
-                  ></textarea>
-                  <div class="suggestions" id="entities-suggestions" hidden></div>
+                ${sensorModeOn ? `
+                <div style="margin-top:10px;">
+                  <div class="field" id="entities-field">
+                    <textarea id="entities" rows="4" placeholder="Enter one sensor per line"></textarea>
+                    <div class="suggestions" id="entities-suggestions" hidden></div>
+                  </div>
+                  ${invalidEntities.length ? `<div class="desc">⚠️ Invalid / missing sensor(s): <code>${invalidEntities.join("</code>, <code>")}</code></div>` : ``}
+                  ${this._renderFilesWizard()}
                 </div>
-
-                ${
-                  invalidEntities.length
-                    ? `<div class="desc">⚠️ Invalid / missing sensor(s): <code>${invalidEntities.join(
-                        "</code>, <code>"
-                      )}</code></div>`
-                    : ``
-                }
-
-                ${sensorModeOn ? this._renderFilesWizard() : ""}
-              </div>
-
-              <div class="row ${mediaModeOn ? "" : "muted"}">
-                <div class="lbl">Media folders</div>
-                <div class="desc">Enter <strong>one</strong> folder per line, or browse and select folders</div>
-
-                <div class="field" id="mediasources-field">
-                  <textarea
-                    id="mediasources"
-                    rows="4"
-                    placeholder="media-source://frigate/frigate/event-search/clips"
-                    ${mediaModeOn ? "" : "disabled"}
-                  ></textarea>
-                  <div class="suggestions" id="mediasources-suggestions" hidden></div>
+                ` : `
+                <div style="margin-top:10px;">
+                  <div class="field" id="mediasources-field">
+                    <textarea id="mediasources" rows="4" placeholder="Enter one folder per line, or browse and select folders"></textarea>
+                    <div class="suggestions" id="mediasources-suggestions" hidden></div>
+                  </div>
+                  <div class="row-actions">
+                    <button type="button" class="actionbtn" id="browse-media-folders"><ha-icon icon="mdi:folder-search-outline"></ha-icon><span>Browse</span></button>
+                    <button type="button" class="actionbtn" id="clear-media-folders"><ha-icon icon="mdi:delete-outline"></ha-icon><span>Clear</span></button>
+                  </div>
+                  ${mediaHasFile ? `<div class="desc">⚠️ One of your entries looks like a file (extension). This field expects folders.</div>` : ``}
                 </div>
-
-                <div class="row-actions">
-                  <button
-                    type="button"
-                    class="actionbtn"
-                    id="browse-media-folders"
-                    ${mediaModeOn ? "" : "disabled"}
-                  >
-                    <ha-icon icon="mdi:folder-search-outline"></ha-icon>
-                    <span>Browse</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    class="actionbtn"
-                    id="clear-media-folders"
-                    ${mediaModeOn ? "" : "disabled"}
-                  >
-                    <ha-icon icon="mdi:delete-outline"></ha-icon>
-                    <span>Clear</span>
-                  </button>
-                </div>
-
-                ${
-                  mediaHasFile
-                    ? `<div class="desc">⚠️ One of your entries looks like a file (extension). This field expects folders.</div>`
-                    : ``
-                }
+                `}
               </div>
 
               <div class="row">
-                <div class="lbl">Folder datetime format</div>
-                <div class="desc">
-                  Parse date from the <strong>parent folder name</strong>. Combine with Filename datetime format for folder=date, file=time setups.
-                </div>
-
-                <input type="text" class="ed-input" id="folderfmt" placeholder="DDMM" />
-
-                <div class="hint">
-                  <ha-icon icon="mdi:information-outline"></ha-icon>
-                  Examples:
-                  <code>DDMM</code>,
-                  <code>YYYYMMDD</code>,
-                  <code>DD-MM-YYYY</code>.
-                  Year defaults to current year if omitted.
-                </div>
-              </div>
-
-              <div class="row">
-                <div class="lbl">Filename datetime format</div>
-                <div class="desc">
-                  Optional custom parser for date and time found in filenames.
-                </div>
-
-                <input type="text" class="ed-input" id="filenamefmt" placeholder="YYYYMMDDHHmmss" />
-
-                <div class="hint">
-                  <ha-icon icon="mdi:information-outline"></ha-icon>
-                  Examples:
-                  <code>YYYYMMDDHHmmss</code>,
-                  <code>DD-MM-YYYY_HH-mm-ss</code>,
-                  <code>YYYY-MM-DDTHH:mm:ss</code>
-                </div>
+                <details ${c.folder_datetime_format || c.filename_datetime_format ? "open" : ""}>
+                  <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;">
+                    <ha-icon icon="mdi:chevron-right" style="transition:transform 0.15s;" class="details-chevron"></ha-icon>
+                    <span class="lbl" style="margin:0;">Datetime formats</span>
+                  </summary>
+                  <div style="padding-top:10px;display:flex;flex-direction:column;gap:14px;">
+                    <div>
+                      <div class="lbl">Folder datetime format</div>
+                      <input type="text" class="ed-input" id="folderfmt" placeholder="DDMM" style="margin-top:4px;" />
+                      <div class="hint" style="margin-top:4px;">
+                        <ha-icon icon="mdi:information-outline"></ha-icon>
+                        Examples: <code>DDMM</code>, <code>YYYYMMDD</code>, <code>DD-MM-YYYY</code>. Year defaults to current year if omitted.
+                      </div>
+                    </div>
+                    <div>
+                      <div class="lbl">Filename datetime format</div>
+                      <input type="text" class="ed-input" id="filenamefmt" placeholder="YYYYMMDDHHmmss" style="margin-top:4px;" />
+                      <div class="hint" style="margin-top:4px;">
+                        <ha-icon icon="mdi:information-outline"></ha-icon>
+                        Examples: <code>YYYYMMDDHHmmss</code>, <code>DD-MM-YYYY_HH-mm-ss</code>, <code>YYYY-MM-DDTHH:mm:ss</code>
+                      </div>
+                    </div>
+                  </div>
+                </details>
               </div>
 
               <div class="row">
@@ -8678,14 +8665,11 @@ class CameraGalleryCardEditor extends HTMLElement {
               <div class="row">
                 <div class="row-head">
                   <div>
-                    <div class="lbl">Open-on-click</div>
-                    <div class="desc">
-                      Only show the main viewer after selecting a thumbnail. Click on the preview to close
-                    </div>
+                    <div class="lbl">Clean mode</div>
                   </div>
 
                   <div class="togrow">
-                    <ha-switch id="clicktoopen" ${clickToOpen ? "checked" : ""}></ha-switch>
+                    <ha-switch id="cleanmode" ${cleanMode ? "checked" : ""}></ha-switch>
                   </div>
                 </div>
               </div>
@@ -8742,7 +8726,7 @@ class CameraGalleryCardEditor extends HTMLElement {
                 </div>
 
                 <div class="desc">
-                  Enable live mode in the gallery preview. All available camera entities are detected automatically.
+                  Enable live mode in the gallery preview.
                 </div>
               </div>
 
@@ -8753,11 +8737,15 @@ class CameraGalleryCardEditor extends HTMLElement {
                 <div class="row">
                   <div class="lbl">Visible cameras in picker</div>
                   <div class="desc">Select cameras for the picker. At least one camera must be added to enable live mode.</div>
-                  ${this._config.live_stream_url ? `
-                  <div class="livecam-tags">
-                    <div class="livecam-tag"><span style="opacity:0.5;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">stream</span><span style="margin-left:4px;">${this._config.live_stream_name || "Stream"}</span></div>
-                  </div>
-                  ` : ``}
+                  ${(() => {
+                    const se = Array.isArray(this._config.live_stream_urls) && this._config.live_stream_urls.length > 0
+                      ? this._config.live_stream_urls.filter(e => e?.url)
+                      : (this._config.live_stream_url ? [{ url: this._config.live_stream_url, name: this._config.live_stream_name || "Stream" }] : []);
+                    return se.length > 0 ? `
+                      <div class="livecam-tags">
+                        ${se.map((e, i) => `<div class="livecam-tag"><span style="opacity:0.5;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">stream ${se.length > 1 ? i+1 : ""}</span><span style="margin-left:4px;">${e.name || "Stream"}</span></div>`).join("")}
+                      </div>` : ``;
+                  })()}
                   ${liveCameraEntities.length > 0 ? `
                   <div class="livecam-tags" id="livecam-tags-dnd">
                     ${liveCameraEntities.map((id, i) => {
@@ -8778,7 +8766,7 @@ class CameraGalleryCardEditor extends HTMLElement {
                   <div class="desc">Optional. This sets the default camera when live mode opens.</div>
                   ${liveCameraEntity ? `
                   <div class="livecam-tags">
-                    <div class="livecam-tag"><span>${liveCameraEntity === "__cgc_stream__" ? (this._config.live_stream_name || "Stream") : String(this._hass?.states?.[liveCameraEntity]?.attributes?.friendly_name || liveCameraEntity).trim()}</span><span class="livecam-tag-entity">${liveCameraEntity === "__cgc_stream__" ? "stream url" : liveCameraEntity}</span><button type="button" class="livecam-tag-del" data-deldefcam="${liveCameraEntity}">×</button></div>
+                    <div class="livecam-tag"><span>${liveCameraEntity.startsWith("__cgc_stream") ? (this._getStreamEntryById(liveCameraEntity)?.name || "Stream") : String(this._hass?.states?.[liveCameraEntity]?.attributes?.friendly_name || liveCameraEntity).trim()}</span><span class="livecam-tag-entity">${liveCameraEntity.startsWith("__cgc_stream") ? "stream url" : liveCameraEntity}</span><button type="button" class="livecam-tag-del" data-deldefcam="${liveCameraEntity}">×</button></div>
                   </div>
                   ${liveCameraEntity !== "__cgc_stream__" && liveCameraEntities.length > 0 && !liveCameraEntities.includes(liveCameraEntity) ? `
                   <div class="cgc-inline-warn"><ha-icon icon="mdi:alert-outline"></ha-icon><span>This camera is not in the visible cameras list. It will not appear in the picker.</span></div>
@@ -8791,75 +8779,54 @@ class CameraGalleryCardEditor extends HTMLElement {
                   </div>
                   ` : ``}
                 </div>
+
+                <div class="row">
+                  <div class="lbl">Stream URLs</div>
+                  <div class="desc">Optional. Add one or more RTSP/HLS/RTMP stream URLs. Each gets its own entry in the camera picker.</div>
+                  <div id="stream-urls-list">
+                    ${(() => {
+                      const entries = (() => {
+                        if (Array.isArray(this._config.live_stream_urls) && this._config.live_stream_urls.length > 0)
+                          return this._config.live_stream_urls;
+                        if (this._config.live_stream_url)
+                          return [{ url: this._config.live_stream_url, name: this._config.live_stream_name || "" }];
+                        return [];
+                      })();
+                      return entries.map((e, i) => `
+                        <div class="stream-url-row" data-si="${i}" style="display:flex;flex-direction:column;gap:4px;padding:8px 0 8px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);">
+                          <div style="display:flex;gap:6px;align-items:center;">
+                            <input type="text" class="ed-input stream-url-input" data-si="${i}" placeholder="rtsp://192.168.1.x:554/stream" autocomplete="off" value="${(e.url || "").replace(/"/g, "&quot;")}" style="flex:1;" />
+                            <button type="button" class="livecam-tag-del stream-url-del" data-si="${i}" style="flex-shrink:0;">×</button>
+                          </div>
+                          <input type="text" class="ed-input stream-name-input" data-si="${i}" placeholder="Name (e.g. Front door)" autocomplete="off" value="${(e.name || "").replace(/"/g, "&quot;")}" />
+                        </div>
+                      `).join("");
+                    })()}
+                  </div>
+                  <button type="button" id="stream-url-add" class="cgc-ed-btn" style="margin-top:8px;">+ Add stream URL</button>
+                </div>
+
+                <div class="row">
+                  <div class="lbl">go2rtc URL (optional)</div>
+                  <div class="desc">External go2rtc base URL (e.g. http://192.168.1.x:8555). Leave empty to use HA's built-in go2rtc.</div>
+                  <div class="field">
+                    <input type="text" class="ed-input" id="live_go2rtc_url" placeholder="http://192.168.1.x:8555" autocomplete="off" value="${this._config.live_go2rtc_url || ""}" />
+                  </div>
+                </div>
+
+                <div class="row">
+                  <div class="row-head">
+                    <div class="lbl">Auto muted</div>
+                    <div class="togrow">
+                      <ha-switch id="live_auto_muted"></ha-switch>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Menu buttons row hidden for now -->
               `
                   : ``
               }
-
-              <div class="row">
-                <div class="lbl">Stream URL</div>
-                <div class="desc">Optional. RTSP, HLS, RTMP or any URL supported by go2rtc. Use this instead of a camera entity when no HA entity is available.</div>
-                <div class="field">
-                  <input type="text" class="ed-input" id="live_stream_url" placeholder="rtsp://192.168.1.x:554/stream" autocomplete="off" value="${this._config.live_stream_url || ""}" />
-                </div>
-                <div class="lbl" style="margin-top:10px;">Stream name</div>
-                <div class="field">
-                  <input type="text" class="ed-input" id="live_stream_name" placeholder="e.g. Front door" autocomplete="off" value="${this._config.live_stream_name || ""}" />
-                </div>
-              </div>
-
-              <div class="row">
-                <div class="lbl">go2rtc URL (optional)</div>
-                <div class="desc">External go2rtc base URL (e.g. http://192.168.1.x:8555). Leave empty to use HA's built-in go2rtc.</div>
-                <div class="field">
-                  <input type="text" class="ed-input" id="live_go2rtc_url" placeholder="http://192.168.1.x:8555" autocomplete="off" value="${this._config.live_go2rtc_url || ""}" />
-                </div>
-              </div>
-
-              <div class="row">
-                <div class="row-head">
-                  <div class="lbl">Auto muted</div>
-                  <div class="togrow">
-                    <ha-switch id="live_auto_muted"></ha-switch>
-                  </div>
-                </div>
-              </div>
-
-              <div class="row">
-                <div class="lbl">Menu buttons</div>
-                <div class="desc">Buttons in the hamburger menu during live view. Switches/lights toggle, automations trigger, scripts start.</div>
-                ${(() => {
-                  const menuBtns = Array.isArray(this._config.menu_buttons) ? this._config.menu_buttons : [];
-                  return `
-                    <div class="menubtn-list">
-                      ${menuBtns.map((btn, i) => `
-                        <div class="menubtn-card">
-                          <div class="menubtn-card-header">
-                            <ha-icon icon="${btn.icon}"></ha-icon>
-                            <span class="lbl" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${btn.entity}</span>
-                            <button type="button" class="livecam-tag-del" data-delmenubutton="${i}">×</button>
-                          </div>
-                          <div class="menubtn-fields">
-                            <div><div class="desc">Icon</div><input class="ed-input" type="text" value="${btn.icon}" data-menubtn="${i}" data-mbfield="icon" placeholder="mdi:doorbell"></div>
-                            <div><div class="desc">Icon on</div><input class="ed-input" type="text" value="${btn.icon_on || ""}" data-menubtn="${i}" data-mbfield="icon_on" placeholder="(optional)"></div>
-                            <div><div class="desc">Color on</div><input class="ed-input" type="text" value="${btn.color_on || ""}" data-menubtn="${i}" data-mbfield="color_on" placeholder="#ff0000"></div>
-                            <div><div class="desc">Color off</div><input class="ed-input" type="text" value="${btn.color_off || ""}" data-menubtn="${i}" data-mbfield="color_off" placeholder="(optional)"></div>
-                          </div>
-                        </div>
-                      `).join("")}
-                    </div>
-                    <div class="field" style="margin-top:8px;">
-                      <input class="ed-input" id="menubtn-entity-input" placeholder="Entity (e.g. switch.deurbel_detect)" autocomplete="off">
-                      <div class="suggestions" id="menubtn-suggestions" hidden></div>
-                    </div>
-                    <div class="field" style="margin-top:6px;">
-                      <input class="ed-input" id="menubtn-icon-input" placeholder="Icon (e.g. mdi:motion-sensor-off)">
-                    </div>
-                    <div style="margin-top:6px;">
-                      <button type="button" id="menubtn-add-btn" class="actionbtn"><ha-icon icon="mdi:plus"></ha-icon><span>Add button</span></button>
-                    </div>
-                  `;
-                })()}
-              </div>
 
             </div>
           `;
@@ -8868,7 +8835,6 @@ class CameraGalleryCardEditor extends HTMLElement {
             <div class="tabpanel" data-panel="thumbs">
               <div class="row">
                 <div class="lbl">Thumbnail layout</div>
-                <div class="desc">Choose how thumbnails are displayed inside the card</div>
                 <div class="segwrap">
                   <button class="seg ${thumbLayout === "horizontal" ? "on" : ""}" data-tlayout="horizontal">Horizontal</button>
                   <button class="seg ${thumbLayout === "vertical" ? "on" : ""}" data-tlayout="vertical">Vertical</button>
@@ -8883,13 +8849,11 @@ class CameraGalleryCardEditor extends HTMLElement {
 
               <div class="row">
                 <div class="lbl">Maximum thumbnails shown</div>
-                <div class="desc">Maximum number of media items loaded into the gallery</div>
                 <div class="ed-input-row"><input type="number" class="ed-input" id="maxmedia" /><span class="ed-suffix">items</span></div>
               </div>
 
               <div class="row">
                 <div class="lbl">Thumbnail bar position</div>
-                <div class="desc">Choose where the info bar on each thumbnail is shown</div>
                 <div class="segwrap">
                   <button class="seg ${thumbBarPos === "top" ? "on" : ""}" data-tbpos="top">Top</button>
                   <button class="seg ${thumbBarPos === "bottom" ? "on" : ""}" data-tbpos="bottom">Bottom</button>
@@ -8929,7 +8893,6 @@ class CameraGalleryCardEditor extends HTMLElement {
               <div class="row">
                 <div class="lbl">Object filters</div>
                 <div class="objmeta">
-                  <div class="desc">Choose which filter chips are available on the card</div>
                   <div class="countpill">Selected ${selectedCount}/${MAX_VISIBLE_OBJECT_FILTERS}</div>
                 </div>
 
@@ -8961,7 +8924,6 @@ class CameraGalleryCardEditor extends HTMLElement {
 
               <div class="row">
                 <div class="lbl">Custom Object Filters</div>
-                  <div class="desc">Add custom object filters and icons (e.g., parcel, woman, etc.)</div>
 
                   <div class="custom-filter-add">
                     <input type="text" class="ed-input" id="new-filter-name" placeholder="e.g. parcel" />
@@ -9377,12 +9339,10 @@ class CameraGalleryCardEditor extends HTMLElement {
 
         .field.valid textarea {
           border-color: var(--ed-valid);
-          box-shadow: 0 0 0 3px var(--ed-valid-glow);
         }
 
         .field.invalid textarea {
           border-color: var(--ed-invalid);
-          box-shadow: 0 0 0 3px var(--ed-invalid-glow);
         }
 
         .suggestions {
@@ -9585,7 +9545,6 @@ class CameraGalleryCardEditor extends HTMLElement {
 
         .select.invalid {
           border-color: var(--ed-invalid);
-          box-shadow: 0 0 0 3px var(--ed-invalid-glow);
         }
 
         .segwrap {
@@ -9692,6 +9651,7 @@ class CameraGalleryCardEditor extends HTMLElement {
         .row-actions {
           display: flex;
           gap: 10px;
+          margin-top: 10px;
         }
 
         .row-actions .actionbtn {
@@ -10487,6 +10447,12 @@ class CameraGalleryCardEditor extends HTMLElement {
           box-shadow: var(--ed-section-glow);
         }
         .ed-input:focus { border-color: color-mix(in srgb, var(--ed-input-border) 25%, var(--primary-color, #03a9f4) 75%); box-shadow: 0 0 0 3px var(--ed-focus-ring), var(--ed-section-glow); }
+        details summary { user-select: none; }
+        details summary .details-chevron { transition: transform 0.15s; }
+        details[open] summary .details-chevron { transform: rotate(90deg); }
+        .cgc-row-summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; padding: 0; }
+        .cgc-row-summary::-webkit-details-marker { display: none; }
+        .cgc-row-body { padding-top: 8px; }
         .ed-input-row { display: flex; align-items: center; gap: 6px; }
         .ed-suffix { font-size: 12px; color: var(--ed-text2); white-space: nowrap; }
         .cgc-wizard-btn {
@@ -10562,6 +10528,8 @@ class CameraGalleryCardEditor extends HTMLElement {
       const browserSlot = this.shadowRoot.getElementById("cgc-browser-slot");
       if (browserSlot) browserSlot.innerHTML = mediaBrowserHtml;
     }
+
+    this._initCollapsibleRows();
 
     const $ = (id) => this.shadowRoot.getElementById(id);
 
@@ -10931,8 +10899,8 @@ class CameraGalleryCardEditor extends HTMLElement {
       });
     });
 
-    $("clicktoopen")?.addEventListener("change", (e) => {
-      this._set("preview_click_to_open", !!e.target.checked);
+    $("cleanmode")?.addEventListener("change", (e) => {
+      this._set("clean_mode", !!e.target.checked);
     });
 
     $("persistentcontrols")?.addEventListener("change", (e) => {
@@ -10951,16 +10919,79 @@ class CameraGalleryCardEditor extends HTMLElement {
       this._set("live_auto_muted", !!e.target.checked);
     });
 
-    $("live_stream_url")?.addEventListener("change", (e) => {
-      const val = String(e.target.value || "").trim();
-      if (val) this._set("live_stream_url", val);
-      else { const n = { ...this._config }; delete n.live_stream_url; this._config = this._stripAlwaysTrueKeys(n); this._fire(); }
-    });
+    // Multi-stream URL list
+    const streamList = $("stream-urls-list");
+    const streamAddBtn = $("stream-url-add");
 
-    $("live_stream_name")?.addEventListener("change", (e) => {
-      const val = String(e.target.value || "").trim();
-      if (val) this._set("live_stream_name", val);
-      else { const n = { ...this._config }; delete n.live_stream_name; this._config = this._stripAlwaysTrueKeys(n); this._fire(); }
+    const _getStreamRows = () => {
+      if (!streamList) return [];
+      return Array.from(streamList.querySelectorAll(".stream-url-row"));
+    };
+
+    const _readStreamEntries = () => {
+      return _getStreamRows().map(row => {
+        const si = row.dataset.si;
+        const url = String(streamList.querySelector(`.stream-url-input[data-si="${si}"]`)?.value || "").trim();
+        const name = String(streamList.querySelector(`.stream-name-input[data-si="${si}"]`)?.value || "").trim();
+        return { url, name: name || null };
+      }).filter(e => e.url);
+    };
+
+    const _saveStreamEntries = () => {
+      const entries = _readStreamEntries();
+      const next = { ...this._config };
+      // Always use new live_stream_urls array, drop legacy single-url fields
+      delete next.live_stream_url;
+      delete next.live_stream_name;
+      if (entries.length > 0) {
+        next.live_stream_urls = entries;
+      } else {
+        delete next.live_stream_urls;
+      }
+      this._config = this._stripAlwaysTrueKeys(next);
+      this._fire();
+    };
+
+    const _addStreamRow = (url = "", name = "") => {
+      if (!streamList) return;
+      const i = streamList.querySelectorAll(".stream-url-row").length;
+      const div = document.createElement("div");
+      div.className = "stream-url-row";
+      div.dataset.si = i;
+      div.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:8px 0 8px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);";
+      div.innerHTML = `
+        <div style="display:flex;gap:6px;align-items:center;">
+          <input type="text" class="ed-input stream-url-input" data-si="${i}" placeholder="rtsp://192.168.1.x:554/stream" autocomplete="off" value="${url.replace(/"/g, "&quot;")}" style="flex:1;" />
+          <button type="button" class="livecam-tag-del stream-url-del" data-si="${i}" style="flex-shrink:0;">×</button>
+        </div>
+        <input type="text" class="ed-input stream-name-input" data-si="${i}" placeholder="Name (e.g. Front door)" autocomplete="off" value="${name.replace(/"/g, "&quot;")}" />
+      `;
+      div.querySelector(".stream-url-del").addEventListener("click", () => {
+        div.remove();
+        _saveStreamEntries();
+        this._scheduleRender();
+      });
+      div.querySelector(".stream-url-input").addEventListener("change", _saveStreamEntries);
+      div.querySelector(".stream-name-input").addEventListener("change", _saveStreamEntries);
+      streamList.appendChild(div);
+    };
+
+    // Bind events on existing rows (rendered in template)
+    if (streamList) {
+      streamList.querySelectorAll(".stream-url-del").forEach(btn => {
+        btn.addEventListener("click", () => {
+          btn.closest(".stream-url-row").remove();
+          _saveStreamEntries();
+          this._scheduleRender();
+        });
+      });
+      streamList.querySelectorAll(".stream-url-input, .stream-name-input").forEach(inp => {
+        inp.addEventListener("change", _saveStreamEntries);
+      });
+    }
+
+    streamAddBtn?.addEventListener("click", () => {
+      _addStreamRow();
     });
 
     $("live_go2rtc_url")?.addEventListener("change", (e) => {
@@ -11021,10 +11052,14 @@ class CameraGalleryCardEditor extends HTMLElement {
 
       const getDefSuggestions = () => {
         const q = livedefaultInput.value.trim().toLowerCase();
-        const streamName = this._config.live_stream_name || "Stream";
-        const streamEntries = this._config.live_stream_url
-          ? [{ id: "__cgc_stream__", label: streamName, sub: "stream url" }]
-          : [];
+        const rawStreams = (() => {
+          if (Array.isArray(this._config.live_stream_urls) && this._config.live_stream_urls.length > 0)
+            return this._config.live_stream_urls.filter(e => e?.url);
+          if (this._config.live_stream_url)
+            return [{ url: this._config.live_stream_url, name: this._config.live_stream_name || "Stream" }];
+          return [];
+        })();
+        const streamEntries = rawStreams.map((e, i) => ({ id: `__cgc_stream_${i}__`, label: e.name || `Stream ${i + 1}`, sub: "stream url" }));
         const entityEntries = cameraEntities.map((id) => ({
           id,
           label: String(this._hass?.states?.[id]?.attributes?.friendly_name || id).trim(),
@@ -11468,6 +11503,87 @@ class CameraGalleryCardEditor extends HTMLElement {
       el.setSelectionRange(pos, pos);
       el.focus({ preventScroll: true });
     } catch (_) {}
+  }
+
+  _initCollapsibleRows() {
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const tab = this._activeTab || 'general';
+    const PREF = 'cgc_ed_sec_';
+
+    const getKey = (label) =>
+      PREF + tab + '_' + label.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+
+    const readState = (key) => {
+      try { const v = localStorage.getItem(key); return v === null ? true : v !== 'false'; }
+      catch (_) { return true; }
+    };
+
+    const saveState = (key, open) => {
+      try { localStorage.setItem(key, open ? 'true' : 'false'); } catch (_) {}
+    };
+
+    // Collapsible `.row` elements that have a direct `.lbl` child
+    sr.querySelectorAll('.tabpanel .row').forEach(row => {
+      if (row.dataset.cgcCol) return; // already processed
+      row.dataset.cgcCol = '1';
+
+      // Skip rows whose only child is .row-head (simple toggle rows — already just one line)
+      const kids = Array.from(row.children);
+      if (kids.length === 1 && kids[0].classList.contains('row-head')) return;
+
+      // Must have a direct .lbl to use as heading
+      const lbl = row.querySelector(':scope > .lbl');
+      if (!lbl) return;
+
+      const title = lbl.textContent.trim();
+      if (!title) return;
+      const key = getKey(title);
+      const open = readState(key);
+
+      const details = document.createElement('details');
+      details.className = 'cgc-row-details';
+      if (open) details.setAttribute('open', '');
+
+      const summary = document.createElement('summary');
+      summary.className = 'cgc-row-summary';
+      const chevron = document.createElement('ha-icon');
+      chevron.setAttribute('icon', 'mdi:chevron-right');
+      chevron.className = 'details-chevron';
+      const lblSpan = document.createElement('span');
+      lblSpan.className = 'lbl';
+      lblSpan.style.margin = '0';
+      lblSpan.textContent = title;
+      summary.appendChild(chevron);
+      summary.appendChild(lblSpan);
+
+      const body = document.createElement('div');
+      body.className = 'cgc-row-body';
+      [...row.childNodes].forEach(child => { if (child !== lbl) body.appendChild(child); });
+      lbl.remove();
+
+      details.appendChild(summary);
+      details.appendChild(body);
+      row.appendChild(details);
+
+      details.addEventListener('toggle', () => saveState(key, details.open));
+    });
+
+    // Add localStorage persistence to pre-existing <details> (Datetime formats, Styling sections)
+    sr.querySelectorAll('details:not(.cgc-row-details)').forEach(details => {
+      if (details.dataset.cgcCol) return;
+      details.dataset.cgcCol = '1';
+      const summaryText = details.querySelector('summary span, summary .lbl')?.textContent?.trim()
+        || details.querySelector('summary')?.textContent?.trim() || '';
+      if (!summaryText) return;
+      const key = getKey(summaryText);
+      try {
+        const stored = localStorage.getItem(key);
+        if (stored === 'false') details.removeAttribute('open');
+        else if (stored === 'true') details.setAttribute('open', '');
+      } catch (_) {}
+      details.addEventListener('toggle', () => saveState(key, details.open));
+    });
   }
 
   _scheduleRender() {
