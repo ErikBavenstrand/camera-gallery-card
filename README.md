@@ -50,7 +50,7 @@ Add sensors directly to your `configuration.yaml` file:
 filetrack:
   sensors:
     - name: Recordings
-      folder: /media/frigate/clips
+      folder: /config/www/test
 ```
 *Note: Restart Home Assistant after adding YAML entries.*
 
