@@ -1,0 +1,16 @@
+# Bevat tokens/secrets — nooit committen
+deploy.sh
+
+# Backupbestanden
+*.backup*.js
+*.backup.js
+*.perf-bak
+
+# Testmedia
+test-media/
+
+# Losse bestanden van andere projecten
+apple-music-search-card.js
+
+# macOS
+.DS_Store
