@@ -1,7 +1,16 @@
 {
   "name": "camera-gallery-card",
-  "version": "1.9.2",
+  "version": "2.5.0",
   "description": "Timeline based media gallery card for Home Assistant",
   "author": "TheScubaDiver",
-  "license": "MIT"
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "push": "dotenv -- bash -c 'rsync -av camera-gallery-card.js dev/loader.js dev/loader-hot.js \"$HA_HOST:$HA_DEV_PATH\"'",
+    "dev": "dotenv -- chokidar camera-gallery-card.js --initial -c 'rsync -a camera-gallery-card.js \"$HA_HOST:$HA_DEV_PATH\"'"
+  },
+  "devDependencies": {
+    "chokidar-cli": "^3.0.0",
+    "dotenv-cli": "^7.4.4"
+  }
 }
