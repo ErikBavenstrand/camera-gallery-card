@@ -4,14 +4,8 @@
 
 import { LitElement, html, css } from "lit";
 
-import {
-  dtMsFromSrc,
-  extractDateTimeKey,
-  extractDayKey,
-  formatDateTime,
-  formatDay,
-  formatTimeFromMs,
-} from "./data/datetime-parsing";
+import { dtMsFromSrc, extractDateTimeKey, extractDayKey } from "./data/datetime-parsing";
+import { formatDateTime, formatDay, formatTimeFromMs, resolveLocale } from "./util/locale";
 import {
   ATTR_NAME,
   AVAILABLE_OBJECT_FILTERS,
@@ -800,7 +794,7 @@ class CameraGalleryCard extends LitElement {
       .sort((a, b) => {
         const an = this._friendlyCameraName(a).toLowerCase();
         const bn = this._friendlyCameraName(b).toLowerCase();
-        return an.localeCompare(bn, this._locale());
+        return an.localeCompare(bn, resolveLocale(this._hass));
       });
   }
 
@@ -849,31 +843,6 @@ class CameraGalleryCard extends LitElement {
       filenameFormat: this.config?.filename_datetime_format,
       resolveName: this.__dtResolveName,
     };
-  }
-
-  _locale() {
-    const hassLocale = this._hass?.locale;
-    if (typeof hassLocale === "string" && hassLocale.trim()) {
-      return hassLocale.trim();
-    }
-    if (
-      hassLocale &&
-      typeof hassLocale === "object" &&
-      typeof hassLocale.language === "string" &&
-      hassLocale.language.trim()
-    ) {
-      return hassLocale.language.trim();
-    }
-    if (
-      typeof this._hass?.language === "string" &&
-      this._hass.language.trim()
-    ) {
-      return this._hass.language.trim();
-    }
-    if (typeof navigator !== "undefined" && navigator.language) {
-      return navigator.language;
-    }
-    return undefined;
   }
 
   _pathHasClass(path = [], cls = "") {
@@ -1848,7 +1817,7 @@ class CameraGalleryCard extends LitElement {
         <div class="live-picker-list">
           ${[...groups.entries()].map(([monthKey, monthDays]) => html`
             <div class="dp-month-header">
-              ${new Intl.DateTimeFormat(this._locale(), { month: "long", year: "numeric" }).format(new Date(`${monthKey}-01T00:00:00`))}
+              ${new Intl.DateTimeFormat(resolveLocale(this._hass), { month: "long", year: "numeric" }).format(new Date(`${monthKey}-01T00:00:00`))}
             </div>
             ${monthDays.map((day) => {
               const isSel = day === selected;
@@ -2080,7 +2049,7 @@ class CameraGalleryCard extends LitElement {
       });
     }
 
-    actions.sort((a, b) => a.label.localeCompare(b.label, this._locale()));
+    actions.sort((a, b) => a.label.localeCompare(b.label, resolveLocale(this._hass)));
     return actions;
   }
 
@@ -3546,7 +3515,7 @@ class CameraGalleryCard extends LitElement {
     const dayKey = extractDayKey(src, this._dtOpts);
     if (dayKey) {
       try {
-        return new Intl.DateTimeFormat(this._locale(), {
+        return new Intl.DateTimeFormat(resolveLocale(this._hass), {
           day: "2-digit",
           month: "short",
           year: "numeric",

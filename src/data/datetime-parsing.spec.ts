@@ -7,13 +7,9 @@ import {
   dtMsFromSrc,
   extractDateTimeKey,
   extractDayKey,
-  formatDateTime,
-  formatDay,
-  formatTimeFromMs,
   parseDateFromFilename,
   parseFolderFileDatetime,
   parseRawDateFields,
-  useAmPm,
 } from "./datetime-parsing";
 import type { DatetimeOptions } from "./datetime-parsing";
 
@@ -98,59 +94,6 @@ describe("Bounds-checked regex match access", () => {
   });
 });
 
-describe("useAmPm takes locale as parameter", () => {
-  it("returns false for time_format='24'", () => {
-    expect(
-      useAmPm({ language: "en", number_format: "comma_decimal", time_format: "24" } as never)
-    ).toBe(false);
-  });
-
-  it("returns true for time_format='12'", () => {
-    expect(
-      useAmPm({ language: "en", number_format: "comma_decimal", time_format: "12" } as never)
-    ).toBe(true);
-  });
-
-  it("returns false for undefined locale (probe falls through to system default)", () => {
-    expect(typeof useAmPm(undefined)).toBe("boolean");
-  });
-
-  it("probes language for time_format='language' (en-US is 12h)", () => {
-    expect(
-      useAmPm({
-        language: "en-US",
-        number_format: "comma_decimal",
-        time_format: "language",
-      } as never)
-    ).toBe(true);
-  });
-
-  it("probes language for time_format='language' (sv-SE is 24h)", () => {
-    expect(
-      useAmPm({
-        language: "sv-SE",
-        number_format: "comma_decimal",
-        time_format: "language",
-      } as never)
-    ).toBe(false);
-  });
-});
-
-describe("Format functions return readable fallback on error", () => {
-  it("formatDay does not throw on bad input", () => {
-    expect(() => formatDay("not-a-date", undefined)).not.toThrow();
-  });
-
-  it("formatDateTime returns input on Intl error", () => {
-    expect(() => formatDateTime("2024-01-01T12:00:00", undefined)).not.toThrow();
-  });
-
-  it("formatTimeFromMs returns empty string for non-finite ms", () => {
-    expect(formatTimeFromMs(NaN, undefined)).toBe("");
-    expect(formatTimeFromMs(Number.POSITIVE_INFINITY, undefined)).toBe("");
-  });
-});
-
 describe("Local-time round-trip invariant", () => {
   it("round-trip ms → dtKey → ms returns the same instant", () => {
     const ms = new Date(2024, 0, 15, 12, 30, 45).getTime();
@@ -222,34 +165,6 @@ describe("Explicit filename format — parseDateFromFilename", () => {
 
   it("returns null when filenameFormat is not configured", () => {
     expect(parseDateFromFilename("cam_20240115_123045.mp4", opts())).toBeNull();
-  });
-});
-
-describe("formatDateTime / formatDay (locale-dependent)", () => {
-  const enUS = {
-    language: "en-US",
-    number_format: "comma_decimal",
-    time_format: "24",
-  } as never;
-
-  it("formatDay produces a localized day/month string", () => {
-    const out = formatDay("2024-01-15", enUS);
-    expect(out).toMatch(/January\s+15/);
-  });
-
-  it("formatDateTime produces a date • time string", () => {
-    const out = formatDateTime("2024-01-15T12:30:00", enUS);
-    expect(out).toMatch(/January.*15.*•.*12:30/);
-  });
-
-  it("formatTimeFromMs produces a time string", () => {
-    const ms = new Date(2024, 0, 15, 14, 5, 0).getTime();
-    const out = formatTimeFromMs(ms, enUS);
-    expect(out).toMatch(/14:05/);
-  });
-
-  it("formatDay returns input on bad date", () => {
-    expect(formatDay("", undefined)).toBe("");
   });
 });
 

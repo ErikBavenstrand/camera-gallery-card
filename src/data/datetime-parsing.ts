@@ -10,9 +10,11 @@
  * EXPLICIT-ONLY: dates are extracted only when the user configures
  * `folder_datetime_format` and/or `filename_datetime_format`. Files with no
  * matching format have no date and appear in the "Other" group.
+ *
+ * Locale-aware formatting (date/time strings, AM/PM detection) lives in
+ * `util/locale.ts` so this module stays free of `Intl` and HA types.
  */
 
-import type { FrontendLocaleData } from "../types/hass";
 import { YEAR_2DIGIT_PIVOT } from "../const";
 
 // ---------- Types ----------
@@ -218,64 +220,4 @@ export function dtKeyFromMs(ms: number): string | null {
     `${pad(d.getFullYear(), 4)}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
     `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
   );
-}
-
-// ---------- Locale-aware formatting ----------
-
-export function useAmPm(locale: FrontendLocaleData | undefined): boolean {
-  const tf = locale?.time_format;
-  if (tf === "24") return false;
-  if (tf === "12") return true;
-  try {
-    const probe = tf === "language" ? locale?.language : undefined;
-    return /AM|PM/i.test(new Date().toLocaleString(probe));
-  } catch {
-    return false;
-  }
-}
-
-export function formatDateTime(dtKey: string, locale: FrontendLocaleData | undefined): string {
-  if (!dtKey) return "";
-  try {
-    const d = new Date(dtKey);
-    const lang = locale?.language;
-    const date = new Intl.DateTimeFormat(lang, {
-      day: "numeric",
-      month: "long",
-      year: "numeric",
-    }).format(d);
-    const time = new Intl.DateTimeFormat(lang, {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: useAmPm(locale),
-    }).format(d);
-    return `${date} • ${time}`;
-  } catch {
-    return dtKey;
-  }
-}
-
-export function formatDay(dayKey: string, locale: FrontendLocaleData | undefined): string {
-  if (!dayKey) return "";
-  try {
-    return new Intl.DateTimeFormat(locale?.language, {
-      day: "numeric",
-      month: "long",
-    }).format(new Date(`${dayKey}T00:00:00`));
-  } catch {
-    return dayKey;
-  }
-}
-
-export function formatTimeFromMs(ms: number, locale: FrontendLocaleData | undefined): string {
-  if (!Number.isFinite(ms)) return "";
-  try {
-    return new Intl.DateTimeFormat(locale?.language, {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: useAmPm(locale),
-    }).format(new Date(ms));
-  } catch {
-    return "";
-  }
 }
