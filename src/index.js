@@ -5,6 +5,14 @@
 import { LitElement, html, css } from "lit";
 
 import {
+  dtMsFromSrc,
+  extractDateTimeKey,
+  extractDayKey,
+  formatDateTime,
+  formatDay,
+  formatTimeFromMs,
+} from "./data/datetime-parsing";
+import {
   ATTR_NAME,
   AVAILABLE_OBJECT_FILTERS,
   DEFAULT_ALLOW_BULK_DELETE,
@@ -17,7 +25,6 @@ import {
   DEFAULT_DELETE_CONFIRM,
   DEFAULT_DELETE_PREFIX,
   DEFAULT_DELETE_SERVICE,
-  DEFAULT_FILENAME_DATETIME_FORMAT,
   DEFAULT_FRIGATE_API_LIMIT,
   DEFAULT_LIVE_AUTO_MUTED,
   DEFAULT_LIVE_ENABLED,
@@ -186,6 +193,9 @@ class CameraGalleryCard extends LitElement {
     this._zoomPanStartY = 0;
     this._zoomPanBaseX = 0;
     this._zoomPanBaseY = 0;
+
+    // Stable bound resolver passed into pure datetime-parsing functions.
+    this.__dtResolveName = (src) => this._sourceNameForParsing(src);
 
     this._onFullscreenChange = () => {
       const isFs = document.fullscreenElement === this || document.webkitFullscreenElement === this;
@@ -437,8 +447,8 @@ class CameraGalleryCard extends LitElement {
     }
 
     const withDt = rawItems.map((src, idx) => {
-      const dtMs = this._dtMsFromSrc(src);
-      const dayKey = this._extractDayKey(src);
+      const dtMs = dtMsFromSrc(src, this._dtOpts);
+      const dayKey = extractDayKey(src, this._dtOpts);
       return { dayKey, dtMs, idx, src };
     });
 
@@ -684,66 +694,6 @@ class CameraGalleryCard extends LitElement {
     }
   }
 
-  _buildFilenameDateRegex(format) {
-    const fmt = String(format || "").trim();
-    if (!fmt) return null;
-
-    const supportedTokens = ["YYYY", "YY", "MM", "DD", "HH", "mm", "ss"];
-    const tokenRegex = /(YYYY|YY|MM|DD|HH|mm|ss)/g;
-
-    const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-    let regexStr = "";
-    let lastIndex = 0;
-    const fields = [];
-
-    let match;
-    while ((match = tokenRegex.exec(fmt)) !== null) {
-      const token = match[0];
-      const idx = match.index;
-
-      if (idx > lastIndex) {
-        regexStr += escapeRegex(fmt.slice(lastIndex, idx));
-      }
-
-      if (token === "YYYY") {
-        regexStr += "(\\d{4})";
-        fields.push("year");
-      } else if (token === "YY") {
-        regexStr += "(\\d{2})";
-        fields.push("year2");
-      } else if (token === "MM") {
-        regexStr += "(\\d{2})";
-        fields.push("month");
-      } else if (token === "DD") {
-        regexStr += "(\\d{2})";
-        fields.push("day");
-      } else if (token === "HH") {
-        regexStr += "(\\d{2})";
-        fields.push("hour");
-      } else if (token === "mm") {
-        regexStr += "(\\d{2})";
-        fields.push("minute");
-      } else if (token === "ss") {
-        regexStr += "(\\d{2})";
-        fields.push("second");
-      }
-
-      lastIndex = idx + token.length;
-    }
-
-    if (lastIndex < fmt.length) {
-      regexStr += escapeRegex(fmt.slice(lastIndex));
-    }
-
-    if (!fields.length) return null;
-
-    return {
-      regex: new RegExp(regexStr),
-      fields,
-    };
-  }
-
   _scheduleVisibleMediaWork(selected, filtered, idx, usingMediaSource) {
     const selectedSrc = String(selected || "");
     const cap = this._normMaxMedia(this.config?.max_media);
@@ -827,213 +777,6 @@ class CameraGalleryCard extends LitElement {
     return out;
   }
 
-  _parseRawDateFields(name, format) {
-    if (!name || !format) return null;
-    try {
-      const built = this._buildFilenameDateRegex(format);
-      if (!built?.regex || !built?.fields?.length) return null;
-      const match = String(name).match(built.regex);
-      if (!match) return null;
-      const f = { year: null, month: null, day: null, hour: null, minute: null, second: null };
-      built.fields.forEach((field, i) => {
-        const v = match[i + 1];
-        if (v == null) return;
-        if (field === "year") f.year = Number(v);
-        else if (field === "year2") f.year = 2000 + Number(v);
-        else if (field === "month") f.month = Number(v);
-        else if (field === "day") f.day = Number(v);
-        else if (field === "hour") f.hour = Number(v);
-        else if (field === "minute") f.minute = Number(v);
-        else if (field === "second") f.second = Number(v);
-      });
-      return f;
-    } catch (_) { return null; }
-  }
-
-  _parseFolderFileDatetime(src) {
-    const folderFmt = this.config?.folder_datetime_format;
-    const fileFmt = this.config?.filename_datetime_format;
-    if (!folderFmt) return null;
-
-    // Haal folder- en bestandsnaam-segment op uit het pad
-    const raw = String(src || "");
-    const parts = raw.split("/").filter(Boolean);
-    if (parts.length < 2) return null;
-    const fileSegment = parts[parts.length - 1].replace(/\.[^./.]+$/, "");
-    const folderSegment = parts[parts.length - 2];
-
-    const folderFields = this._parseRawDateFields(folderSegment, folderFmt);
-    if (!folderFields) return null;
-
-    const fileFields = fileFmt ? this._parseRawDateFields(fileSegment, fileFmt) : null;
-
-    // Samenvoegen: folder levert datum, bestand levert tijdstip
-    const year  = folderFields.year  ?? fileFields?.year  ?? new Date().getFullYear();
-    const month = folderFields.month ?? fileFields?.month ?? null;
-    const day   = folderFields.day   ?? fileFields?.day   ?? null;
-    const hour   = fileFields?.hour   ?? folderFields.hour   ?? 0;
-    const minute = fileFields?.minute ?? folderFields.minute ?? 0;
-    const second = fileFields?.second ?? folderFields.second ?? 0;
-
-    if (month == null || day == null) return null;
-    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-
-    const ms = new Date(year, month - 1, day, hour, minute, second).getTime();
-    if (!Number.isFinite(ms)) return null;
-
-    const pad = (n, l = 2) => String(n).padStart(l, "0");
-    const dtKey = `${pad(year, 4)}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}`;
-    return { dayKey: `${pad(year, 4)}-${pad(month)}-${pad(day)}`, dtKey, ms };
-  }
-
-  _autoDetectFolderDate(folderSegment) {
-    const s = String(folderSegment || "").trim();
-    const thisYear = new Date().getFullYear();
-    let m;
-
-    // YYYY-MM-DD or YYYY.MM.DD or YYYY_MM_DD
-    m = s.match(/^(\d{4})[_\-.](\d{2})[_\-.](\d{2})$/);
-    if (m) {
-      const year = +m[1], month = +m[2], day = +m[3];
-      if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return { year, month, day };
-    }
-
-    // DD-MM-YYYY or DD.MM.YYYY or DD_MM_YYYY
-    m = s.match(/^(\d{2})[_\-.](\d{2})[_\-.](\d{4})$/);
-    if (m) {
-      const day = +m[1], month = +m[2], year = +m[3];
-      if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return { year, month, day };
-    }
-
-    // 8 digits YYYYMMDD
-    m = s.match(/^(\d{4})(\d{2})(\d{2})$/);
-    if (m) {
-      const year = +m[1], month = +m[2], day = +m[3];
-      if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return { year, month, day };
-    }
-
-    // 4 digits: DDMM first (European), fallback MMDD
-    m = s.match(/^(\d{2})(\d{2})$/);
-    if (m) {
-      const a = +m[1], b = +m[2];
-      if (b >= 1 && b <= 12 && a >= 1 && a <= 31) return { year: thisYear, month: b, day: a };
-      if (a >= 1 && a <= 12 && b >= 1 && b <= 31) return { year: thisYear, month: a, day: b };
-    }
-
-    return null;
-  }
-
-  _autoDetectFileTime(fileSegment) {
-    const s = String(fileSegment || "").trim();
-    let m;
-
-    // HH:MM:SS or HH-MM-SS or HH_MM_SS (with optional surrounding chars)
-    m = s.match(/(?:^|[^0-9])(\d{2})[:_-](\d{2})[:_-](\d{2})(?:[^0-9]|$)/);
-    if (m) {
-      const hour = +m[1], minute = +m[2], second = +m[3];
-      if (hour <= 23 && minute <= 59 && second <= 59) return { hour, minute, second };
-    }
-
-    // Exact 6 digits only (no surrounding digits)
-    m = s.match(/^\d{6}$/);
-    if (m) {
-      const hour = +s.slice(0, 2), minute = +s.slice(2, 4), second = +s.slice(4, 6);
-      if (hour <= 23 && minute <= 59 && second <= 59) return { hour, minute, second };
-    }
-
-    return null;
-  }
-
-  _autoDetectFolderFileDate(src) {
-    const parts = String(src || "").split("/").filter(Boolean);
-    if (parts.length < 2) return null;
-    const fileSegment = parts[parts.length - 1].replace(/\.[^./.]+$/, "");
-    const folderSegment = parts[parts.length - 2];
-
-    const dateFields = this._autoDetectFolderDate(folderSegment);
-    if (!dateFields) return null;
-
-    const timeFields = this._autoDetectFileTime(fileSegment);
-    const { year, month, day } = dateFields;
-    const hour   = timeFields?.hour   ?? 0;
-    const minute = timeFields?.minute ?? 0;
-    const second = timeFields?.second ?? 0;
-
-    const ms = new Date(year, month - 1, day, hour, minute, second).getTime();
-    if (!Number.isFinite(ms)) return null;
-
-    const pad = (n, l = 2) => String(n).padStart(l, "0");
-    const dtKey = `${pad(year,4)}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}`;
-    return { dayKey: `${pad(year,4)}-${pad(month)}-${pad(day)}`, dtKey, ms };
-  }
-
-  _parseDateFromFilename(src, format) {
-    const name = this._sourceNameForParsing(src);
-    if (!name || !format) return null;
-
-    try {
-      const built = this._buildFilenameDateRegex(format);
-      if (!built?.regex || !built?.fields?.length) return null;
-
-      const match = String(name).match(built.regex);
-      if (!match) return null;
-
-      let year = null;
-      let month = null;
-      let day = null;
-      let hour = 0;
-      let minute = 0;
-      let second = 0;
-
-      built.fields.forEach((field, i) => {
-        const value = match[i + 1];
-        if (value == null) return;
-
-        if (field === "year") year = Number(value);
-        if (field === "year2") year = 2000 + Number(value);
-        if (field === "month") month = Number(value);
-        if (field === "day") day = Number(value);
-        if (field === "hour") hour = Number(value);
-        if (field === "minute") minute = Number(value);
-        if (field === "second") second = Number(value);
-      });
-
-      if (
-        !Number.isFinite(year) ||
-        !Number.isFinite(month) ||
-        !Number.isFinite(day)
-      ) {
-        return null;
-      }
-
-      if (month < 1 || month > 12) return null;
-      if (day < 1 || day > 31) return null;
-      if (hour < 0 || hour > 23) return null;
-      if (minute < 0 || minute > 59) return null;
-      if (second < 0 || second > 59) return null;
-
-      const y = String(year).padStart(4, "0");
-      const mo = String(month).padStart(2, "0");
-      const d = String(day).padStart(2, "0");
-      const hh = String(hour).padStart(2, "0");
-      const mm = String(minute).padStart(2, "0");
-      const ss = String(second).padStart(2, "0");
-
-      const dtKey = `${y}-${mo}-${d}T${hh}:${mm}:${ss}`;
-      const ms = new Date(dtKey).getTime();
-
-      if (!Number.isFinite(ms)) return null;
-
-      return {
-        dayKey: `${y}-${mo}-${d}`,
-        dtKey,
-        ms,
-      };
-    } catch (_) {
-      return null;
-    }
-  }
-
   _getAllLiveCameraEntities() {
     const states = this._hass?.states || {};
     const allowed = this.config?.live_camera_entities;
@@ -1098,6 +841,16 @@ class CameraGalleryCard extends LitElement {
     return JSON.stringify(a) === JSON.stringify(b);
   }
 
+  // Options bag for the pure datetime-parsing functions.
+  // Reads config + resolveName each access; cheap allocation, no caching needed.
+  get _dtOpts() {
+    return {
+      folderFormat: this.config?.folder_datetime_format,
+      filenameFormat: this.config?.filename_datetime_format,
+      resolveName: this.__dtResolveName,
+    };
+  }
+
   _locale() {
     const hassLocale = this._hass?.locale;
     if (typeof hassLocale === "string" && hassLocale.trim()) {
@@ -1121,21 +874,6 @@ class CameraGalleryCard extends LitElement {
       return navigator.language;
     }
     return undefined;
-  }
-
-  // Mirrors HA's useAmPm: respects hass.locale.time_format ("12" | "24" |
-  // "language" | "system"), falling back to a probe of the resolved locale.
-  _useAmPm() {
-    const tf = this._hass?.locale?.time_format;
-    if (tf === "24") return false;
-    if (tf === "12") return true;
-    try {
-      const probeLocale = tf === "language" ? this._locale() : undefined;
-      const sample = new Date().toLocaleString(probeLocale);
-      return /AM|PM/i.test(sample);
-    } catch (_) {
-      return false;
-    }
   }
 
   _pathHasClass(path = [], cls = "") {
@@ -2127,7 +1865,7 @@ class CameraGalleryCard extends LitElement {
                     this._closeDatePicker();
                   }}
                 >
-                  <span class="dp-day-label">${this._formatDay(day)}</span>
+                  <span class="dp-day-label">${formatDay(day, this._hass?.locale)}</span>
                   ${isSel ? html`<ha-icon class="live-picker-check" icon="mdi:check"></ha-icon>` : html``}
                 </button>
               `;
@@ -2768,7 +2506,7 @@ class CameraGalleryCard extends LitElement {
     }
 
     if (!match) {
-      const videoMs = this._dtMsFromSrc(src);
+      const videoMs = dtMsFromSrc(src, this._dtOpts);
 
       if (Number.isFinite(videoMs)) {
         let best = null;
@@ -3214,8 +2952,8 @@ class CameraGalleryCard extends LitElement {
               mime: String(x.mime_type || ""),
               cls: String(x.media_class || ""),
               thumb: String(x.thumbnail || ""),
-              dtMs: this._dtMsFromSrc(String(x.title || x.media_content_id || "")),
-              dayKey: this._extractDayKey(String(x.title || x.media_content_id || "")),
+              dtMs: dtMsFromSrc(String(x.title || x.media_content_id || ""), this._dtOpts),
+              dayKey: extractDayKey(String(x.title || x.media_content_id || ""), this._dtOpts),
             }))
             .filter((x) => !!x.id);
         } catch (e) {
@@ -3240,8 +2978,8 @@ class CameraGalleryCard extends LitElement {
       items = this._dedupeByRelPath(items);
 
       items.sort((a, b) => {
-        const am = this._dtMsFromSrc(a.id);
-        const bm = this._dtMsFromSrc(b.id);
+        const am = dtMsFromSrc(a.id, this._dtOpts);
+        const bm = dtMsFromSrc(b.id, this._dtOpts);
         const aOk = Number.isFinite(am);
         const bOk = Number.isFinite(bm);
         if (aOk && bOk && bm !== am) return bm - am;
@@ -3527,6 +3265,7 @@ class CameraGalleryCard extends LitElement {
           continue;
         }
 
+        const dirsRev = [];
         for (let i = children.length - 1; i >= 0; i--) {
           if (out.length >= limit) break;
 
@@ -3539,11 +3278,17 @@ class CameraGalleryCard extends LitElement {
           const cls = String(ch?.media_class || "").toLowerCase();
 
           if (canExpand || (!canPlay && cls === "directory")) {
-            stack.push({ depth: depth + 1, id: mid });
+            dirsRev.push({ depth: depth + 1, id: mid });
           } else if (canPlay || this._msIsRenderable(ch?.mime_type, ch?.media_class, ch?.title)) {
             out.push(ch);
           }
         }
+        // Push subdirectories so the alphabetically-LAST one ends up on top
+        // of the LIFO stack and is popped first. For date-named folders like
+        // "2026-04-28" / "2026-04-29", this traverses today before yesterday
+        // — without it, the per-root limit can be exhausted on older folders
+        // before today's folder is ever visited.
+        for (let i = dirsRev.length - 1; i >= 0; i--) stack.push(dirsRev[i]);
       }
 
       if (onProgress && out.length > prevCount) onProgress([...out]);
@@ -3558,21 +3303,6 @@ class CameraGalleryCard extends LitElement {
       setTimeout(() => rej(new Error(`WS timeout: ${payload?.type}`)), timeoutMs)
     );
     return Promise.race([p, t]);
-  }
-
-  // ─── Data / time parsing ──────────────────────────────────────────
-
-  _dayKeyFromMs(ms) {
-    if (!Number.isFinite(ms)) return null;
-    try {
-      const d = new Date(ms);
-      const y = String(d.getFullYear()).padStart(4, "0");
-      const m = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      return `${y}-${m}-${dd}`;
-    } catch (_) {
-      return null;
-    }
   }
 
   _dedupeByRelPath(items) {
@@ -3596,227 +3326,6 @@ class CameraGalleryCard extends LitElement {
     }
 
     return Array.from(seen.values());
-  }
-
-  _dtKeyFromMs(ms) {
-    if (!Number.isFinite(ms)) return null;
-    try {
-      const d = new Date(ms);
-      const y = String(d.getFullYear()).padStart(4, "0");
-      const m = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const hh = String(d.getHours()).padStart(2, "0");
-      const mm = String(d.getMinutes()).padStart(2, "0");
-      const ss = String(d.getSeconds()).padStart(2, "0");
-      return `${y}-${m}-${dd}T${hh}:${mm}:${ss}`;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  _dtMsFromSrc(src) {
-    const folderFile = this._parseFolderFileDatetime(src);
-    if (folderFile?.ms != null) return folderFile.ms;
-
-    const custom = this._parseDateFromFilename(
-      src,
-      this.config?.filename_datetime_format
-    );
-    if (custom?.ms != null) return custom.ms;
-
-    const ems = this._extractEpochMs(src);
-    if (Number.isFinite(ems)) return ems;
-
-    const ymd = this._extractYmdHms(src);
-    if (ymd?.dtKey) {
-      const ms = new Date(ymd.dtKey).getTime();
-      if (Number.isFinite(ms)) return ms;
-    }
-
-    const dtKey = (() => {
-      const s = this._sourceNameForParsing(src);
-      const m = String(s || "").match(/(\d{8})[_-](\d{6})/);
-      if (!m) return null;
-      return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(
-        6,
-        8
-      )}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
-    })();
-
-    if (dtKey) {
-      const ms = new Date(dtKey).getTime();
-      if (Number.isFinite(ms)) return ms;
-    }
-
-    const dayKey = (() => {
-      const s = this._sourceNameForParsing(src);
-      const m = String(s || "").match(/(\d{8})/);
-      if (!m) return null;
-      return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}`;
-    })();
-
-    if (dayKey) {
-      const ms = new Date(`${dayKey}T00:00:00`).getTime();
-      if (Number.isFinite(ms)) return ms;
-    }
-
-    const pathDtKey = (() => {
-      const m = String(src || "").match(/\/(\d{8})\/(\d{6})\./);
-      if (!m) return null;
-      return `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)}T${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}`;
-    })();
-
-    if (pathDtKey) {
-      const ms = new Date(pathDtKey).getTime();
-      if (Number.isFinite(ms)) return ms;
-    }
-
-    const autoFolder = this._autoDetectFolderFileDate(src);
-    if (autoFolder?.ms != null) return autoFolder.ms;
-
-    return NaN;
-  }
-
-  _extractDateTimeKey(src) {
-    const folderFile = this._parseFolderFileDatetime(src);
-    if (folderFile?.dtKey) return folderFile.dtKey;
-
-    const custom = this._parseDateFromFilename(
-      src,
-      this.config?.filename_datetime_format
-    );
-    if (custom?.dtKey) return custom.dtKey;
-
-    const ymd = this._extractYmdHms(src);
-    if (ymd?.dtKey) return ymd.dtKey;
-
-    const autoFolder = this._autoDetectFolderFileDate(src);
-    if (autoFolder?.dtKey) return autoFolder.dtKey;
-
-    const ms = this._dtMsFromSrc(src);
-    const dt = this._dtKeyFromMs(ms);
-    if (dt) return dt;
-
-    const s = this._sourceNameForParsing(src);
-    const m = String(s || "").match(/(\d{8})[_-](\d{6})/);
-    if (!m) return null;
-    return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(
-      6,
-      8
-    )}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4, 6)}`;
-  }
-
-  _extractDayKey(src) {
-    const folderFile = this._parseFolderFileDatetime(src);
-    if (folderFile?.dayKey) return folderFile.dayKey;
-
-    const custom = this._parseDateFromFilename(
-      src,
-      this.config?.filename_datetime_format
-    );
-    if (custom?.dayKey) return custom.dayKey;
-
-    const ymd = this._extractYmdHms(src);
-    if (ymd?.dayKey) return ymd.dayKey;
-
-    const autoFolder = this._autoDetectFolderFileDate(src);
-    if (autoFolder?.dayKey) return autoFolder.dayKey;
-
-    const ms = this._dtMsFromSrc(src);
-    const dk = this._dayKeyFromMs(ms);
-    if (dk) return dk;
-
-    const s = this._sourceNameForParsing(src);
-    const m = String(s).match(/(\d{8})/);
-    if (!m) return null;
-    return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6, 8)}`;
-  }
-
-  _extractEpochMs(src) {
-    const s = this._sourceNameForParsing(src);
-    if (!s) return NaN;
-
-    let m = String(s).match(/-(\d{9,11}(?:\.\d+)?)-/);
-    if (!m) m = String(s).match(/(\d{9,11}(?:\.\d+)?)/);
-    if (!m) return NaN;
-
-    const sec = Number.parseFloat(m[1]);
-    if (!Number.isFinite(sec)) return NaN;
-
-    if (sec < 946684800 || sec > 4102444800) return NaN;
-
-    return sec * 1000;
-  }
-
-  _extractYmdHms(src) {
-    const s = this._sourceNameForParsing(src);
-    if (!s) return null;
-
-    const m = String(s).match(
-      /(\d{4})-(\d{2})-(\d{2})[T _-]?(\d{2})[:\-\.](\d{2})[:\-\.](\d{2})/
-    );
-    if (!m) return null;
-
-    const y = m[1];
-    const mo = m[2];
-    const d = m[3];
-    const hh = m[4];
-    const mm = m[5];
-    const ss = m[6];
-
-    return {
-      dayKey: `${y}-${mo}-${d}`,
-      dtKey: `${y}-${mo}-${d}T${hh}:${mm}:${ss}`,
-    };
-  }
-
-  _formatDateTime(dtKey) {
-    if (!dtKey) return "";
-    try {
-      const dt = new Date(dtKey);
-      const locale = this._locale();
-
-      const date = new Intl.DateTimeFormat(locale, {
-        day: "numeric",
-        month: "long",
-        year: "numeric",
-      }).format(dt);
-
-      const time = new Intl.DateTimeFormat(locale, {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: this._useAmPm(),
-      }).format(dt);
-
-      return `${date} • ${time}`;
-    } catch (_) {
-      return "";
-    }
-  }
-
-  _formatDay(dayKey) {
-    if (!dayKey) return "";
-    try {
-      return new Intl.DateTimeFormat(this._locale(), {
-        day: "numeric",
-        month: "long",
-      }).format(new Date(`${dayKey}T00:00:00`));
-    } catch (_) {
-      return dayKey;
-    }
-  }
-
-  _formatTimeFromMs(ms) {
-    if (!Number.isFinite(ms)) return "";
-    try {
-      return new Intl.DateTimeFormat(this._locale(), {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: this._useAmPm(),
-      }).format(new Date(ms));
-    } catch (_) {
-      return "";
-    }
   }
 
   _items() {
@@ -4028,14 +3537,13 @@ class CameraGalleryCard extends LitElement {
     const name = this._sourceNameForParsing(src);
     if (!name) return "";
 
-    const ms = this._dtMsFromSrc(src);
-    if (Number.isFinite(ms)) {
-      const dtKey = this._dtKeyFromMs(ms);
-      const nice = this._formatDateTime(dtKey);
+    const dtKey = extractDateTimeKey(src, this._dtOpts);
+    if (dtKey) {
+      const nice = formatDateTime(dtKey, this._hass?.locale);
       if (nice) return nice;
     }
 
-    const dayKey = this._extractDayKey(src);
+    const dayKey = extractDayKey(src, this._dtOpts);
     if (dayKey) {
       try {
         return new Intl.DateTimeFormat(this._locale(), {
@@ -4048,11 +3556,8 @@ class CameraGalleryCard extends LitElement {
       }
     }
 
-    const base = String(name).split("/").pop() || String(name);
-    const noExt = base.replace(
-      /\.(mp4|webm|mov|m4v|jpg|jpeg|png|webp|gif)$/i,
-      ""
-    );
+    const base = name.split("/").pop() || name;
+    const noExt = base.replace(/\.(mp4|webm|mov|m4v|jpg|jpeg|png|webp|gif)$/i, "");
     return noExt.length > 42 ? `${noExt.slice(0, 39)}…` : noExt;
   }
 
@@ -4235,8 +3740,8 @@ class CameraGalleryCard extends LitElement {
 
     const rawItems = this._items();
     const withDt = rawItems.map((src, idx) => {
-      const dtMs = this._dtMsFromSrc(src);
-      const dayKey = this._extractDayKey(src);
+      const dtMs = dtMsFromSrc(src, this._dtOpts);
+      const dayKey = extractDayKey(src, this._dtOpts);
       return { dayKey, dtMs, idx, src };
     });
 
@@ -4548,6 +4053,10 @@ class CameraGalleryCard extends LitElement {
       config.filename_datetime_format || ""
     ).trim();
 
+    const folder_datetime_format = String(
+      config.folder_datetime_format || ""
+    ).trim();
+
     const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
     const num = (v, d) => {
       if (v === null || v === undefined) return d;
@@ -4649,6 +4158,12 @@ class CameraGalleryCard extends LitElement {
     } else if (!mediaRaw && !mediaSourcesClean.length) {
         throw new Error(
           "camera-gallery-card: 'media_source' OR 'media_sources' is required in source_mode: media"
+      );
+    }
+
+    if (!folder_datetime_format && !filename_datetime_format) {
+      throw new Error(
+        "camera-gallery-card: 'folder_datetime_format' or 'filename_datetime_format' is required so files can be grouped by date"
       );
     }
 
@@ -4784,7 +4299,7 @@ class CameraGalleryCard extends LitElement {
       thumb_size,
       thumbnail_frame_pct,
       live_go2rtc_stream: String(config.live_go2rtc_stream || "").trim() || null,
-      folder_datetime_format: String(config.folder_datetime_format || "").trim() || null,
+      folder_datetime_format: folder_datetime_format || null,
       sync_entity: String(config.sync_entity || "").trim() || null,
       menu_buttons: Array.isArray(config.menu_buttons)
         ? config.menu_buttons
@@ -4971,8 +4486,8 @@ class CameraGalleryCard extends LitElement {
 
     if (rawItems.length) {
       const withDt = rawItems.map((src, idx) => {
-        const dtMs = this._dtMsFromSrc(src);
-        const dayKey = this._extractDayKey(src);
+        const dtMs = dtMsFromSrc(src, this._dtOpts);
+        const dayKey = extractDayKey(src, this._dtOpts);
         return { dayKey, dtMs, idx, src };
       });
 
@@ -5099,8 +4614,8 @@ class CameraGalleryCard extends LitElement {
     }
 
     const withDt = rawItems.map((src, idx) => {
-      const dtMs = this._dtMsFromSrc(src);
-      const dayKey = this._extractDayKey(src);
+      const dtMs = dtMsFromSrc(src, this._dtOpts);
+      const dayKey = extractDayKey(src, this._dtOpts);
       return { dayKey, dtMs, idx, src };
     });
 
@@ -5173,9 +4688,7 @@ class CameraGalleryCard extends LitElement {
       !!selected &&
       this._isVideoSmart(selectedUrl || selectedTitle, selectedMime, selectedCls);
 
-    const tsKey = selected ? this._extractDateTimeKey(selected) : "";
-    const tsText = tsKey ? this._formatDateTime(tsKey) : "";
-    const tsLabel = selected ? tsText || this._tsLabelFromFilename(selected) : "";
+    const tsLabel = selected ? this._tsLabelFromFilename(selected) : "";
 
     const currentForNav = activeDay ?? newestDay;
     const dayIdx = currentForNav ? days.indexOf(currentForNav) : -1;
@@ -5554,8 +5067,8 @@ class CameraGalleryCard extends LitElement {
                       ? (hasUrl && !!poster)
                       : (this._revealedThumbs.has(it.src) && hasUrl && !!poster);
 
-                    const tMs = this._dtMsFromSrc(it.src);
-                    const tTime = this._formatTimeFromMs(tMs);
+                    const tMs = dtMsFromSrc(it.src, this._dtOpts);
+                    const tTime = formatTimeFromMs(tMs, this._hass?.locale);
 
                     const obj = this._objectForSrc(it.src);
                     const objIcon = this._objectIcon(obj);
@@ -5713,7 +5226,7 @@ class CameraGalleryCard extends LitElement {
               ${useDatePicker ? html`
                 <div class="datepill has-filters" role="group" aria-label="Day navigation">
                   <div class="dateinfo datepick" @click=${() => this._openDatePicker(days)} title="Select date">
-                    <span class="txt">${currentForNav ? this._formatDay(currentForNav) : "—"}</span>
+                    <span class="txt">${currentForNav ? formatDay(currentForNav, this._hass?.locale) : "—"}</span>
                   </div>
                 </div>
               ` : html`
@@ -5722,7 +5235,7 @@ class CameraGalleryCard extends LitElement {
                     <ha-icon icon="mdi:chevron-left"></ha-icon>
                   </button>
                   <div class="dateinfo" title="Selected day">
-                    <span class="txt">${currentForNav ? this._formatDay(currentForNav) : "—"}</span>
+                    <span class="txt">${currentForNav ? formatDay(currentForNav, this._hass?.locale) : "—"}</span>
                   </div>
                   <button class="iconbtn" ?disabled=${!canNext} @click=${() => this._stepDay(-1, days, currentForNav)} aria-label="Next day" title="Next day">
                     <ha-icon icon="mdi:chevron-right"></ha-icon>
@@ -9010,30 +8523,30 @@ class CameraGalleryCardEditor extends HTMLElement {
               </div>
 
               <div class="row">
-                <details ${c.folder_datetime_format || c.filename_datetime_format ? "open" : ""}>
-                  <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;">
-                    <span class="lbl" style="margin:0;flex:1;">Datetime formats</span>
-                    <span class="details-chevron" style="transition:transform 0.15s;">${svgIcon('mdi:chevron-right', 16)}</span>
-                  </summary>
-                  <div style="padding-top:10px;display:flex;flex-direction:column;gap:14px;">
-                    <div>
-                      <div class="lbl">Folder datetime format</div>
-                      <input type="text" class="ed-input" id="folderfmt" placeholder="DDMM" style="margin-top:4px;" />
-                      <div class="hint" style="margin-top:4px;">
-                        ${svgIcon('mdi:information-outline', 14)}
-                        Examples: <code>DDMM</code>, <code>YYYYMMDD</code>, <code>DD-MM-YYYY</code>. Year defaults to current year if omitted.
-                      </div>
-                    </div>
-                    <div>
-                      <div class="lbl">Filename datetime format</div>
-                      <input type="text" class="ed-input" id="filenamefmt" placeholder="YYYYMMDDHHmmss" style="margin-top:4px;" />
-                      <div class="hint" style="margin-top:4px;">
-                        ${svgIcon('mdi:information-outline', 14)}
-                        Examples: <code>YYYYMMDDHHmmss</code>, <code>DD-MM-YYYY_HH-mm-ss</code>, <code>YYYY-MM-DDTHH:mm:ss</code>
-                      </div>
+                <div class="lbl">Datetime formats</div>
+                <div class="desc">
+                  ${svgIcon('mdi:information-outline', 14)}
+                  Configure at least one format so files can be grouped by date. Files with no matching format appear under <strong>Other</strong>.
+                  Tokens: <code>YYYY</code> <code>MM</code> <code>DD</code> <code>HH</code> <code>mm</code> <code>ss</code>
+                </div>
+                <div style="padding-top:8px;display:flex;flex-direction:column;gap:14px;">
+                  <div>
+                    <div class="lbl">Folder datetime format</div>
+                    <input type="text" class="ed-input" id="folderfmt" placeholder="e.g. YYYY-MM-DD" style="margin-top:4px;" />
+                    <div class="hint" style="margin-top:4px;">
+                      ${svgIcon('mdi:information-outline', 14)}
+                      Matches the folder name in the path. Examples: <code>YYYY-MM-DD</code>, <code>YYYYMMDD</code>, <code>DD-MM-YYYY</code>. Year defaults to current year if omitted.
                     </div>
                   </div>
-                </details>
+                  <div>
+                    <div class="lbl">Filename datetime format</div>
+                    <input type="text" class="ed-input" id="filenamefmt" placeholder="e.g. YYYYMMDD_HHmmss" style="margin-top:4px;" />
+                    <div class="hint" style="margin-top:4px;">
+                      ${svgIcon('mdi:information-outline', 14)}
+                      Matches the filename (without extension). Examples: <code>YYYYMMDD_HHmmss</code>, <code>DD-MM-YYYY_HH-mm-ss</code>, <code>YYYY-MM-DDTHH:mm:ss</code>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <div class="row ${mediaModeOn ? "row-disabled" : ""}">
