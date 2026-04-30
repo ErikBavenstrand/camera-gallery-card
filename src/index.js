@@ -3355,7 +3355,7 @@ class CameraGalleryCard extends LitElement {
     // Look up media-source-side metadata (dtMs) for a given src. Sensor-only
     // srcs aren't in `_ms.listIndex` and surface as plain `{ src }`.
     const enrich = (src) => {
-      const dtMs = this._ms?.listIndex?.get(src)?.dtMs;
+      const dtMs = this._ms?.listIndex?.get(src)?.dtMs ?? frigateEventIdMs(src);
       return typeof dtMs === "number" && Number.isFinite(dtMs) ? { src, dtMs } : { src };
     };
 
