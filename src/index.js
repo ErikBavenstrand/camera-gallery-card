@@ -2866,9 +2866,6 @@ class CameraGalleryCard extends LitElement {
 
     try {
       const visibleCap = this._normMaxMedia(this.config?.max_media);
-      const isFrigateRoot = roots.some((r) =>
-        isFrigateRoot(r)
-      );
 
       const internalCap = Math.min(2000, Math.max(visibleCap * 4, 400));
 
