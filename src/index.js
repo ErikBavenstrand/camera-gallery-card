@@ -10249,17 +10249,7 @@ if (oldPanel && tmp.firstElementChild) {
 
     this.shadowRoot.querySelectorAll("[data-src]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const next = btn.dataset.src;
-        if (next === "media") {
-          const cleaned = { ...this._config };
-          delete cleaned.delete_service;
-          delete cleaned.shell_command;
-          delete cleaned.allow_delete;
-          delete cleaned.allow_bulk_delete;
-          delete cleaned.delete_confirm;
-          this._config = this._stripAlwaysTrueKeys(cleaned);
-        }
-        this._set("source_mode", next);
+        this._set("source_mode", btn.dataset.src);
       });
     });
 
