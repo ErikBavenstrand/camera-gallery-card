@@ -943,10 +943,6 @@ class CameraGalleryCard extends LitElement {
     return this.config?.thumb_layout === "vertical";
   }
 
-  _jsonEq(a, b) {
-    return JSON.stringify(a) === JSON.stringify(b);
-  }
-
   // Options bag for the pure datetime-parsing functions.
   // Reads config + resolveName each access; cheap allocation, no caching needed.
   get _dtOpts() {
