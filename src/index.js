@@ -2543,15 +2543,11 @@ class CameraGalleryCard extends LitElement {
     });
   }
 
-  _thumbHash(url) {
-    return "cgc_p_" + fnv1aHash(url);
-  }
-
   // Salt the localStorage key with the current frame %, so changing the % invalidates
   // cached frames without needing to wipe storage.
   _lsKey(url) {
     const pct = this.config?.thumbnail_frame_pct ?? DEFAULT_THUMBNAIL_FRAME_PCT;
-    return this._thumbHash(url + "|" + pct);
+    return "cgc_p_" + fnv1aHash(url + "|" + pct);
   }
 
   _lsThumbGet(url) {
