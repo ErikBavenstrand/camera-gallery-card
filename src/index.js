@@ -24,6 +24,11 @@ import {
   sensorTextForFilter,
 } from "./data/object-filters";
 import {
+  dedupeByRelPath,
+  pairMediaSourceThumbnails,
+  pairSensorItems,
+} from "./data/pairing";
+import {
   FRIGATE_SNAPSHOTS_ROOT,
   FRIGATE_URI_PREFIX,
   fetchFrigateEvents,
@@ -2905,7 +2910,7 @@ class CameraGalleryCard extends LitElement {
         })
         .filter((x) => !!x.id);
 
-      items = this._dedupeByRelPath(items);
+      items = dedupeByRelPath(items);
 
       items.sort((a, b) => {
         const am = a.dtMs ?? dtMsFromSrc(a.id, this._dtOpts);
@@ -3011,48 +3016,8 @@ class CameraGalleryCard extends LitElement {
       .join(" | ");
   }
 
-  _msPairThumbnails(items) {
-    const videosByStem = new Map();
-    for (let i = 0; i < items.length; i++) {
-      const m = String(items[i].id || "").match(/([^/]+)\.(mp4|webm|mov|m4v)$/i);
-      if (m) videosByStem.set(m[1].toLowerCase(), i);
-    }
-    const pairedThumbs = new Map();
-    const toRemove = new Set();
-    for (let i = 0; i < items.length; i++) {
-      const m = String(items[i].id || "").match(/([^/]+)\.(jpg|jpeg|png|webp)$/i);
-      if (!m) continue;
-      const vidIdx = videosByStem.get(m[1].toLowerCase());
-      if (vidIdx === undefined) continue;
-      pairedThumbs.set(items[vidIdx].id, items[i].id);
-      toRemove.add(i);
-    }
-    const filtered = toRemove.size ? items.filter((_, i) => !toRemove.has(i)) : items;
-    return { items: filtered, pairedThumbs };
-  }
-
-  _pairSensorItems(items) {
-    const videosByStem = new Map();
-    for (let i = 0; i < items.length; i++) {
-      const m = String(items[i].src || "").match(/([^/]+)\.(mp4|webm|mov|m4v)$/i);
-      if (m) videosByStem.set(m[1].toLowerCase(), i);
-    }
-    const pairedThumbs = new Map();
-    const toRemove = new Set();
-    for (let i = 0; i < items.length; i++) {
-      const m = String(items[i].src || "").match(/([^/]+)\.(jpg|jpeg|png|webp)$/i);
-      if (!m) continue;
-      const vidIdx = videosByStem.get(m[1].toLowerCase());
-      if (vidIdx === undefined) continue;
-      pairedThumbs.set(items[vidIdx].src, items[i].src);
-      toRemove.add(i);
-    }
-    const filtered = toRemove.size ? items.filter((_, i) => !toRemove.has(i)) : items;
-    return { items: filtered, pairedThumbs };
-  }
-
   _msSetList(items) {
-    const { items: paired, pairedThumbs } = this._msPairThumbnails(Array.isArray(items) ? [...items] : []);
+    const { items: paired, pairedThumbs } = pairMediaSourceThumbnails(Array.isArray(items) ? [...items] : []);
     this._ms.list = paired;
     this._ms.listIndex = new Map(paired.map((x) => [x.id, x]));
     this._ms.pairedThumbs = pairedThumbs;
@@ -3209,29 +3174,6 @@ class CameraGalleryCard extends LitElement {
     return Promise.race([p, t]);
   }
 
-  _dedupeByRelPath(items) {
-    const seen = new Map();
-
-    const norm = (idOrPath) =>
-      String(idOrPath || "")
-        .replace(/^media-source:\/\/media_source\//, "")
-        .replace(/^media-source:\/\/media_source/, "")
-        .replace(/^media-source:\/\//, "")
-        .replace(/\/{2,}/g, "/")
-        .replace(/^\/+/, "")
-        .replace(/\/+$/g, "")
-        .trim()
-        .toLowerCase();
-
-    for (const it of items || []) {
-      const key = norm(it?.media_content_id || it?.path || it?.id || it?.src || it);
-      if (!key) continue;
-      if (!seen.has(key)) seen.set(key, it);
-    }
-
-    return Array.from(seen.values());
-  }
-
   /**
    * @typedef {{ src: string, dtMs?: number }} CardItem
    *
@@ -3279,18 +3221,18 @@ class CameraGalleryCard extends LitElement {
         }
         sensorList.push(...part);
       }
-      const enrichedSensor = this._dedupeByRelPath(sensorList).map(enrich);
-      const { items: pairedSensor, pairedThumbs: sensorPaired } = this._pairSensorItems(enrichedSensor);
+      const enrichedSensor = dedupeByRelPath(sensorList).map(enrich);
+      const { items: pairedSensor, pairedThumbs: sensorPaired } = pairSensorItems(enrichedSensor);
       this._sensorPairedThumbs = sensorPaired;
-      const msItems = this._dedupeByRelPath(this._msIds()).map(enrich);
-      const merged = this._dedupeByRelPath([...pairedSensor, ...msItems]);
+      const msItems = dedupeByRelPath(this._msIds()).map(enrich);
+      const merged = dedupeByRelPath([...pairedSensor, ...msItems]);
       return this._deleted?.size
         ? merged.filter((it) => !this._deleted.has(it.src))
         : merged;
     }
 
     if (usingMediaSource) {
-      const ids = this._dedupeByRelPath(this._msIds()).map(enrich);
+      const ids = dedupeByRelPath(this._msIds()).map(enrich);
       return this._deleted?.size ? ids.filter((it) => !this._deleted.has(it.src)) : ids;
     }
 
@@ -3331,14 +3273,14 @@ class CameraGalleryCard extends LitElement {
       list.push(...part);
     }
 
-    list = this._dedupeByRelPath(list);
+    list = dedupeByRelPath(list);
 
     if (this._deleted?.size) {
       list = list.filter((src) => !this._deleted.has(src));
     }
 
     const enriched = list.map(enrich);
-    const { items: paired, pairedThumbs } = this._pairSensorItems(enriched);
+    const { items: paired, pairedThumbs } = pairSensorItems(enriched);
     this._sensorPairedThumbs = pairedThumbs;
     return paired;
   }
