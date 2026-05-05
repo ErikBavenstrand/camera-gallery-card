@@ -28,6 +28,8 @@ import {
   pairMediaSourceThumbnails,
   pairSensorItems,
 } from "./data/pairing";
+import { FavoritesStore } from "./data/favorites";
+import { fnv1aHash } from "./util/hash";
 import {
   FRIGATE_SNAPSHOTS_ROOT,
   FRIGATE_URI_PREFIX,
@@ -201,7 +203,7 @@ class CameraGalleryCard extends LitElement {
     this._pillsHideActive = false;
     this._srcEntityMap = new Map();
     this._sensorPairedThumbs = new Map();
-    this._favorites = new Set();
+    this._favorites = new FavoritesStore({ onChange: () => this.requestUpdate() });
     this._suppressNextThumbClick = false;
     this._swipeStartX = 0;
     this._swipeStartY = 0;
@@ -2542,38 +2544,7 @@ class CameraGalleryCard extends LitElement {
   }
 
   _thumbHash(url) {
-    let h = 2166136261;
-    for (let i = 0; i < url.length; i++) {
-      h ^= url.charCodeAt(i);
-      h = Math.imul(h, 16777619) >>> 0;
-    }
-    return "cgc_p_" + h.toString(36);
-  }
-
-  _favKey() {
-    const id = [
-      ...(this.config?.entities ?? []),
-      ...(this.config?.media_sources ?? []),
-    ].sort().join("|");
-    return "cgc_favs_" + this._thumbHash(id);
-  }
-
-  _loadFavorites() {
-    try {
-      const raw = localStorage.getItem(this._favKey());
-      this._favorites = raw ? new Set(JSON.parse(raw)) : new Set();
-    } catch (_) { this._favorites = new Set(); }
-  }
-
-  _saveFavorites() {
-    try { localStorage.setItem(this._favKey(), JSON.stringify([...this._favorites])); } catch (_) {}
-  }
-
-  _toggleFavorite(src) {
-    if (this._favorites.has(src)) this._favorites.delete(src);
-    else this._favorites.add(src);
-    this._saveFavorites();
-    this.requestUpdate();
+    return "cgc_p_" + fnv1aHash(url);
   }
 
   // Salt the localStorage key with the current frame %, so changing the % invalidates
@@ -3834,7 +3805,7 @@ class CameraGalleryCard extends LitElement {
 
     this.config = nextConfig;
     this._customIcons = customIcons;
-    this._loadFavorites();
+    this._favorites.load(this.config);
     this._startMediaPoll();
 
     const { changedKeys, isSourceChange: sourceChange, isUiOnly: uiOnlyChange } =
@@ -4689,7 +4660,7 @@ class CameraGalleryCard extends LitElement {
 
                         <div
                           class="fav-btn ${this._favorites.has(it.src) ? 'on' : ''}"
-                          @click=${(e) => { e.stopPropagation(); this._toggleFavorite(it.src); }}
+                          @click=${(e) => { e.stopPropagation(); this._favorites.toggle(it.src); }}
                           @pointerdown=${(e) => e.stopPropagation()}
                           role="button"
                           title="Favorite"
