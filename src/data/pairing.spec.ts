@@ -182,6 +182,15 @@ describe("dedupeByRelPath", () => {
     expect(out[0]).toBe("media-source://media_source/local/clip.mp4");
   });
 
+  it("equates media-source://media_source (no trailing slash) with empty path", () => {
+    // Edge case from the legacy chain: the second `replace` (without the
+    // trailing slash) catches inputs that the first one misses. The
+    // consolidated regex still strips the prefix and the input normalises
+    // to the empty string, which is dropped.
+    const out = dedupeByRelPath(["media-source://media_source"]);
+    expect(out).toEqual([]);
+  });
+
   it("does NOT collapse other media-source roots into bare paths", () => {
     // The card intentionally treats `media-source://frigate/...` and
     // `media-source://media_source/...` as distinct sources — only the

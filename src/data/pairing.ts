@@ -54,34 +54,32 @@ export function pairVideoThumbnails<T>(
   }
 
   const videoIdxByStem = new Map<string, number>();
-  for (let i = 0; i < items.length; i++) {
-    const key = getKey(items[i] as T);
+  for (const [i, it] of items.entries()) {
+    const key = getKey(it);
     if (!key) continue;
-    const m = VIDEO_EXT_RE.exec(key);
-    const stem = m?.[1];
+    const stem = VIDEO_EXT_RE.exec(key)?.[1];
     if (!stem) continue;
     videoIdxByStem.set(stem.toLowerCase(), i);
   }
 
   const pairedThumbs = new Map<string, string>();
   const toRemove = new Set<number>();
-  for (let i = 0; i < items.length; i++) {
-    const thumbKey = getKey(items[i] as T);
+  for (const [i, it] of items.entries()) {
+    const thumbKey = getKey(it);
     if (!thumbKey) continue;
-    const m = IMAGE_EXT_RE.exec(thumbKey);
-    const stem = m?.[1];
+    const stem = IMAGE_EXT_RE.exec(thumbKey)?.[1];
     if (!stem) continue;
     const vidIdx = videoIdxByStem.get(stem.toLowerCase());
     if (vidIdx === undefined) continue;
-    const videoKey = getKey(items[vidIdx] as T);
+    const video = items[vidIdx];
+    if (video === undefined) continue;
+    const videoKey = getKey(video);
     if (!videoKey) continue;
     pairedThumbs.set(videoKey, thumbKey);
     toRemove.add(i);
   }
 
-  const filtered = toRemove.size
-    ? (items as readonly T[]).filter((_, i) => !toRemove.has(i))
-    : ([...items] as T[]);
+  const filtered = toRemove.size ? items.filter((_, i) => !toRemove.has(i)) : [...items];
   return { items: filtered, pairedThumbs };
 }
 
@@ -103,18 +101,22 @@ export function pairSensorItems<T extends SensorLike>(
  * Strip media-source/leading-slash noise off a path-ish string for
  * deduplication. Lowercased, trimmed, with collapsed consecutive slashes.
  *
- * Handles the various shapes the card sees: bare paths (`/local/foo.mp4`),
- * `media-source://media_source/local/foo.mp4`, `media-source://frigate/...`,
- * etc.
+ * The prefix-strip regex equates `media-source://media_source/<path>`,
+ * `media-source://media_source` (no trailing slash), and bare `<path>`,
+ * but preserves the root segment for other media-source URIs (Frigate,
+ * etc.) so they don't collide with bare local paths.
  */
+const MEDIA_SOURCE_PREFIX_RE = /^media-source:\/\/(?:media_source\/?)?/;
+const MULTI_SLASH_RE = /\/{2,}/g;
+const LEADING_SLASH_RE = /^\/+/;
+const TRAILING_SLASH_RE = /\/+$/;
+
 function normalizeRelPath(idOrPath: unknown): string {
   return String(idOrPath ?? "")
-    .replace(/^media-source:\/\/media_source\//, "")
-    .replace(/^media-source:\/\/media_source/, "")
-    .replace(/^media-source:\/\//, "")
-    .replace(/\/{2,}/g, "/")
-    .replace(/^\/+/, "")
-    .replace(/\/+$/g, "")
+    .replace(MEDIA_SOURCE_PREFIX_RE, "")
+    .replace(MULTI_SLASH_RE, "/")
+    .replace(LEADING_SLASH_RE, "")
+    .replace(TRAILING_SLASH_RE, "")
     .trim()
     .toLowerCase();
 }
